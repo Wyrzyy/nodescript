@@ -1,425 +1,491 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# Цвета
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-ok() { echo -e "${GREEN}[✓]${NC} $1"; }
-info() { echo -e "${BLUE}[i]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-err() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+APP="remnanode"
+INSTALL_DIR="/opt/${APP}"
 
-[[ $EUID -ne 0 ]] && err "Запустите с root."
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-# ==========================================
-# Функция удаления старой ноды
-# ==========================================
-check_and_remove_existing() {
-    local exists=0
-    docker ps -a --format '{{.Names}}' | grep -q "^remnanode$" && exists=1
-    [[ -d "/opt/remnanode" ]] && exists=1
-    if [[ $exists -eq 1 ]]; then
-        echo -n -e "${YELLOW}[?] Удалить старую ноду и установить заново? (y/N): ${NC}"
-        read -r answer
-        if [[ "$answer" =~ ^[Yy]$ ]]; then
-            docker stop remnanode 2>/dev/null || true
-            docker rm remnanode 2>/dev/null || true
-            rm -rf /opt/remnanode
-            ok "Старая установка удалена."
-        else
-            info "Установка отменена."
-            exit 0
-        fi
-    fi
-}
+ok(){ echo -e "${GREEN}[✓]${NC} $1"; }
+info(){ echo -e "${BLUE}[i]${NC} $1"; }
+warn(){ echo -e "${YELLOW}[!]${NC} $1"; }
+fail(){ echo -e "${RED}[x]${NC} $1"; exit 1; }
 
-# ==========================================
-# 1. Базовые пакеты
-# ==========================================
-info "Обновление системы и установка пакетов..."
-apt update -y
-pkgs=(curl wget git ufw fail2ban software-properties-common gnupg lsb-release ca-certificates haveged irqbalance)
-for pkg in "${pkgs[@]}"; do
-    if ! dpkg -l | grep -qw "$pkg"; then
-        apt install -y "$pkg"
-        ok "Установлен $pkg"
-    else
-        info "$pkg уже установлен"
-    fi
-done
+[[ $EUID -ne 0 ]] && fail "Run as root"
 
-# ==========================================
-# 2. Sysctl (только если изменился)
-# ==========================================
-SYSCTL_CONF="/etc/sysctl.d/99-remnawave.conf"
-NEW_MD5=$(cat <<'EOF' | md5sum | cut -d' ' -f1
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-net.ipv4.tcp_mem = 786432 1048576 1572864
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_abort_on_overflow = 0
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_syn_retries = 2
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_dsack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.secure_redirects = 0
-net.ipv4.conf.default.secure_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.icmp_echo_ignore_all = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-fs.file-max = 2097152
-fs.inotify.max_user_instances = 8192
-fs.inotify.max_user_watches = 524288
+export DEBIAN_FRONTEND=noninteractive
+
+clear
+
+echo "========================================="
+echo "      REMNANODE INSTALLER"
+echo "========================================="
+
+sleep 1
+
+############################################
+# PACKAGES
+############################################
+
+info "Installing packages..."
+
+apt update -qq
+
+apt install -y -qq \
+curl \
+wget \
+git \
+jq \
+nftables \
+fail2ban \
+ca-certificates \
+gnupg \
+lsb-release \
+apt-transport-https \
+software-properties-common \
+irqbalance >/dev/null
+
+ok "Packages installed"
+
+############################################
+# SYSCTL
+############################################
+
+info "Applying kernel optimization..."
+
+cat >/etc/sysctl.d/99-remnanode.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=262144
+
+net.ipv4.tcp_max_syn_backlog=262144
+
+net.ipv4.ip_local_port_range=1024 65535
+
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_slow_start_after_idle=0
+
+net.ipv4.tcp_fin_timeout=15
+
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+
+net.ipv4.tcp_mtu_probing=1
+
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+
+net.ipv4.conf.all.secure_redirects=0
+net.ipv4.conf.default.secure_redirects=0
+
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+
+net.netfilter.nf_conntrack_max=1048576
+
+fs.file-max=2097152
+
+fs.inotify.max_user_instances=8192
+fs.inotify.max_user_watches=524288
 EOF
-)
-if [[ ! -f "$SYSCTL_CONF" ]] || [[ "$(md5sum "$SYSCTL_CONF" | cut -d' ' -f1)" != "$NEW_MD5" ]]; then
-    cat > "$SYSCTL_CONF" <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-net.ipv4.tcp_mem = 786432 1048576 1572864
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_abort_on_overflow = 0
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_syn_retries = 2
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_dsack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.secure_redirects = 0
-net.ipv4.conf.default.secure_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.icmp_echo_ignore_all = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-fs.file-max = 2097152
-fs.inotify.max_user_instances = 8192
-fs.inotify.max_user_watches = 524288
-EOF
-    sysctl -p "$SYSCTL_CONF"
-    ok "Параметры ядра обновлены."
-else
-    info "Параметры ядра уже актуальны."
-fi
 
-# ==========================================
-# 3. Ulimits
-# ==========================================
-LIMITS_CONF="/etc/security/limits.d/99-remnawave.conf"
-if ! grep -q "soft nofile 1048576" "$LIMITS_CONF" 2>/dev/null; then
-    cat > "$LIMITS_CONF" <<'EOF'
+sysctl --system >/dev/null
+
+ok "Kernel optimized"
+
+############################################
+# LIMITS
+############################################
+
+info "Applying limits..."
+
+cat >/etc/security/limits.d/99-remnanode.conf <<'EOF'
 * soft nofile 1048576
 * hard nofile 1048576
-* soft nproc unlimited
-* hard nproc unlimited
 root soft nofile 1048576
 root hard nofile 1048576
 EOF
-    ok "Ulimits настроены."
-else
-    info "Ulimits уже настроены."
-fi
 
-SYSTEMD_LIMITS="/etc/systemd/system.conf.d/99-limits.conf"
-if ! grep -q "DefaultLimitNOFILE" "$SYSTEMD_LIMITS" 2>/dev/null; then
-    mkdir -p /etc/systemd/system.conf.d/
-    cat > "$SYSTEMD_LIMITS" <<'EOF'
+mkdir -p /etc/systemd/system.conf.d
+
+cat >/etc/systemd/system.conf.d/99-remnanode.conf <<'EOF'
 [Manager]
 DefaultLimitNOFILE=1048576
-DefaultLimitNPROC=infinity
 EOF
-    systemctl daemon-reload
-    ok "Systemd limits настроены."
-else
-    info "Systemd limits уже настроены."
-fi
 
-# ==========================================
-# 4. Docker
-# ==========================================
-if ! command -v docker &> /dev/null; then
-    info "Установка Docker..."
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    apt update -y
-    apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-    systemctl enable docker
-    systemctl start docker
-    ok "Docker установлен."
-else
-    ok "Docker уже установлен."
-fi
+systemctl daemon-reexec
 
-# ==========================================
-# 5. UFW – гарантированно чистая настройка
-# ==========================================
-info "Настройка UFW с нуля..."
+ok "Limits applied"
 
-# Полный сброс (удаляем всё старое)
-ufw --force reset
+############################################
+# JOURNALD
+############################################
 
-# Базовые политики
-ufw default deny incoming
-ufw default allow outgoing
-ufw default deny forward
+info "Optimizing journald..."
 
-# Открываем необходимые порты
-ufw allow 22/tcp comment 'SSH'
-ufw allow 80/tcp comment 'HTTP'
-ufw allow 443/tcp comment 'HTTPS/VLESS'
-ufw allow 3000/tcp comment 'Remnawave API'
+mkdir -p /etc/systemd/journald.conf.d
 
-# Восстанавливаем оригинальный before.rules из системной директории
-ORIG_BEFORE="/usr/share/ufw/before.rules"
-if [[ -f "$ORIG_BEFORE" ]]; then
-    cp "$ORIG_BEFORE" /etc/ufw/before.rules
-    ok "Оригинальный before.rules восстановлен."
-else
-    warn "Оригинальный before.rules не найден. Создаём базовый шаблон."
-    cat > /etc/ufw/before.rules <<'EOF'
-# Minimal valid before.rules
-*nat
-:PREROUTING ACCEPT [0:0]
-:POSTROUTING ACCEPT [0:0]
-COMMIT
-*mangle
-:PREROUTING ACCEPT [0:0]
-:INPUT ACCEPT [0:0]
-:FORWARD ACCEPT [0:0]
-:OUTPUT ACCEPT [0:0]
-:POSTROUTING ACCEPT [0:0]
-COMMIT
-*filter
-:INPUT DROP [0:0]
-:FORWARD DROP [0:0]
-:OUTPUT ACCEPT [0:0]
--A INPUT -i lo -j ACCEPT
--A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
--A INPUT -p icmp -j ACCEPT
-COMMIT
+cat >/etc/systemd/journald.conf.d/remnanode.conf <<'EOF'
+[Journal]
+SystemMaxUse=200M
+RuntimeMaxUse=100M
+RateLimitIntervalSec=30s
+RateLimitBurst=200
 EOF
+
+systemctl restart systemd-journald
+
+ok "Journald optimized"
+
+############################################
+# DOCKER
+############################################
+
+if ! command -v docker >/dev/null; then
+
+info "Installing Docker..."
+
+mkdir -p /etc/apt/keyrings
+
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+| gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+echo \
+"deb [arch=$(dpkg --print-architecture) \
+signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu \
+$(lsb_release -cs) stable" \
+>/etc/apt/sources.list.d/docker.list
+
+apt update -qq
+
+apt install -y -qq \
+docker-ce \
+docker-ce-cli \
+containerd.io \
+docker-compose-plugin >/dev/null
+
 fi
 
-# Удаляем возможные предыдущие вставки наших правил (по маркеру)
-sed -i '/# === Remnawave Anti-DDoS Rules ===/,/^$/d' /etc/ufw/before.rules
+mkdir -p /etc/docker
 
-# Теперь добавляем наши правила перед последним COMMIT в секции *filter
-TMP_RULES=$(mktemp)
-awk '
-/^*filter$/ { in_filter=1 }
-in_filter && /^COMMIT$/ {
-    print "# === Remnawave Anti-DDoS Rules ==="
-    print "-A INPUT -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT"
-    print "-A INPUT -p tcp --syn -j DROP"
-    print "-A INPUT -m state --state INVALID -j DROP"
-    print "-A INPUT -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP"
-    print "-A INPUT -p tcp --tcp-flags ALL NONE -j DROP"
-    print "-A INPUT -p tcp --tcp-flags ALL ALL -j DROP"
-    print "-A INPUT -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT"
-    print "-A INPUT -p tcp --dport 443 -j DROP"
-    print ""
-    in_filter=0
+cat >/etc/docker/daemon.json <<'EOF'
+{
+  "live-restore": true,
+  "userland-proxy": false,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
 }
-{ print }
-' /etc/ufw/before.rules > "$TMP_RULES"
-mv "$TMP_RULES" /etc/ufw/before.rules
+EOF
 
-# Проверяем синтаксис получившегося файла
-if iptables-restore -t < /etc/ufw/before.rules 2>/dev/null; then
-    ok "Синтаксис before.rules корректен."
-else
-    warn "Ошибка синтаксиса в before.rules! Восстанавливаем оригинал без анти-DDoS правил."
-    # Возвращаем оригинальный файл (чистый)
-    cp "$ORIG_BEFORE" /etc/ufw/before.rules
-    # Убедимся, что ошибок нет
-    if ! iptables-restore -t < /etc/ufw/before.rules 2>/dev/null; then
-        err "Не удалось восстановить корректный before.rules. UFW будет отключён."
-        ufw --force disable
-    else
-        ok "Оригинальный before.rules восстановлен (без анти-DDoS правил)."
-    fi
-fi
+systemctl enable docker >/dev/null
+systemctl restart docker
 
-# Принудительно включаем UFW и перезагружаем
-ufw --force enable
-ufw reload
-ok "UFW активен и настроен."
+ok "Docker configured"
 
-# ==========================================
-# 6. Fail2Ban
-# ==========================================
-if ! systemctl is-active --quiet fail2ban; then
-    apt install -y fail2ban
-    cat > /etc/fail2ban/jail.local <<'EOF'
+############################################
+# NFTABLES
+############################################
+
+info "Configuring firewall..."
+
+cat >/etc/nftables.conf <<'EOF'
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+
+    chain input {
+
+        type filter hook input priority 0;
+
+        policy drop;
+
+        iif lo accept
+
+        ct state established,related accept
+        ct state invalid drop
+
+        tcp dport 22 ct state new limit rate 15/minute accept
+
+        tcp dport {80,443,3000} accept
+        udp dport 443 accept
+
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+
+        limit rate 5/second accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0;
+        policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0;
+        policy accept;
+    }
+}
+EOF
+
+systemctl enable nftables >/dev/null
+systemctl restart nftables
+
+ok "Firewall configured"
+
+############################################
+# FAIL2BAN
+############################################
+
+info "Configuring Fail2Ban..."
+
+cat >/etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
-bantime = 1h
-findtime = 60
-maxretry = 20
-banaction = ufw
-ignoreip = 127.0.0.1/8
+bantime = 24h
+findtime = 10m
+maxretry = 5
+backend = systemd
+banaction = nftables-multiport
 
 [sshd]
 enabled = true
-port = 22
-maxretry = 5
-bantime = 1h
 EOF
-    systemctl restart fail2ban
-    systemctl enable fail2ban
-    ok "Fail2Ban настроен."
-else
-    info "Fail2Ban уже запущен."
+
+systemctl enable fail2ban >/dev/null
+systemctl restart fail2ban
+
+ok "Fail2Ban configured"
+
+############################################
+# IRQBALANCE
+############################################
+
+CPU_CORES=$(nproc)
+
+if (( CPU_CORES >= 4 )); then
+    systemctl enable irqbalance --now >/dev/null
+    ok "irqbalance enabled"
 fi
 
-# ==========================================
-# 7. Удаление старой ноды (опционально)
-# ==========================================
-check_and_remove_existing
+############################################
+# INSTALL DIRECTORY
+############################################
 
-# ==========================================
-# 8. Установка Remnawave Node
-# ==========================================
-info "Установка Remnawave Node..."
-INSTALL_DIR="/opt/remnanode"
-mkdir -p "$INSTALL_DIR"
+mkdir -p "${INSTALL_DIR}"
 
-if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
-    OLD_KEY=$(grep "SECRET_KEY=" "$INSTALL_DIR/docker-compose.yml" | cut -d'=' -f2 | tr -d ' ' | head -1)
-    if [[ -n "$OLD_KEY" ]]; then
-        SECRET_KEY="$OLD_KEY"
-        info "Используем существующий SECRET_KEY."
-    else
-        echo -n -e "${YELLOW}[?] Введите SECRET_KEY: ${NC}"
-        read -r SECRET_KEY
-    fi
-else
-    echo -n -e "${YELLOW}[?] Введите SECRET_KEY: ${NC}"
-    read -r SECRET_KEY
-fi
-[[ -z "$SECRET_KEY" ]] && err "SECRET_KEY не может быть пустым."
+############################################
+# SECRET KEY
+############################################
 
-cat > "$INSTALL_DIR/docker-compose.yml" <<EOF
+echo
+read -rp "SECRET_KEY: " SECRET_KEY
+
+[[ -z "${SECRET_KEY}" ]] && fail "SECRET_KEY required"
+
+############################################
+# DOCKER COMPOSE
+############################################
+
+info "Creating compose..."
+
+cat >"${INSTALL_DIR}/docker-compose.yml" <<EOF
 services:
+
   remnanode:
-    container_name: remnanode
-    hostname: remnanode
+
     image: remnawave/node:latest
-    network_mode: host
-    restart: always
+
+    container_name: remnanode
+
+    restart: unless-stopped
+
+    ports:
+      - "443:443/tcp"
+      - "443:443/udp"
+      - "3000:3000/tcp"
+
     cap_add:
       - NET_ADMIN
+
+    security_opt:
+      - no-new-privileges:true
+
+    pids_limit: 512
+
+    mem_limit: 2g
+
+    cpus: 2.0
+
     environment:
-      - NODE_PORT=3000
       - SECRET_KEY=${SECRET_KEY}
+      - NODE_PORT=3000
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
-        max-size: "50m"
-        max-file: "5"
-        compress: "true"
+        max-size: "10m"
+        max-file: "3"
+
     volumes:
-      - '/var/log/remnanode:/var/log/remnanode'
-      - '/etc/timezone:/etc/timezone:ro'
-      - '/etc/localtime:/etc/localtime:ro'
+      - /var/log/remnanode:/var/log/remnanode
 EOF
 
-cd "$INSTALL_DIR"
-docker compose down 2>/dev/null || true
-docker compose up -d
-ok "Remnawave Node запущена."
+############################################
+# START
+############################################
 
-# ==========================================
-# 9. Автоблокировка аномальных IP
-# ==========================================
-if ! crontab -l 2>/dev/null | grep -q "/root/auto-ban.sh"; then
-    cat > /root/auto-ban.sh <<'EOF'
-#!/bin/bash
-ss -tn | grep :443 | awk '{print $5}' | cut -d: -f1 | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort | uniq -c | sort -nr | awk '{if ($1 > 30) print $2}' | while read ip; do
-    if ! ufw status | grep -q "$ip"; then
-        echo "$(date): AUTO-BAN $ip ($1 соединений)" >> /root/auto-ban.log
-        ufw deny from $ip to any port 443 comment "AUTO_BAN_$(date +%s)"
-    fi
+info "Starting container..."
+
+cd "${INSTALL_DIR}"
+
+docker compose pull >/dev/null
+docker compose up -d >/dev/null
+
+ok "Container started"
+
+############################################
+# REMNANODE CLI
+############################################
+
+info "Installing CLI..."
+
+cat >/usr/local/bin/remnanode <<'EOF'
+#!/usr/bin/env bash
+
+set -e
+
+while true; do
+
+clear
+
+echo "================================="
+echo "         REMNANODE"
+echo "================================="
+echo
+echo "1) Status"
+echo "2) Logs"
+echo "3) Restart"
+echo "4) Stop"
+echo "5) Start"
+echo "6) Docker Stats"
+echo "7) Firewall"
+echo "8) Fail2Ban"
+echo "9) Update"
+echo "10) Reinstall"
+echo "0) Exit"
+echo
+
+read -rp "Select: " opt
+
+case $opt in
+
+1)
+docker ps --filter name=remnanode
+;;
+
+2)
+docker logs -f --tail 100 remnanode
+;;
+
+3)
+docker restart remnanode
+;;
+
+4)
+docker stop remnanode
+;;
+
+5)
+docker start remnanode
+;;
+
+6)
+docker stats remnanode
+;;
+
+7)
+nft list ruleset
+;;
+
+8)
+fail2ban-client status
+;;
+
+9)
+cd /opt/remnanode
+docker compose pull
+docker compose up -d
+;;
+
+10)
+bash /opt/remnanode/install.sh
+;;
+
+0)
+exit 0
+;;
+
+*)
+echo "Invalid option"
+;;
+
+esac
+
+echo
+read -rp "Press Enter..."
 done
 EOF
-    chmod +x /root/auto-ban.sh
-    (crontab -l 2>/dev/null; echo "*/2 * * * * /root/auto-ban.sh") | crontab -
-    ok "Автоблокировка через cron добавлена."
-else
-    info "Автоблокировка уже настроена."
-fi
 
-# ==========================================
-# 10. Дополнительные сервисы
-# ==========================================
-systemctl enable haveged --now 2>/dev/null || true
-systemctl enable irqbalance --now 2>/dev/null || true
-ok "Haveged и irqbalance (опционально) запущены."
+chmod +x /usr/local/bin/remnanode
 
-# ==========================================
-# Итог
-# ==========================================
-echo ""
-echo "============================================================"
-ok "УСТАНОВКА ЗАВЕРШЕНА!"
-echo "============================================================"
-echo ""
-echo -e "${GREEN}Установленные компоненты:${NC}"
-echo "  ✓ BBR + TCP-оптимизация"
-echo "  ✓ UFW + анти-DDoS правила"
-echo "  ✓ Fail2Ban"
-echo "  ✓ Docker + Remnawave Node (NET_ADMIN)"
-echo "  ✓ Автоблокировка аномальных IP (cron)"
-echo ""
-echo -e "${BLUE}Проверка:${NC}"
-echo "  docker ps | grep remnanode"
-echo "  ufw status numbered"
-echo "  tail -f /root/auto-ban.log"
-echo ""
-echo -e "${YELLOW}Рекомендации:${NC}"
-echo "  • Добавьте ноду в панель Remnawave по IP:3000"
-echo "  • Для дополнительной защиты настройте Cloudflare"
-echo "============================================================"
+ok "CLI installed"
+
+############################################
+# SAVE INSTALLER
+############################################
+
+cp "$0" /opt/remnanode/install.sh 2>/dev/null || true
+
+############################################
+# DONE
+############################################
+
+echo
+echo "========================================="
+echo "         INSTALL COMPLETE"
+echo "========================================="
+echo
+echo "Command:"
+echo
+echo "   remnanode"
+echo
+echo "Ports:"
+echo
+echo "   443/tcp"
+echo "   443/udp"
+echo "   3000/tcp"
+echo
