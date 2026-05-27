@@ -1,36 +1,26 @@
 #!/bin/bash
 set -euo pipefail
 
-# ==========================================
-# Цвета для вывода
-# ==========================================
+# Цвета
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 ok() { echo -e "${GREEN}[✓]${NC} $1"; }
 info() { echo -e "${BLUE}[i]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 
-# ==========================================
-# Проверка root
-# ==========================================
-[[ $EUID -ne 0 ]] && err "Запустите с root (sudo)."
+[[ $EUID -ne 0 ]] && err "Запустите с root."
 
 # ==========================================
-# Функция проверки существования ноды
+# Функция удаления старой ноды
 # ==========================================
 check_and_remove_existing() {
     local exists=0
-    if docker ps -a --format '{{.Names}}' | grep -q "^remnanode$"; then
-        exists=1; warn "Найден контейнер 'remnanode'."
-    fi
-    if [[ -d "/opt/remnanode" ]]; then
-        exists=1; warn "Найдена директория /opt/remnanode."
-    fi
+    docker ps -a --format '{{.Names}}' | grep -q "^remnanode$" && exists=1
+    [[ -d "/opt/remnanode" ]] && exists=1
     if [[ $exists -eq 1 ]]; then
         echo -n -e "${YELLOW}[?] Удалить старую ноду и установить заново? (y/N): ${NC}"
         read -r answer
         if [[ "$answer" =~ ^[Yy]$ ]]; then
-            info "Удаление..."
             docker stop remnanode 2>/dev/null || true
             docker rm remnanode 2>/dev/null || true
             rm -rf /opt/remnanode
@@ -43,13 +33,12 @@ check_and_remove_existing() {
 }
 
 # ==========================================
-# 1. Обновление системы (только если нужно)
+# 1. Базовые пакеты
 # ==========================================
-info "Обновление списка пакетов..."
+info "Обновление системы и установка пакетов..."
 apt update -y
-# Установка базовых пакетов (если отсутствуют)
-PACKAGES="curl wget git ufw fail2ban software-properties-common gnupg lsb-release ca-certificates haveged irqbalance"
-for pkg in $PACKAGES; do
+pkgs=(curl wget git ufw fail2ban software-properties-common gnupg lsb-release ca-certificates haveged irqbalance)
+for pkg in "${pkgs[@]}"; do
     if ! dpkg -l | grep -qw "$pkg"; then
         apt install -y "$pkg"
         ok "Установлен $pkg"
@@ -59,11 +48,9 @@ for pkg in $PACKAGES; do
 done
 
 # ==========================================
-# 2. Оптимизация ядра (только если конфиг изменился)
+# 2. Sysctl (только если изменился)
 # ==========================================
-info "Настройка sysctl..."
 SYSCTL_CONF="/etc/sysctl.d/99-remnawave.conf"
-CURRENT_MD5=$(md5sum "$SYSCTL_CONF" 2>/dev/null | cut -d' ' -f1 || echo "")
 NEW_MD5=$(cat <<'EOF' | md5sum | cut -d' ' -f1
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -108,7 +95,7 @@ fs.inotify.max_user_instances = 8192
 fs.inotify.max_user_watches = 524288
 EOF
 )
-if [[ "$CURRENT_MD5" != "$NEW_MD5" ]]; then
+if [[ ! -f "$SYSCTL_CONF" ]] || [[ "$(md5sum "$SYSCTL_CONF" | cut -d' ' -f1)" != "$NEW_MD5" ]]; then
     cat > "$SYSCTL_CONF" <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -155,7 +142,7 @@ EOF
     sysctl -p "$SYSCTL_CONF"
     ok "Параметры ядра обновлены."
 else
-    info "Параметры ядра уже настроены."
+    info "Параметры ядра уже актуальны."
 fi
 
 # ==========================================
@@ -191,7 +178,7 @@ else
 fi
 
 # ==========================================
-# 4. Docker (установка только если отсутствует)
+# 4. Docker
 # ==========================================
 if ! command -v docker &> /dev/null; then
     info "Установка Docker..."
@@ -208,10 +195,10 @@ else
 fi
 
 # ==========================================
-# 5. UFW (идемпотентная настройка)
+# 5. UFW (полностью идемпотентно, без интерактива)
 # ==========================================
 info "Настройка UFW..."
-# Сбрасываем UFW только если не настроен
+# Сброс только если UFW не активен или правила не те
 if ! ufw status | grep -q "Status: active"; then
     ufw --force reset
     ufw default deny incoming
@@ -221,53 +208,36 @@ if ! ufw status | grep -q "Status: active"; then
     ufw allow 80/tcp comment 'HTTP'
     ufw allow 443/tcp comment 'HTTPS/VLESS'
     ufw allow 3000/tcp comment 'Remnawave API'
-    # Копируем оригинальный before.rules, если его нет
-    if [[ ! -f /etc/ufw/before.rules.orig ]]; then
-        cp /usr/share/ufw/before.rules /etc/ufw/before.rules.orig
-    fi
+    # Сохраняем оригинальный before.rules
+    cp /usr/share/ufw/before.rules /etc/ufw/before.rules.orig
     cp /etc/ufw/before.rules.orig /etc/ufw/before.rules
-    # Добавляем защитные правила (если их нет)
-    if ! grep -q "Remnawave Anti-DDoS Rules" /etc/ufw/before.rules; then
-        cat >> /etc/ufw/before.rules <<'EOF'
-
-# === Remnawave Anti-DDoS Rules ===
--A ufw-before-input -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT
--A ufw-before-input -p tcp --syn -j DROP
--A ufw-before-input -m state --state INVALID -j DROP
--A ufw-before-input -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP
--A ufw-before-input -p tcp --tcp-flags ALL NONE -j DROP
--A ufw-before-input -p tcp --tcp-flags ALL ALL -j DROP
--A ufw-before-input -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT
--A ufw-before-input -p tcp --dport 443 -j DROP
-EOF
-        ok "Защитные правила UFW добавлены."
-    fi
-    yes | ufw enable
-    ok "UFW активирован."
-else
-    info "UFW уже активен. Проверяем правила..."
-    # Проверяем и добавляем недостающие правила в before.rules
-    if ! grep -q "Remnawave Anti-DDoS Rules" /etc/ufw/before.rules; then
-        # Создаём бэкап, если нет
-        cp /etc/ufw/before.rules /etc/ufw/before.rules.bak
-        cat >> /etc/ufw/before.rules <<'EOF'
-
-# === Remnawave Anti-DDoS Rules ===
--A ufw-before-input -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT
--A ufw-before-input -p tcp --syn -j DROP
--A ufw-before-input -m state --state INVALID -j DROP
--A ufw-before-input -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP
--A ufw-before-input -p tcp --tcp-flags ALL NONE -j DROP
--A ufw-before-input -p tcp --tcp-flags ALL ALL -j DROP
--A ufw-before-input -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT
--A ufw-before-input -p tcp --dport 443 -j DROP
-EOF
-        ufw reload
-        ok "Защитные правила UFW добавлены."
-    else
-        info "Защитные правила UFW уже присутствуют."
-    fi
 fi
+
+# Добавляем анти-DDoS правила, если их нет
+if ! grep -q "# === Remnawave Anti-DDoS Rules ===" /etc/ufw/before.rules; then
+    # Удалим возможные старые вставки (по ключевому слову)
+    sed -i '/# === Remnawave Anti-DDoS Rules ===/,/# FINISH/d' /etc/ufw/before.rules
+    cat >> /etc/ufw/before.rules <<'EOF'
+
+# === Remnawave Anti-DDoS Rules ===
+-A ufw-before-input -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT
+-A ufw-before-input -p tcp --syn -j DROP
+-A ufw-before-input -m state --state INVALID -j DROP
+-A ufw-before-input -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP
+-A ufw-before-input -p tcp --tcp-flags ALL NONE -j DROP
+-A ufw-before-input -p tcp --tcp-flags ALL ALL -j DROP
+-A ufw-before-input -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT
+-A ufw-before-input -p tcp --dport 443 -j DROP
+EOF
+    ok "Анти-DDoS правила добавлены в before.rules."
+else
+    info "Анти-DDoS правила уже присутствуют."
+fi
+
+# Принудительно включаем/перезагружаем UFW без вопросов
+ufw --force enable
+ufw reload
+ok "UFW активен и правила загружены."
 
 # ==========================================
 # 6. Fail2Ban
@@ -296,7 +266,7 @@ else
 fi
 
 # ==========================================
-# 7. Проверка и удаление старой ноды
+# 7. Удаление старой ноды (по желанию)
 # ==========================================
 check_and_remove_existing
 
@@ -305,28 +275,25 @@ check_and_remove_existing
 # ==========================================
 info "Установка Remnawave Node..."
 INSTALL_DIR="/opt/remnanode"
-mkdir -p $INSTALL_DIR
+mkdir -p "$INSTALL_DIR"
 
-# Получение SECRET_KEY
+# Определяем SECRET_KEY
 if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
-    # Извлечём существующий SECRET_KEY, чтобы не запрашивать заново
     OLD_KEY=$(grep "SECRET_KEY=" "$INSTALL_DIR/docker-compose.yml" | cut -d'=' -f2 | tr -d ' ' | head -1)
     if [[ -n "$OLD_KEY" ]]; then
-        info "Найден существующий SECRET_KEY. Используем его."
         SECRET_KEY="$OLD_KEY"
+        info "Используем существующий SECRET_KEY."
     else
-        echo -n -e "${YELLOW}[?] Введите SECRET_KEY для ноды: ${NC}"
+        echo -n -e "${YELLOW}[?] Введите SECRET_KEY: ${NC}"
         read -r SECRET_KEY
-        [[ -z "$SECRET_KEY" ]] && err "SECRET_KEY не может быть пустым."
     fi
 else
-    echo -n -e "${YELLOW}[?] Введите SECRET_KEY для ноды: ${NC}"
+    echo -n -e "${YELLOW}[?] Введите SECRET_KEY: ${NC}"
     read -r SECRET_KEY
-    [[ -z "$SECRET_KEY" ]] && err "SECRET_KEY не может быть пустым."
 fi
+[[ -z "$SECRET_KEY" ]] && err "SECRET_KEY не может быть пустым."
 
-# Запись docker-compose.yml (перезаписываем, но с тем же ключом)
-cat > $INSTALL_DIR/docker-compose.yml <<EOF
+cat > "$INSTALL_DIR/docker-compose.yml" <<EOF
 services:
   remnanode:
     container_name: remnanode
@@ -351,14 +318,13 @@ services:
       - '/etc/localtime:/etc/localtime:ro'
 EOF
 
-# Запуск ноды (всегда пересоздаём, т.к. могли обновить образ)
-cd $INSTALL_DIR
+cd "$INSTALL_DIR"
 docker compose down 2>/dev/null || true
 docker compose up -d
 ok "Remnawave Node запущена."
 
 # ==========================================
-# 9. Автоблокировка аномальных IP (cron)
+# 9. Автоблокировка аномальных IP
 # ==========================================
 if ! crontab -l 2>/dev/null | grep -q "/root/auto-ban.sh"; then
     cat > /root/auto-ban.sh <<'EOF'
@@ -380,8 +346,9 @@ fi
 # ==========================================
 # 10. Дополнительные сервисы
 # ==========================================
-systemctl enable haveged --now 2>/dev/null || ok "haveged уже запущен"
-systemctl enable irqbalance --now 2>/dev/null || ok "irqbalance уже запущен"
+systemctl enable haveged --now 2>/dev/null || true
+systemctl enable irqbalance --now 2>/dev/null || true
+ok "Haveged и irqbalance (опционально) запущены."
 
 # ==========================================
 # Итог
@@ -391,14 +358,14 @@ echo "============================================================"
 ok "УСТАНОВКА ЗАВЕРШЕНА!"
 echo "============================================================"
 echo ""
-echo -e "${CYAN}Установленные компоненты:${NC}"
-echo "  ✓ BBR + TCP-оптимизация (sysctl)"
+echo -e "${GREEN}Установленные компоненты:${NC}"
+echo "  ✓ BBR + TCP-оптимизация"
 echo "  ✓ UFW + анти-DDoS правила"
 echo "  ✓ Fail2Ban"
 echo "  ✓ Docker + Remnawave Node (NET_ADMIN)"
 echo "  ✓ Автоблокировка аномальных IP (cron)"
 echo ""
-echo -e "${CYAN}Проверка:${NC}"
+echo -e "${BLUE}Проверка:${NC}"
 echo "  docker ps | grep remnanode"
 echo "  ufw status numbered"
 echo "  tail -f /root/auto-ban.log"
