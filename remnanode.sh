@@ -195,30 +195,33 @@ else
 fi
 
 # ==========================================
-# 5. UFW (исправленная версия – всегда сброс и чистая настройка)
+# 5. UFW – гарантированно чистая настройка
 # ==========================================
-info "Настройка UFW..."
+info "Настройка UFW с нуля..."
 
-# Полный сброс и настройка заново (гарантирует отсутствие старых ошибок)
+# Полный сброс (удаляем всё старое)
 ufw --force reset
+
+# Базовые политики
 ufw default deny incoming
 ufw default allow outgoing
 ufw default deny forward
 
-# Разрешаем нужные порты
+# Открываем необходимые порты
 ufw allow 22/tcp comment 'SSH'
 ufw allow 80/tcp comment 'HTTP'
 ufw allow 443/tcp comment 'HTTPS/VLESS'
 ufw allow 3000/tcp comment 'Remnawave API'
 
-# Восстанавливаем оригинальный before.rules из системного шаблона
+# Восстанавливаем оригинальный before.rules из системной директории
 ORIG_BEFORE="/usr/share/ufw/before.rules"
 if [[ -f "$ORIG_BEFORE" ]]; then
     cp "$ORIG_BEFORE" /etc/ufw/before.rules
+    ok "Оригинальный before.rules восстановлен."
 else
-    warn "Оригинальный before.rules не найден, создаю новый."
+    warn "Оригинальный before.rules не найден. Создаём базовый шаблон."
     cat > /etc/ufw/before.rules <<'EOF'
-# Описание стандартных правил (минимальный шаблон)
+# Minimal valid before.rules
 *nat
 :PREROUTING ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
@@ -241,8 +244,10 @@ COMMIT
 EOF
 fi
 
-# Добавляем наши анти-DDoS правила перед строкой COMMIT в секции *filter
-# Используем awk для вставки перед последним COMMIT в секции filter
+# Удаляем возможные предыдущие вставки наших правил (по маркеру)
+sed -i '/# === Remnawave Anti-DDoS Rules ===/,/^$/d' /etc/ufw/before.rules
+
+# Теперь добавляем наши правила перед последним COMMIT в секции *filter
 TMP_RULES=$(mktemp)
 awk '
 /^*filter$/ { in_filter=1 }
@@ -256,26 +261,33 @@ in_filter && /^COMMIT$/ {
     print "-A INPUT -p tcp --tcp-flags ALL ALL -j DROP"
     print "-A INPUT -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT"
     print "-A INPUT -p tcp --dport 443 -j DROP"
+    print ""
     in_filter=0
 }
 { print }
 ' /etc/ufw/before.rules > "$TMP_RULES"
 mv "$TMP_RULES" /etc/ufw/before.rules
 
-# Проверка синтаксиса перед применением
-if ! iptables-restore -t < /etc/ufw/before.rules 2>/dev/null; then
-    err "Ошибка синтаксиса в before.rules. Восстанавливаем оригинал."
+# Проверяем синтаксис получившегося файла
+if iptables-restore -t < /etc/ufw/before.rules 2>/dev/null; then
+    ok "Синтаксис before.rules корректен."
+else
+    warn "Ошибка синтаксиса в before.rules! Восстанавливаем оригинал без анти-DDoS правил."
+    # Возвращаем оригинальный файл (чистый)
     cp "$ORIG_BEFORE" /etc/ufw/before.rules
-    # Повторная попытка без дополнительных правил
-    ufw --force enable
-    ufw reload
-    err "Не удалось применить анти-DDoS правила. UFW работает с базовыми правилами."
+    # Убедимся, что ошибок нет
+    if ! iptables-restore -t < /etc/ufw/before.rules 2>/dev/null; then
+        err "Не удалось восстановить корректный before.rules. UFW будет отключён."
+        ufw --force disable
+    else
+        ok "Оригинальный before.rules восстановлен (без анти-DDoS правил)."
+    fi
 fi
 
-# Принудительно включаем и перезагружаем UFW
+# Принудительно включаем UFW и перезагружаем
 ufw --force enable
 ufw reload
-ok "UFW активен и анти-DDoS правила загружены."
+ok "UFW активен и настроен."
 
 # ==========================================
 # 6. Fail2Ban
