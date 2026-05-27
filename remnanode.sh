@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE INSTALLER — Ubuntu 24.04 / Debian 12
 # Оптимизировано под XRay Reality (TCP) + Hysteria2 (UDP)
-# Версия: 2026.1
+# Версия: 2026.1.2
 ###############################################################################
 
 APP="remnanode"
@@ -77,7 +77,19 @@ CODENAME=$VERSION_CODENAME
 ###############################################################################
 CPU=$(nproc)
 RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
+
+# Публичный IP (несколько источников на всякий случай)
+PUBLIC_IP=$(curl -fsS4 --max-time 3 https://api.ipify.org 2>/dev/null \
+         || curl -fsS4 --max-time 3 https://ifconfig.me 2>/dev/null \
+         || curl -fsS4 --max-time 3 https://icanhazip.com 2>/dev/null \
+         || echo "неизвестен")
+
+# Локальный IP по дефолтному маршруту (на случай NAT)
+LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+
 info "CPU: $CPU cores | RAM: ${RAM_MB}MB | ARCH: $ARCH"
+info "Public IP:  $PUBLIC_IP"
+info "Local IP:   ${LOCAL_IP:-неизвестен}"
 
 if   (( CPU <= 1 )); then BACKLOG=4096
 elif (( CPU <= 2 )); then BACKLOG=16384
@@ -439,6 +451,9 @@ systemctl restart docker'"
 
 ###############################################################################
 # docker-compose.yml
+# (sysctls удалены — Docker не позволяет их задавать при network_mode: host.
+#  Все нужные параметры уже применены на хосте через sysctl.d/99-remnanode.conf
+#  и контейнер автоматически использует их через общий network namespace.)
 ###############################################################################
 mkdir -p "$DIR"
 
@@ -459,8 +474,6 @@ services:
       nofile:
         soft: 1048576
         hard: 1048576
-    sysctls:
-      - net.ipv4.tcp_fastopen=3
 EOF
 
 chmod 600 "$COMPOSE"
@@ -482,7 +495,7 @@ fi
 ok "Контейнер remnanode работает"
 
 ###############################################################################
-# CLI panel — оригинальная навигация + расширенный LIVE
+# CLI panel
 ###############################################################################
 cat > /usr/local/bin/remnanode <<'CLIEOF'
 #!/usr/bin/env bash
@@ -517,7 +530,6 @@ live_panel() {
     printf "  Swap:     %s\n" "$SWAP"
     printf "  Disk /:   %s\n" "$DISK"
 
-    # Docker контейнер
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
       CSTATS=$(docker stats --no-stream --format '{{.CPUPerc}} | {{.MemUsage}}' remnanode 2>/dev/null)
       printf "  Node:     ${GREEN}● running${NC}  (%s)\n" "$CSTATS"
@@ -615,6 +627,7 @@ echo -e "${GREEN}===================================="
 echo -e "  ✔ УСТАНОВКА ЗАВЕРШЕНА"
 echo -e "====================================${NC}"
 echo
+echo " Public IP:               ${PUBLIC_IP}"
 echo " Панель IP (whitelisted): ${PANEL_IP}"
 echo " NODE_PORT:               ${NODE_PORT}"
 echo " SSH порт:                ${SSH_PORT}"
