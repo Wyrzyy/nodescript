@@ -1,68 +1,78 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Цвета для вывода
+# ==========================================
+# Цвета и стили для понятного вывода
+# ==========================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+ok()   { echo -e "${GREEN}[✓]${NC} $1"; }
+info() { echo -e "${BLUE}[i]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+err()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 
-# Проверка на root
-if [ "$EUID" -ne 0 ]; then
-    print_error "Пожалуйста, запустите скрипт с правами root (sudo)"
-    exit 1
-fi
+# ==========================================
+# Проверка прав root
+# ==========================================
+[[ $EUID -ne 0 ]] && err "Скрипт должен запускаться от root (sudo)."
 
-# Обновление списка пакетов и системы
-print_info "Обновление системы и пакетов..."
+# ==========================================
+# Обновление системы и установка базовых пакетов
+# ==========================================
+info "Обновление списка пакетов и установка необходимых утилит..."
 apt update -y && apt upgrade -y
-apt install -y curl wget git ufw fail2ban iptables-persistent netfilter-persistent software-properties-common gnupg lsb-release ca-certificates
+apt install -y curl wget git ufw fail2ban software-properties-common \
+                gnupg lsb-release ca-certificates haveged
 
-# Определение основного сетевого интерфейса
-DEFAULT_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-print_info "Основной сетевой интерфейс: $DEFAULT_INTERFACE"
+ok "Базовые пакеты установлены."
 
-# ============================================
-# 1. Системные оптимизации и TCP Tuning
-# ============================================
-print_info "Настройка системных параметров и TCP..."
+# ==========================================
+# Определение сетевого интерфейса
+# ==========================================
+DEFAULT_IF=$(ip route | grep default | awk '{print $5}' | head -1)
+[[ -z "$DEFAULT_IF" ]] && DEFAULT_IF="eth0"
+info "Основной сетевой интерфейс: $DEFAULT_IF"
 
-cat > /etc/sysctl.d/99-remnawave.conf <<EOF
-# ------------------------------------------------------------------
-# Remnawave Node Performance & Protection Tuning
-# ------------------------------------------------------------------
+# ==========================================
+# Оптимизация ядра для максимальной скорости (TCP/UDP)
+# ==========================================
+info "Настройка параметров ядра (BBR, буферы, защита)..."
 
-# 1. BBR + FQ (для максимальной производительности TCP)
+cat > /etc/sysctl.d/99-remnawave.conf <<'EOF'
+# ---------- СКОРОСТЬ И ПРОИЗВОДИТЕЛЬНОСТЬ ----------
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
 
-# 2. Увеличение лимитов для обработки большого числа соединений
+# Увеличение сетевых буферов (для высоких скоростей)
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.tcp_mem = 786432 1048576 1572864
+
+# Увеличение лимитов очередей
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_abort_on_overflow = 0
 
-# 3. Оптимизация памяти для сетевых буферов
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.tcp_mem = 786432 1048576 1572864
-
-# 4. Ускорение закрытия соединений и переиспользование портов
+# Быстрое закрытие соединений (уменьшает нагрузку)
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_tw_recycle = 0
 net.ipv4.ip_local_port_range = 1024 65535
 
-# 5. Защита от DDoS и вредоносных пакетов
+# ---------- ЗАЩИТА БЕЗ ПОТЕРИ СКОРОСТИ ----------
 net.ipv4.tcp_syn_retries = 2
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_rfc1337 = 1
@@ -73,7 +83,7 @@ net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_no_metrics_save = 1
 
-# 6. Игнорируем ICMP редиректы (безопасность)
+# Игнорируем ICMP редиректы (безопасность)
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
@@ -81,26 +91,25 @@ net.ipv4.conf.default.secure_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 
-# 7. Защита от ICMP flood
+# Защита от ICMP flood
 net.ipv4.icmp_echo_ignore_all = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 
-# 8. Увеличение лимитов для файлов (для высоких нагрузок)
+# Лимиты файлов (для большого числа соединений)
 fs.file-max = 2097152
 fs.inotify.max_user_instances = 8192
 fs.inotify.max_user_watches = 524288
 EOF
 
 sysctl -p /etc/sysctl.d/99-remnawave.conf
-print_success "Системные параметры применены"
+ok "Параметры ядра применены."
 
-# ============================================
-# 2. Лимиты для пользователя (ulimits)
-# ============================================
-print_info "Настройка ulimits..."
-
-cat > /etc/security/limits.d/99-remnawave.conf <<EOF
+# ==========================================
+# Ulimits (файловые дескрипторы)
+# ==========================================
+info "Настройка лимитов (ulimit)..."
+cat > /etc/security/limits.d/99-remnawave.conf <<'EOF'
 * soft nofile 1048576
 * hard nofile 1048576
 * soft nproc unlimited
@@ -109,158 +118,120 @@ root soft nofile 1048576
 root hard nofile 1048576
 EOF
 
-# Настройка systemd лимитов
 mkdir -p /etc/systemd/system.conf.d/
-cat > /etc/systemd/system.conf.d/99-limits.conf <<EOF
+cat > /etc/systemd/system.conf.d/99-limits.conf <<'EOF'
 [Manager]
 DefaultLimitNOFILE=1048576
 DefaultLimitNPROC=infinity
 EOF
-
 systemctl daemon-reload
-print_success "Ulimits настроены"
+ok "Ulimits настроены."
 
-# ============================================
-# 3. Установка Docker
-# ============================================
-print_info "Установка Docker..."
+# ==========================================
+# Установка Docker (официальный репозиторий)
+# ==========================================
+info "Установка Docker..."
+if ! command -v docker &> /dev/null; then
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    apt update -y
+    apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    systemctl enable docker
+    systemctl start docker
+    ok "Docker установлен."
+else
+    ok "Docker уже установлен."
+fi
 
-# Добавление официального репозитория Docker
-mkdir -p /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-apt update -y
-apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-systemctl enable docker
-systemctl start docker
-
-print_success "Docker и Docker Compose установлены"
-
-# ============================================
-# 4. Настройка UFW (Uncomplicated Firewall)
-# ============================================
-print_info "Настройка UFW..."
-
-# Сброс к дефолтным настройкам
-yes | ufw reset
-
-# Политики по умолчанию
+# ==========================================
+# Настройка UFW (порты + анти-DDoS)
+# ==========================================
+info "Настройка файрвола UFW..."
+ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw default deny forward
 
-# Разрешаем только нужные порты
 ufw allow 22/tcp comment 'SSH'
 ufw allow 80/tcp comment 'HTTP'
 ufw allow 443/tcp comment 'HTTPS/VLESS'
 ufw allow 3000/tcp comment 'Remnawave API'
 
-# Защита от SYN flood на уровне UFW
-# (это дополнение к iptables правилам)
+# Вставляем защитные правила в before.rules
+sed -i '/# End required/d' /etc/ufw/before.rules
 cat >> /etc/ufw/before.rules <<'EOF'
 
-# === Remnawave Anti-DDoS Rules ===
-# Ограничение SYN пакетов
+# === АНТИ-DDOS ПРАВИЛА (сохраняют скорость для легитимных юзеров) ===
+# Защита от SYN Flood
 -A ufw-before-input -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT
 -A ufw-before-input -p tcp --syn -j DROP
 
 # Отбрасываем невалидные пакеты
 -A ufw-before-input -m state --state INVALID -j DROP
 
-# Ограничение на количество соединений с одного IP (для 443 порта)
+# Максимум 30 соединений с одного IP на 443 порту (безопасно для реальных пользователей)
 -A ufw-before-input -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP
 
 # Защита от сканирования портов
 -A ufw-before-input -p tcp --tcp-flags ALL NONE -j DROP
 -A ufw-before-input -p tcp --tcp-flags ALL ALL -j DROP
+
+# Rate limit (50 новых соединений в секунду – достаточно для любого легитимного трафика)
+-A ufw-before-input -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT
+-A ufw-before-input -p tcp --dport 443 -j DROP
+# End required
 EOF
 
-# Включаем UFW
 yes | ufw enable
-print_success "UFW настроен: открыты порты 22, 80, 443, 3000"
+ok "UFW настроен (порты 22,80,443,3000 открыты)."
 
-# ============================================
-# 5. Установка и настройка Fail2Ban
-# ============================================
-print_info "Установка Fail2Ban..."
-
+# ==========================================
+# Настройка Fail2Ban (бан через ufw)
+# ==========================================
+info "Настройка Fail2Ban..."
+systemctl stop fail2ban 2>/dev/null || true
 apt install -y fail2ban
 
-# Создаем фильтры для защиты от DDoS
-cat > /etc/fail2ban/filter.d/remnawave-ddos.conf <<'EOF'
-[Definition]
-failregex = ^.*rate limit exceeded.*remote_ip": "<HOST>".*$
-ignoreregex =
-EOF
-
-cat > /etc/fail2ban/filter.d/remnawave-connlimit.conf <<'EOF'
-[Definition]
-failregex = ^.*connlimit.*\s<HOST>\s.*$
-ignoreregex =
-EOF
-
-# Настройка jail.local
 cat > /etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
 bantime = 1h
 findtime = 60
 maxretry = 20
-banaction = iptables-multiport
+banaction = ufw
 ignoreip = 127.0.0.1/8
 
 [sshd]
 enabled = true
 port = 22
-filter = sshd
 maxretry = 5
 bantime = 1h
 
-[remnawave-ddos]
+[sshd-ddos]
 enabled = true
-port = 80,443
-filter = remnawave-ddos
-logpath = /var/log/caddy/access.log
-         /var/log/remnanode/access.log
-maxretry = 30
+port = 22
+maxretry = 10
 findtime = 30
-bantime = 4h
-
-[remnawave-connlimit]
-enabled = true
-port = 80,443
-filter = remnawave-connlimit
-logpath = /var/log/ufw.log
-maxretry = 5
-findtime = 10
-bantime = 1h
+bantime = 2h
 EOF
 
 systemctl restart fail2ban
 systemctl enable fail2ban
-print_success "Fail2Ban настроен"
+ok "Fail2Ban активирован (бан через UFW)."
 
-# ============================================
-# 6. Установка Remnawave Node
-# ============================================
-print_info "Установка Remnawave Node..."
-
-# Директория для установки
+# ==========================================
+# Установка Remnawave Node
+# ==========================================
+info "Подготовка к установке Remnawave Node..."
 INSTALL_DIR="/opt/remnanode"
-mkdir -p ${INSTALL_DIR}
+mkdir -p $INSTALL_DIR
 
-# Запрос SECRET_KEY у пользователя
-echo ""
-print_warning "Введите SECRET_KEY для Remnawave ноды (можно получить в панели управления):"
-read -p "SECRET_KEY: " SECRET_KEY
+echo -n -e "${YELLOW}[?]${NC} Введите SECRET_KEY для ноды (из панели управления): "
+read -r SECRET_KEY
+[[ -z "$SECRET_KEY" ]] && err "SECRET_KEY не может быть пустым."
 
-if [ -z "$SECRET_KEY" ]; then
-    print_error "SECRET_KEY не может быть пустым!"
-    exit 1
-fi
-
-# Создание docker-compose.yml с NET_ADMIN и лимитами ресурсов
-cat > ${INSTALL_DIR}/docker-compose.yml <<EOF
+info "Создание docker-compose.yml с ограничением ресурсов и NET_ADMIN..."
+cat > $INSTALL_DIR/docker-compose.yml <<EOF
 services:
   remnanode:
     container_name: remnanode
@@ -268,12 +239,8 @@ services:
     image: remnawave/node:latest
     network_mode: host
     restart: always
-    
-    # Добавляем NET_ADMIN для управления соединениями
     cap_add:
       - NET_ADMIN
-    
-    # Ограничение ресурсов контейнера
     deploy:
       resources:
         limits:
@@ -282,89 +249,81 @@ services:
         reservations:
           cpus: '0.5'
           memory: 512M
-    
     environment:
       - NODE_PORT=3000
       - SECRET_KEY=${SECRET_KEY}
-    
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "5"
         compress: "true"
-    
     volumes:
       - '/var/log/remnanode:/var/log/remnanode'
       - '/etc/timezone:/etc/timezone:ro'
       - '/etc/localtime:/etc/localtime:ro'
 EOF
 
-# Запуск ноды
-cd ${INSTALL_DIR}
+cd $INSTALL_DIR
 docker compose up -d
+ok "Remnawave Node запущена (контейнер remnanode)."
 
-print_success "Remnawave Node установлена и запущена"
+# ==========================================
+# Автоматическая блокировка аномальных IP (cron)
+# ==========================================
+info "Настройка автоматической блокировки атакующих IP..."
+cat > /root/auto-ban.sh <<'EOF'
+#!/bin/bash
+# Блокирует IP, создающие более 30 соединений на порту 443
+ss -tn | grep :443 | awk '{print $5}' | cut -d: -f1 | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort | uniq -c | sort -nr | awk '{if ($1 > 30) print $2}' | while read ip; do
+    if ! ufw status | grep -q "$ip"; then
+        echo "$(date): AUTO-BAN $ip ($1 соединений)" >> /root/auto-ban.log
+        ufw deny from $ip to any port 443 comment "AUTO_BAN_$(date +%s)"
+    fi
+done
+EOF
 
-# ============================================
-# 7. Дополнительные iptables правила (дублирование защиты)
-# ============================================
-print_info "Применение дополнительных iptables правил..."
+chmod +x /root/auto-ban.sh
+(crontab -l 2>/dev/null; echo "*/2 * * * * /root/auto-ban.sh") | crontab -
+ok "Автоблокировка IP через cron добавлена (каждые 2 минуты)."
 
-# Очистка старых правил, но сохранение важных
-iptables -F
-iptables -X
+# ==========================================
+# Дополнительные улучшения для скорости
+# ==========================================
+info "Включение генератора случайных чисел (haveged) для ускорения TLS..."
+systemctl enable haveged
+systemctl start haveged
 
-# Базовые разрешения
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+info "Настройка планировщика CPU для сетевых прерываний (IRQ)..."
+apt install -y irqbalance
+systemctl enable irqbalance
+systemctl start irqbalance
 
-# SYN Flood защита
-iptables -A INPUT -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT
-iptables -A INPUT -p tcp --syn -j DROP
-
-# Невалидные пакеты
-iptables -A INPUT -m state --state INVALID -j DROP
-
-# Connlimit для порта 443
-iptables -A INPUT -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP
-
-# Rate limit для порта 443 (пропускаем легитимный трафик)
-iptables -A INPUT -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT
-iptables -A INPUT -p tcp --dport 443 -j DROP
-
-# Сохраняем правила
-netfilter-persistent save
-
-print_success "Дополнительные iptables правила применены"
-
-# ============================================
-# 8. Информация о установке
-# ============================================
+# ==========================================
+# Итоговый вывод
+# ==========================================
 echo ""
-echo "=========================================="
-print_success "УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!"
-echo "=========================================="
+echo "============================================================"
+ok "УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!"
+echo "============================================================"
 echo ""
-print_info "Установлены компоненты:"
-echo "  ✓ BBR + TCP Tuning"
-echo "  ✓ UFW (порты: 22, 80, 443, 3000)"
-echo "  ✓ Защита от SYN flood"
-echo "  ✓ Fail2Ban с кастомными правилами"
-echo "  ✓ Docker + Remnawave Node"
+echo -e "${CYAN}Установленные компоненты:${NC}"
+echo "  ✓ BBR + полная TCP-оптимизация (максимальная скорость)"
+echo "  ✓ Увеличенные буферы и лимиты файлов"
+echo "  ✓ UFW (порты 22,80,443,3000) + встроенная DDoS-защита"
+echo "  ✓ Fail2Ban (блокировка подозрительных IP через UFW)"
+echo "  ✓ Docker и Docker Compose"
+echo "  ✓ Remnawave Node (контейнер с NET_ADMIN и лимитами CPU/RAM)"
+echo "  ✓ Автоматическая блокировка IP с >30 соединений (cron)"
+echo "  ✓ Haveged (ускорение шифрования) + irqbalance"
 echo ""
-print_info "Проверка статуса:"
-docker ps | grep remnanode
+echo -e "${CYAN}Проверка работы:${NC}"
+echo "  docker ps | grep remnanode"
+echo "  ufw status numbered"
+echo "  tail -f /root/auto-ban.log"
 echo ""
-print_info "Логи ноды:"
-echo "  docker logs -f remnanode"
-echo ""
-print_info "Проверка BBR:"
-echo "  sysctl net.ipv4.tcp_congestion_control"
-echo ""
-print_warning "Рекомендации:"
-echo "  1. Настройте Cloudflare для дополнительной защиты"
-echo "  2. Регулярно обновляйте систему: apt update && apt upgrade"
-echo "  3. Настройте мониторинг: docker stats remnanode"
-echo "=========================================="
+echo -e "${YELLOW}Рекомендации:${NC}"
+echo "  • Настройте Cloudflare для дополнительной защиты от DDoS"
+echo "  • Регулярно обновляйте систему: apt update && apt upgrade"
+echo "  • Для отслеживания нагрузки: docker stats remnanode"
+echo "============================================================"
