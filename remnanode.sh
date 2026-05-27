@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ########################################
-# CONFIG
+# НАСТРОЙКИ
 ########################################
 
 APP="remnanode"
@@ -10,7 +10,7 @@ INSTALL_DIR="/opt/${APP}"
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 
 ########################################
-# COLORS
+# ЦВЕТА
 ########################################
 
 GREEN='\033[0;32m'
@@ -25,33 +25,47 @@ warn(){ echo -e "${YELLOW}[!]${NC} $1"; }
 fail(){ echo -e "${RED}[x]${NC} $1"; exit 1; }
 
 ########################################
-# ROOT CHECK
+# ROOT
 ########################################
 
-[[ $EUID -ne 0 ]] && fail "Run as root"
+[[ $EUID -ne 0 ]] && fail "Запустите скрипт от root"
 
 export DEBIAN_FRONTEND=noninteractive
 
 clear
 
-echo "================================================"
-echo "              REMNANODE INSTALLER"
-echo "================================================"
+echo "=================================================="
+echo "            REMNANODE INSTALLER"
+echo "=================================================="
 echo
 
 ########################################
-# OS CHECK
+# ПРОВЕРКА ОС
 ########################################
 
 if ! grep -qiE 'ubuntu|debian' /etc/os-release; then
-    fail "Only Ubuntu/Debian supported"
+    fail "Поддерживается только Ubuntu/Debian"
 fi
 
 ########################################
-# PACKAGES
+# ИНФОРМАЦИЯ О СЕРВЕРЕ
 ########################################
 
-info "Installing packages..."
+RAM=$(free -m | awk '/Mem:/ {print $2}')
+CPU=$(nproc)
+
+info "RAM: ${RAM} MB"
+info "CPU: ${CPU} cores"
+
+if (( RAM < 1800 )); then
+    warn "Рекомендуется минимум 2GB RAM"
+fi
+
+########################################
+# ПАКЕТЫ
+########################################
+
+info "Установка пакетов..."
 
 apt update -qq
 
@@ -68,30 +82,29 @@ apt-transport-https \
 software-properties-common \
 fail2ban \
 iptables \
-nftables \
 iptables-persistent \
 netfilter-persistent \
 irqbalance \
 unzip >/dev/null
 
-ok "Packages installed"
+ok "Пакеты установлены"
 
 ########################################
-# IPTABLES NFT BACKEND
+# IPTABLES BACKEND
 ########################################
 
-info "Configuring iptables backend..."
+info "Настройка iptables backend..."
 
 update-alternatives --set iptables /usr/sbin/iptables-nft >/dev/null
 update-alternatives --set ip6tables /usr/sbin/ip6tables-nft >/dev/null
 
-ok "iptables-nft enabled"
+ok "iptables-nft включен"
 
 ########################################
 # SYSCTL
 ########################################
 
-info "Applying kernel optimization..."
+info "Оптимизация ядра..."
 
 cat >/etc/sysctl.d/99-remnanode.conf <<'EOF'
 net.core.default_qdisc=fq
@@ -117,6 +130,14 @@ net.ipv4.tcp_mtu_probing=1
 
 net.ipv4.ip_forward=1
 
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+
+net.netfilter.nf_conntrack_max=1048576
+
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
 
@@ -132,9 +153,9 @@ net.ipv4.conf.default.rp_filter=1
 net.ipv4.icmp_echo_ignore_broadcasts=1
 net.ipv4.icmp_ignore_bogus_error_responses=1
 
-net.netfilter.nf_conntrack_max=1048576
-
 fs.file-max=2097152
+
+vm.swappiness=10
 
 fs.inotify.max_user_instances=8192
 fs.inotify.max_user_watches=524288
@@ -142,13 +163,13 @@ EOF
 
 sysctl --system >/dev/null
 
-ok "Kernel optimized"
+ok "Ядро оптимизировано"
 
 ########################################
 # LIMITS
 ########################################
 
-info "Applying limits..."
+info "Настройка лимитов..."
 
 cat >/etc/security/limits.d/99-remnanode.conf <<'EOF'
 * soft nofile 1048576
@@ -166,13 +187,13 @@ EOF
 
 systemctl daemon-reexec
 
-ok "Limits applied"
+ok "Лимиты настроены"
 
 ########################################
 # JOURNALD
 ########################################
 
-info "Optimizing journald..."
+info "Оптимизация логов..."
 
 mkdir -p /etc/systemd/journald.conf.d
 
@@ -182,11 +203,25 @@ SystemMaxUse=200M
 RuntimeMaxUse=100M
 RateLimitIntervalSec=30s
 RateLimitBurst=200
+Compress=yes
 EOF
 
 systemctl restart systemd-journald
 
-ok "Journald optimized"
+ok "Journald оптимизирован"
+
+########################################
+# SSH HARDENING
+########################################
+
+info "Усиление SSH..."
+
+sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 3/' /etc/ssh/sshd_config
+sed -i 's/^#*LoginGraceTime.*/LoginGraceTime 20/' /etc/ssh/sshd_config
+
+systemctl restart ssh || true
+
+ok "SSH усилен"
 
 ########################################
 # DOCKER
@@ -194,7 +229,7 @@ ok "Journald optimized"
 
 if ! command -v docker >/dev/null; then
 
-info "Installing Docker..."
+info "Установка Docker..."
 
 mkdir -p /etc/apt/keyrings
 
@@ -223,12 +258,15 @@ mkdir -p /etc/docker
 cat >/etc/docker/daemon.json <<'EOF'
 {
   "live-restore": true,
-  "userland-proxy": false,
   "iptables": true,
+  "userland-proxy": false,
+  "storage-driver": "overlay2",
   "log-driver": "json-file",
+  "shutdown-timeout": 15,
   "log-opts": {
     "max-size": "10m",
-    "max-file": "3"
+    "max-file": "3",
+    "compress": "true"
   }
 }
 EOF
@@ -236,13 +274,13 @@ EOF
 systemctl enable docker >/dev/null
 systemctl restart docker
 
-ok "Docker configured"
+ok "Docker настроен"
 
 ########################################
 # FIREWALL
 ########################################
 
-info "Configuring firewall..."
+info "Настройка firewall..."
 
 iptables -F
 iptables -X
@@ -253,36 +291,55 @@ iptables -P OUTPUT ACCEPT
 
 iptables -A INPUT -i lo -j ACCEPT
 
-iptables -A INPUT -m conntrack \
---ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT \
+-m conntrack \
+--ctstate ESTABLISHED,RELATED \
+-j ACCEPT
 
-iptables -A INPUT -m conntrack \
---ctstate INVALID -j DROP
+iptables -A INPUT \
+-m conntrack \
+--ctstate INVALID \
+-j DROP
 
-iptables -A INPUT -p tcp --dport 22 \
--m connlimit --connlimit-above 10 -j DROP
+iptables -A INPUT \
+-p tcp \
+--dport 22 \
+-m connlimit \
+--connlimit-above 10 \
+-j DROP
 
-iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+iptables -A INPUT \
+-p tcp \
+--dport 22 \
+-j ACCEPT
 
-iptables -A INPUT -p tcp \
--m multiport --dports 80,443,3000 -j ACCEPT
+iptables -A INPUT \
+-p tcp \
+-m multiport \
+--dports 80,443,3000 \
+-j ACCEPT
 
-iptables -A INPUT -p udp --dport 443 -j ACCEPT
+iptables -A INPUT \
+-p udp \
+--dport 443 \
+-j ACCEPT
 
-iptables -A INPUT -p icmp -j ACCEPT
+iptables -A INPUT \
+-p icmp \
+-j ACCEPT
 
 iptables-save >/etc/iptables/rules.v4
 
 systemctl enable netfilter-persistent >/dev/null
 systemctl restart netfilter-persistent
 
-ok "Firewall configured"
+ok "Firewall настроен"
 
 ########################################
 # FAIL2BAN
 ########################################
 
-info "Configuring Fail2Ban..."
+info "Настройка Fail2Ban..."
 
 cat >/etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
@@ -299,19 +356,19 @@ EOF
 systemctl enable fail2ban >/dev/null
 systemctl restart fail2ban
 
-ok "Fail2Ban configured"
+ok "Fail2Ban настроен"
 
 ########################################
 # IRQBALANCE
 ########################################
 
-if (( $(nproc) >= 4 )); then
+if (( CPU >= 4 )); then
     systemctl enable irqbalance --now >/dev/null
-    ok "irqbalance enabled"
+    ok "irqbalance включен"
 fi
 
 ########################################
-# DIRECTORY
+# ДИРЕКТОРИИ
 ########################################
 
 mkdir -p "${INSTALL_DIR}"
@@ -324,19 +381,18 @@ mkdir -p /var/log/remnanode
 while true; do
 
 echo
-read -rsp "SECRET_KEY: " SECRET_KEY
-echo
+read -rp "Введите SECRET_KEY: " SECRET_KEY
 
-read -rsp "CONFIRM SECRET_KEY: " SECRET_KEY_CONFIRM
 echo
+read -rp "Подтвердите SECRET_KEY: " SECRET_KEY_CONFIRM
 
 [[ -z "${SECRET_KEY}" ]] && {
-    warn "SECRET_KEY cannot be empty"
+    warn "SECRET_KEY не может быть пустым"
     continue
 }
 
 [[ "${SECRET_KEY}" != "${SECRET_KEY_CONFIRM}" ]] && {
-    warn "SECRET_KEY mismatch"
+    warn "SECRET_KEY не совпадает"
     continue
 }
 
@@ -344,21 +400,21 @@ break
 
 done
 
-ok "SECRET_KEY confirmed"
+ok "SECRET_KEY подтвержден"
 
 ########################################
-# PORT CHECK
+# ПРОВЕРКА ПОРТОВ
 ########################################
 
 if ss -tulpn | grep -q ':443 '; then
-    fail "Port 443 already in use"
+    fail "Порт 443 уже занят"
 fi
 
 ########################################
-# COMPOSE
+# DOCKER COMPOSE
 ########################################
 
-info "Creating compose..."
+info "Создание docker compose..."
 
 cat >"${COMPOSE_FILE}" <<EOF
 services:
@@ -372,6 +428,8 @@ services:
     hostname: remnanode
 
     restart: unless-stopped
+
+    stop_grace_period: 15s
 
     ports:
       - "443:443/tcp"
@@ -394,29 +452,30 @@ services:
       - SECRET_KEY=${SECRET_KEY}
       - NODE_PORT=3000
 
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
 
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
     volumes:
       - /var/log/remnanode:/var/log/remnanode
 EOF
 
-ok "Compose created"
+ok "Compose создан"
 
 ########################################
-# START CONTAINER
+# ЗАПУСК
 ########################################
 
-info "Starting container..."
+info "Запуск контейнера..."
 
 cd "${INSTALL_DIR}"
 
@@ -430,16 +489,29 @@ sleep 5
 
 if ! docker ps | grep -q remnanode; then
     docker logs remnanode --tail 50
-    fail "Container failed to start"
+    fail "Контейнер не запустился"
 fi
 
-ok "Container started"
+ok "Контейнер успешно запущен"
+
+########################################
+# AUTO CLEANUP
+########################################
+
+info "Настройка автоочистки Docker..."
+
+cat >/etc/cron.daily/docker-cleanup <<'EOF'
+#!/usr/bin/env bash
+docker system prune -af >/dev/null 2>&1
+EOF
+
+chmod +x /etc/cron.daily/docker-cleanup
+
+ok "Автоочистка настроена"
 
 ########################################
 # LOGROTATE
 ########################################
-
-info "Configuring logrotate..."
 
 cat >/etc/logrotate.d/remnanode <<'EOF'
 /var/log/remnanode/*.log {
@@ -452,52 +524,42 @@ cat >/etc/logrotate.d/remnanode <<'EOF'
 }
 EOF
 
-ok "Logrotate configured"
-
 ########################################
 # CLI
 ########################################
 
-info "Installing CLI..."
+info "Установка CLI..."
 
 cat >/usr/local/bin/remnanode <<'EOF'
 #!/usr/bin/env bash
-
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-NC='\033[0m'
 
 while true; do
 
 clear
 
-echo -e "${BLUE}"
-echo "================================="
-echo "          REMNANODE"
-echo "================================="
-echo -e "${NC}"
-
 STATUS=$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || echo "not_found")
 
-echo "Status: ${STATUS}"
+echo "======================================="
+echo "             REMNANODE"
+echo "======================================="
 echo
-
-echo "1) Status"
-echo "2) Logs"
-echo "3) Restart"
-echo "4) Stop"
-echo "5) Start"
+echo "Статус: ${STATUS}"
+echo
+echo "1) Статус контейнера"
+echo "2) Логи"
+echo "3) Перезапуск"
+echo "4) Остановить"
+echo "5) Запустить"
 echo "6) Docker Stats"
-echo "7) Firewall Rules"
-echo "8) Fail2Ban Status"
-echo "9) Update Container"
-echo "10) Reinstall"
+echo "7) Firewall"
+echo "8) Fail2Ban"
+echo "9) Обновить контейнер"
+echo "10) Переустановить"
 echo "11) Healthcheck"
-echo "0) Exit"
+echo "0) Выход"
 echo
 
-read -rp "Select: " opt
+read -rp "Выберите пункт: " opt
 
 case $opt in
 
@@ -554,67 +616,56 @@ exit 0
 ;;
 
 *)
-echo "Invalid option"
+echo "Неверный пункт"
 ;;
 
 esac
 
 echo
-read -rp "Press Enter..."
+read -rp "Нажмите Enter..."
 done
 EOF
 
 chmod +x /usr/local/bin/remnanode
 
-ok "CLI installed"
+ok "CLI установлен"
 
 ########################################
-# SAVE INSTALLER
+# СОХРАНЕНИЕ INSTALLER
 ########################################
 
 cp "$0" /opt/remnanode/install.sh 2>/dev/null || true
 
 ########################################
-# FINAL
+# ФИНАЛ
 ########################################
 
 clear
 
-echo "================================================"
-echo "              INSTALL COMPLETE"
-echo "================================================"
+echo "=================================================="
+echo "             УСТАНОВКА ЗАВЕРШЕНА"
+echo "=================================================="
 echo
-
-echo -e "${GREEN}Installed:${NC}"
+echo "Установлено:"
 echo
 echo "✓ Docker"
 echo "✓ Remnanode"
 echo "✓ BBR"
-echo "✓ Fail2Ban"
 echo "✓ Firewall"
+echo "✓ Fail2Ban"
 echo "✓ Docker hardening"
+echo "✓ Auto cleanup"
 echo "✓ Healthcheck"
-echo "✓ Logrotate"
 echo "✓ CLI manager"
 echo
-
-echo -e "${BLUE}Command:${NC}"
+echo "Команда управления:"
 echo
 echo "remnanode"
 echo
-
-echo -e "${BLUE}Ports:${NC}"
+echo "Порты:"
 echo
 echo "443/tcp"
 echo "443/udp"
 echo "3000/tcp"
 echo
-
-echo -e "${BLUE}Checks:${NC}"
-echo
-echo "docker ps"
-echo "docker logs remnanode"
-echo "fail2ban-client status"
-echo
-
-echo "================================================"
+echo "=================================================="
