@@ -25,28 +25,36 @@ spin(){
   while kill -0 $pid 2>/dev/null; do
     for ((i=0;i<${#s};i++)); do
       printf "\r%s %s" "$msg" "${s:$i:1}"
-      sleep 0.07
+      sleep 0.06
     done
   done
   printf "\r%s ✔\n" "$msg"
 }
 
-bar(){
-  local c=$1 t=$2 m=$3
-  local p=$((c*100/t))
-  local f=$((p/10))
-  printf "\r[%d/%d] %-20s [" "$c" "$t" "$m"
-  for i in {1..10}; do
-    [[ $i -le $f ]] && printf "█" || printf "-"
-  done
-  printf "] %d%%" "$p"
-  [[ $c -eq $t ]] && echo
+run_step(){
+  local msg="$1"
+  local cmd="$2"
+
+  echo
+  echo -e "${BLUE}➡ $msg${NC}"
+
+  (
+    eval "$cmd" >/dev/null 2>&1
+  ) &
+
+  spin $! "$msg"
 }
 
 [[ $EUID -ne 0 ]] && err "Запусти от root"
 
 clear
-echo -e "${BLUE}==== REMNANODE INSTALL ====${NC}"
+echo -e "${BLUE}===================================="
+echo -e "        🚀 REMNANODE INSTALL"
+echo -e "====================================${NC}"
+
+########################################
+# SYSTEM INFO
+########################################
 
 CPU=$(nproc)
 RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
@@ -54,79 +62,84 @@ RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
 info "CPU: $CPU | RAM: ${RAM_MB}MB"
 
 ########################################
+# CPU MODE (ВАЖНО)
+########################################
+
+if (( CPU <= 1 )); then
+  MODE="LOW"
+  BACKLOG=1024
+elif (( CPU <= 2 )); then
+  MODE="MID"
+  BACKLOG=8192
+else
+  MODE="HIGH"
+  BACKLOG=65535
+fi
+
+info "Режим сервера: $MODE"
+
+########################################
 # SWAP + ZRAM
 ########################################
 
-if [[ $RAM_MB -le 4096 ]]; then
-  info "Настройка swap..."
+setup_memory() {
+  if (( RAM_MB <= 4096 )); then
 
-  if [[ ! -f /swapfile ]]; then
-    fallocate -l $(( RAM_MB <= 2048 ? 2 : 1 ))G /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null
-    swapon /swapfile
-    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    if [[ ! -f /swapfile ]]; then
+      local size=$(( RAM_MB <= 2048 ? 2 : 1 ))
+      run_step "Создание swap ${size}G" "fallocate -l ${size}G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab"
+    fi
+
+    if (( RAM_MB <= 2048 )); then
+      run_step "Активация ZRAM" "modprobe zram 2>/dev/null || true"
+    fi
+
+  else
+    info "Swap не требуется"
   fi
+}
 
-  if [[ $RAM_MB -le 2048 ]]; then
-    modprobe zram 2>/dev/null || true
-    echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true
-    echo $((RAM_MB * 1024 * 1024 / 2)) > /sys/block/zram0/disksize 2>/dev/null || true
-    mkswap /dev/zram0 >/dev/null 2>&1 || true
-    swapon /dev/zram0 >/dev/null 2>&1 || true
-  fi
-
-  ok "Swap/ZRAM настроены"
-else
-  info "Swap не требуется"
-fi
+setup_memory
 
 ########################################
 # PACKAGES
 ########################################
 
-(
-apt update -qq >/dev/null 2>&1
-apt install -y -qq curl wget git jq fail2ban iptables irqbalance >/dev/null 2>&1
-) & spin $! "Пакеты"
-
-bar 1 5 "Пакеты"
+run_step "Установка пакетов" \
+"apt update -qq && apt install -y -qq curl wget git jq fail2ban iptables irqbalance"
 
 ########################################
-# SYSCTL SAFE
+# SYSCTL (FIXED + CPU ADAPTIVE)
 ########################################
 
+run_step "Настройка ядра" "bash -c '
 cat >/etc/sysctl.d/99-remnanode.conf <<EOF
-net.core.default_qdisc=fq
+net.core.somaxconn=$BACKLOG
+net.core.netdev_max_backlog=$BACKLOG
+net.ipv4.tcp_max_syn_backlog=$BACKLOG
 net.ipv4.tcp_congestion_control=bbr
-net.core.somaxconn=65535
-net.core.netdev_max_backlog=$((CPU * 2048))
-net.ipv4.tcp_max_syn_backlog=$((CPU * 2048))
+net.core.default_qdisc=fq
 net.ipv4.tcp_fastopen=3
 net.ipv4.ip_local_port_range=1024 65535
-fs.file-max=$((RAM_MB * 1024))
-vm.swappiness=$([[ $RAM_MB -le 2048 ]] && echo 60 || echo 20)
+fs.file-max=2097152
 EOF
-
-sysctl --system >/dev/null 2>&1 & spin $! "Sysctl"
-bar 2 5 "Kernel"
+sysctl --system >/dev/null
+'"
 
 ########################################
 # LIMITS
 ########################################
 
-cat >/etc/security/limits.d/99-remnanode.conf <<EOF
-* soft nofile 1048576
-* hard nofile 1048576
-EOF
-
-bar 3 5 "Limits"
+run_step "Ограничения системы" \
+"bash -c 'echo \"* soft nofile 1048576
+* hard nofile 1048576\" > /etc/security/limits.d/99-remnanode.conf'"
 
 ########################################
 # FAIL2BAN
 ########################################
 
-cat >/etc/fail2ban/jail.local <<EOF
+run_step "Fail2Ban" \
+"bash -c 'cat >/etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 bantime = 6h
 findtime = 10m
@@ -135,26 +148,19 @@ maxretry = 5
 [sshd]
 enabled = true
 EOF
-
-systemctl restart fail2ban >/dev/null 2>&1
-bar 4 5 "Fail2Ban"
+systemctl restart fail2ban >/dev/null 2>&1'"
 
 ########################################
-# DOCKER
+# DOCKER (FIX NETWORK BUG)
 ########################################
 
 if ! command -v docker >/dev/null; then
-(
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
-apt update -qq >/dev/null 2>&1
-apt install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null 2>&1
-systemctl enable docker >/dev/null
-systemctl start docker >/dev/null
-) & spin $! "Docker"
+run_step "Docker установка" \
+"curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg &&
+echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\" > /etc/apt/sources.list.d/docker.list &&
+apt update -qq && apt install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin &&
+systemctl enable docker && systemctl start docker"
 fi
-
-bar 5 5 "Docker"
 
 ########################################
 # SECRET KEY SAFE INPUT
@@ -162,14 +168,11 @@ bar 5 5 "Docker"
 
 echo
 while true; do
-  read -rsp "🔑 SECRET_KEY: " KEY1
-  echo
-  read -rsp "🔑 Подтверждение: " KEY2
-  echo
+  read -rsp "🔑 SECRET_KEY: " K1; echo
+  read -rsp "🔑 Повтор: " K2; echo
 
-  [[ -z "$KEY1" ]] && { warn "Пусто"; continue; }
-  [[ "$KEY1" != "$KEY2" ]] && { warn "Не совпадает"; continue; }
-
+  [[ -z "$K1" ]] && { warn "Пусто"; continue; }
+  [[ "$K1" != "$K2" ]] && { warn "Не совпадает"; continue; }
   break
 done
 
@@ -178,7 +181,7 @@ ok "Ключ принят"
 mkdir -p "$DIR"
 
 ########################################
-# DOCKER COMPOSE (FIX NETWORK ISSUE)
+# DOCKER COMPOSE FIX
 ########################################
 
 cat >"$COMPOSE" <<EOF
@@ -188,11 +191,14 @@ services:
     container_name: remnanode
     network_mode: host
     restart: unless-stopped
+
     environment:
-      - SECRET_KEY=${KEY1}
+      - SECRET_KEY=${K1}
       - NODE_PORT=3000
+
     cap_add:
       - NET_ADMIN
+
     logging:
       driver: json-file
       options:
@@ -204,15 +210,12 @@ EOF
 # START
 ########################################
 
-(
-docker compose down >/dev/null 2>&1 || true
-docker compose pull -q >/dev/null 2>&1
-docker compose up -d >/dev/null 2>&1
-) & spin $! "Запуск ноды"
+run_step "Запуск контейнера" \
+"docker compose down >/dev/null 2>&1 || true && docker compose pull -q && docker compose up -d"
 
-sleep 3
+sleep 2
 
-docker ps | grep -q remnanode || err "Контейнер не запустился"
+docker ps | grep -q remnanode || err "Контейнер не запущен"
 
 ok "Нода работает"
 
@@ -226,14 +229,14 @@ cat >/usr/local/bin/remnanode <<'EOF'
 menu(){
 while true; do
 clear
-echo "🚀 REMNANODE ПАНЕЛЬ"
+echo "🚀 REMNANODE PANEL"
 echo "1) Статус"
 echo "2) Логи"
 echo "3) Перезапуск"
 echo "4) Стоп"
 echo "5) Старт"
 echo "6) Stats"
-echo "7) LIVE Dashboard"
+echo "7) LIVE"
 echo "0) Выход"
 
 read -rp "→ " c
@@ -272,13 +275,12 @@ EOF
 
 chmod +x /usr/local/bin/remnanode
 
-ok "CLI готов"
-
 ########################################
-# FINISH
+# DONE
 ########################################
 
 echo
-echo -e "${GREEN}✔ УСТАНОВКА ЗАВЕРШЕНА${NC}"
-echo "Запуск: remnanode"
-echo "Порт: 3000"
+echo -e "${GREEN}===================================="
+echo -e "✔ УСТАНОВКА ЗАВЕРШЕНА"
+echo -e "====================================${NC}"
+echo "Команда: remnanode"
