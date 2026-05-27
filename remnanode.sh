@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+########################################
+# CONFIG
+########################################
+
 APP="remnanode"
 INSTALL_DIR="/opt/${APP}"
+COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
+
+########################################
+# COLORS
+########################################
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -15,21 +24,32 @@ info(){ echo -e "${BLUE}[i]${NC} $1"; }
 warn(){ echo -e "${YELLOW}[!]${NC} $1"; }
 fail(){ echo -e "${RED}[x]${NC} $1"; exit 1; }
 
+########################################
+# ROOT CHECK
+########################################
+
 [[ $EUID -ne 0 ]] && fail "Run as root"
 
 export DEBIAN_FRONTEND=noninteractive
 
 clear
 
-echo "========================================="
-echo "      REMNANODE INSTALLER"
-echo "========================================="
+echo "================================================"
+echo "              REMNANODE INSTALLER"
+echo "================================================"
+echo
 
-sleep 1
+########################################
+# OS CHECK
+########################################
 
-############################################
+if ! grep -qiE 'ubuntu|debian' /etc/os-release; then
+    fail "Only Ubuntu/Debian supported"
+fi
+
+########################################
 # PACKAGES
-############################################
+########################################
 
 info "Installing packages..."
 
@@ -40,20 +60,36 @@ curl \
 wget \
 git \
 jq \
-nftables \
-fail2ban \
+sudo \
 ca-certificates \
 gnupg \
 lsb-release \
 apt-transport-https \
 software-properties-common \
-irqbalance >/dev/null
+fail2ban \
+iptables \
+nftables \
+iptables-persistent \
+netfilter-persistent \
+irqbalance \
+unzip >/dev/null
 
 ok "Packages installed"
 
-############################################
+########################################
+# IPTABLES NFT BACKEND
+########################################
+
+info "Configuring iptables backend..."
+
+update-alternatives --set iptables /usr/sbin/iptables-nft >/dev/null
+update-alternatives --set ip6tables /usr/sbin/ip6tables-nft >/dev/null
+
+ok "iptables-nft enabled"
+
+########################################
 # SYSCTL
-############################################
+########################################
 
 info "Applying kernel optimization..."
 
@@ -78,6 +114,8 @@ net.ipv4.tcp_keepalive_intvl=30
 net.ipv4.tcp_keepalive_probes=5
 
 net.ipv4.tcp_mtu_probing=1
+
+net.ipv4.ip_forward=1
 
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
@@ -106,9 +144,9 @@ sysctl --system >/dev/null
 
 ok "Kernel optimized"
 
-############################################
+########################################
 # LIMITS
-############################################
+########################################
 
 info "Applying limits..."
 
@@ -130,9 +168,9 @@ systemctl daemon-reexec
 
 ok "Limits applied"
 
-############################################
+########################################
 # JOURNALD
-############################################
+########################################
 
 info "Optimizing journald..."
 
@@ -150,9 +188,9 @@ systemctl restart systemd-journald
 
 ok "Journald optimized"
 
-############################################
+########################################
 # DOCKER
-############################################
+########################################
 
 if ! command -v docker >/dev/null; then
 
@@ -186,6 +224,7 @@ cat >/etc/docker/daemon.json <<'EOF'
 {
   "live-restore": true,
   "userland-proxy": false,
+  "iptables": true,
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "10m",
@@ -199,61 +238,49 @@ systemctl restart docker
 
 ok "Docker configured"
 
-############################################
-# NFTABLES
-############################################
+########################################
+# FIREWALL
+########################################
 
 info "Configuring firewall..."
 
-cat >/etc/nftables.conf <<'EOF'
-#!/usr/sbin/nft -f
+iptables -F
+iptables -X
 
-flush ruleset
+iptables -P INPUT DROP
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
 
-table inet filter {
+iptables -A INPUT -i lo -j ACCEPT
 
-    chain input {
+iptables -A INPUT -m conntrack \
+--ctstate ESTABLISHED,RELATED -j ACCEPT
 
-        type filter hook input priority 0;
+iptables -A INPUT -m conntrack \
+--ctstate INVALID -j DROP
 
-        policy drop;
+iptables -A INPUT -p tcp --dport 22 \
+-m connlimit --connlimit-above 10 -j DROP
 
-        iif lo accept
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 
-        ct state established,related accept
-        ct state invalid drop
+iptables -A INPUT -p tcp \
+-m multiport --dports 80,443,3000 -j ACCEPT
 
-        tcp dport 22 ct state new limit rate 15/minute accept
+iptables -A INPUT -p udp --dport 443 -j ACCEPT
 
-        tcp dport {80,443,3000} accept
-        udp dport 443 accept
+iptables -A INPUT -p icmp -j ACCEPT
 
-        ip protocol icmp accept
-        ip6 nexthdr ipv6-icmp accept
+iptables-save >/etc/iptables/rules.v4
 
-        limit rate 5/second accept
-    }
-
-    chain forward {
-        type filter hook forward priority 0;
-        policy drop;
-    }
-
-    chain output {
-        type filter hook output priority 0;
-        policy accept;
-    }
-}
-EOF
-
-systemctl enable nftables >/dev/null
-systemctl restart nftables
+systemctl enable netfilter-persistent >/dev/null
+systemctl restart netfilter-persistent
 
 ok "Firewall configured"
 
-############################################
+########################################
 # FAIL2BAN
-############################################
+########################################
 
 info "Configuring Fail2Ban..."
 
@@ -263,7 +290,7 @@ bantime = 24h
 findtime = 10m
 maxretry = 5
 backend = systemd
-banaction = nftables-multiport
+banaction = iptables-multiport
 
 [sshd]
 enabled = true
@@ -274,39 +301,66 @@ systemctl restart fail2ban
 
 ok "Fail2Ban configured"
 
-############################################
+########################################
 # IRQBALANCE
-############################################
+########################################
 
-CPU_CORES=$(nproc)
-
-if (( CPU_CORES >= 4 )); then
+if (( $(nproc) >= 4 )); then
     systemctl enable irqbalance --now >/dev/null
     ok "irqbalance enabled"
 fi
 
-############################################
-# INSTALL DIRECTORY
-############################################
+########################################
+# DIRECTORY
+########################################
 
 mkdir -p "${INSTALL_DIR}"
+mkdir -p /var/log/remnanode
 
-############################################
+########################################
 # SECRET KEY
-############################################
+########################################
+
+while true; do
 
 echo
-read -rp "SECRET_KEY: " SECRET_KEY
+read -rsp "SECRET_KEY: " SECRET_KEY
+echo
 
-[[ -z "${SECRET_KEY}" ]] && fail "SECRET_KEY required"
+read -rsp "CONFIRM SECRET_KEY: " SECRET_KEY_CONFIRM
+echo
 
-############################################
-# DOCKER COMPOSE
-############################################
+[[ -z "${SECRET_KEY}" ]] && {
+    warn "SECRET_KEY cannot be empty"
+    continue
+}
+
+[[ "${SECRET_KEY}" != "${SECRET_KEY_CONFIRM}" ]] && {
+    warn "SECRET_KEY mismatch"
+    continue
+}
+
+break
+
+done
+
+ok "SECRET_KEY confirmed"
+
+########################################
+# PORT CHECK
+########################################
+
+if ss -tulpn | grep -q ':443 '; then
+    fail "Port 443 already in use"
+fi
+
+########################################
+# COMPOSE
+########################################
 
 info "Creating compose..."
 
-cat >"${INSTALL_DIR}/docker-compose.yml" <<EOF
+cat >"${COMPOSE_FILE}" <<EOF
 services:
 
   remnanode:
@@ -314,6 +368,8 @@ services:
     image: remnawave/node:latest
 
     container_name: remnanode
+
+    hostname: remnanode
 
     restart: unless-stopped
 
@@ -338,64 +394,106 @@ services:
       - SECRET_KEY=${SECRET_KEY}
       - NODE_PORT=3000
 
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
 
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
     volumes:
       - /var/log/remnanode:/var/log/remnanode
 EOF
 
-############################################
-# START
-############################################
+ok "Compose created"
+
+########################################
+# START CONTAINER
+########################################
 
 info "Starting container..."
 
 cd "${INSTALL_DIR}"
 
+docker network prune -f >/dev/null 2>&1 || true
+
 docker compose pull >/dev/null
+
 docker compose up -d >/dev/null
+
+sleep 5
+
+if ! docker ps | grep -q remnanode; then
+    docker logs remnanode --tail 50
+    fail "Container failed to start"
+fi
 
 ok "Container started"
 
-############################################
-# REMNANODE CLI
-############################################
+########################################
+# LOGROTATE
+########################################
+
+info "Configuring logrotate..."
+
+cat >/etc/logrotate.d/remnanode <<'EOF'
+/var/log/remnanode/*.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+
+ok "Logrotate configured"
+
+########################################
+# CLI
+########################################
 
 info "Installing CLI..."
 
 cat >/usr/local/bin/remnanode <<'EOF'
 #!/usr/bin/env bash
 
-set -e
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
 while true; do
 
 clear
 
+echo -e "${BLUE}"
 echo "================================="
-echo "         REMNANODE"
+echo "          REMNANODE"
 echo "================================="
+echo -e "${NC}"
+
+STATUS=$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || echo "not_found")
+
+echo "Status: ${STATUS}"
 echo
+
 echo "1) Status"
 echo "2) Logs"
 echo "3) Restart"
 echo "4) Stop"
 echo "5) Start"
 echo "6) Docker Stats"
-echo "7) Firewall"
-echo "8) Fail2Ban"
-echo "9) Update"
+echo "7) Firewall Rules"
+echo "8) Fail2Ban Status"
+echo "9) Update Container"
 echo "10) Reinstall"
+echo "11) Healthcheck"
 echo "0) Exit"
 echo
 
@@ -428,7 +526,7 @@ docker stats remnanode
 ;;
 
 7)
-nft list ruleset
+iptables -L -n -v
 ;;
 
 8)
@@ -443,6 +541,12 @@ docker compose up -d
 
 10)
 bash /opt/remnanode/install.sh
+;;
+
+11)
+docker inspect \
+--format='{{json .State.Health}}' \
+remnanode | jq
 ;;
 
 0)
@@ -464,28 +568,53 @@ chmod +x /usr/local/bin/remnanode
 
 ok "CLI installed"
 
-############################################
+########################################
 # SAVE INSTALLER
-############################################
+########################################
 
 cp "$0" /opt/remnanode/install.sh 2>/dev/null || true
 
-############################################
-# DONE
-############################################
+########################################
+# FINAL
+########################################
 
+clear
+
+echo "================================================"
+echo "              INSTALL COMPLETE"
+echo "================================================"
 echo
-echo "========================================="
-echo "         INSTALL COMPLETE"
-echo "========================================="
+
+echo -e "${GREEN}Installed:${NC}"
 echo
-echo "Command:"
+echo "✓ Docker"
+echo "✓ Remnanode"
+echo "✓ BBR"
+echo "✓ Fail2Ban"
+echo "✓ Firewall"
+echo "✓ Docker hardening"
+echo "✓ Healthcheck"
+echo "✓ Logrotate"
+echo "✓ CLI manager"
 echo
-echo "   remnanode"
+
+echo -e "${BLUE}Command:${NC}"
 echo
-echo "Ports:"
+echo "remnanode"
 echo
-echo "   443/tcp"
-echo "   443/udp"
-echo "   3000/tcp"
+
+echo -e "${BLUE}Ports:${NC}"
 echo
+echo "443/tcp"
+echo "443/udp"
+echo "3000/tcp"
+echo
+
+echo -e "${BLUE}Checks:${NC}"
+echo
+echo "docker ps"
+echo "docker logs remnanode"
+echo "fail2ban-client status"
+echo
+
+echo "================================================"
