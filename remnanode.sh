@@ -3,16 +3,21 @@ set -Eeuo pipefail
 
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
-# Установщик: Remnanode + Selfsteal + WARP
-# Версия: 2026.2.0
+# Установщик: Remnanode + Selfsteal + WARP + GeoAssets (Loyalsoldier)
+# Версия: 2026.3.0
 ###############################################################################
 
 APP="remnanode"
 DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
+ASSETS_DIR="$DIR/assets"
 LOG="/var/log/${APP}-install.log"
 PANEL_IP_DEFAULT="141.98.7.57"
 WARP_PORT=9091
+
+# Источник geo-файлов
+GEOSITE_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+GEOIP_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
 
 export DEBIAN_FRONTEND=noninteractive
 export APT_LISTCHANGES_FRONTEND=none
@@ -358,6 +363,64 @@ systemctl restart docker'"
 }
 
 ###############################################################################
+# GEO ASSETS — Loyalsoldier geosite.dat + geoip.dat
+###############################################################################
+install_geoassets() {
+  info "Установка расширенных geo-файлов (Loyalsoldier)"
+  info "Категории: yandex-ads, vk-ads, mail-ru-ads, category-ads-all и др."
+  echo
+
+  mkdir -p "$ASSETS_DIR"
+
+  run_step "Скачивание geosite.dat" \
+"curl -fsSL --retry 3 --max-time 60 -o $ASSETS_DIR/geosite.dat.new $GEOSITE_URL && \
+ mv $ASSETS_DIR/geosite.dat.new $ASSETS_DIR/geosite.dat"
+
+  run_step "Скачивание geoip.dat" \
+"curl -fsSL --retry 3 --max-time 60 -o $ASSETS_DIR/geoip.dat.new $GEOIP_URL && \
+ mv $ASSETS_DIR/geoip.dat.new $ASSETS_DIR/geoip.dat"
+
+  # Хелпер для ручного обновления
+  cat > /usr/local/bin/remnanode-geo-update <<EOF
+#!/usr/bin/env bash
+set -e
+ASSETS_DIR="$ASSETS_DIR"
+GEOSITE_URL="$GEOSITE_URL"
+GEOIP_URL="$GEOIP_URL"
+
+echo "[\$(date '+%F %T')] Обновление geo-файлов..."
+mkdir -p "\$ASSETS_DIR"
+
+curl -fsSL --retry 3 --max-time 60 -o "\$ASSETS_DIR/geosite.dat.new" "\$GEOSITE_URL" || { echo "geosite.dat: fail"; exit 1; }
+curl -fsSL --retry 3 --max-time 60 -o "\$ASSETS_DIR/geoip.dat.new" "\$GEOIP_URL" || { echo "geoip.dat: fail"; exit 1; }
+
+mv "\$ASSETS_DIR/geosite.dat.new" "\$ASSETS_DIR/geosite.dat"
+mv "\$ASSETS_DIR/geoip.dat.new" "\$ASSETS_DIR/geoip.dat"
+echo "Файлы обновлены. Перезапуск контейнера..."
+
+cd /opt/remnanode && docker compose restart remnanode
+echo "Готово."
+EOF
+  chmod +x /usr/local/bin/remnanode-geo-update
+
+  # Cron на еженедельное обновление (воскресенье 4:00)
+  run_step "Установка cron для автообновления" \
+"bash -c 'cat > /etc/cron.d/remnanode-geo-update <<EOF
+# Еженедельное обновление geo-файлов для Remnanode (Loyalsoldier)
+0 4 * * 0 root /usr/local/bin/remnanode-geo-update >> /var/log/remnanode-geo-update.log 2>&1
+EOF
+chmod 644 /etc/cron.d/remnanode-geo-update'"
+
+  local geosite_size geoip_size
+  geosite_size=$(du -h "$ASSETS_DIR/geosite.dat" 2>/dev/null | cut -f1)
+  geoip_size=$(du -h "$ASSETS_DIR/geoip.dat" 2>/dev/null | cut -f1)
+
+  ok "Geo-файлы установлены (geosite: ${geosite_size}, geoip: ${geoip_size})"
+  info "Ручное обновление: ${CYAN}remnanode-geo-update${NC}"
+  info "Автообновление:    каждое воскресенье в 04:00"
+}
+
+###############################################################################
 # nftables firewall — динамический, в зависимости от установленных сервисов
 ###############################################################################
 setup_firewall() {
@@ -485,6 +548,10 @@ install_remnanode() {
   setup_firewall "$PANEL_IP" "$NODE_PORT" "$SSH_PORT" "$has_selfsteal"
 
   mkdir -p "$DIR"
+
+  # Скачиваем geo-файлы ДО запуска контейнера, чтобы было что монтировать
+  install_geoassets
+
   cat > "$COMPOSE" <<EOF
 services:
   remnanode:
@@ -496,6 +563,7 @@ services:
     environment:
       - SECRET_KEY=${K1}
       - NODE_PORT=${NODE_PORT}
+      - XRAY_LOCATION_ASSET=/usr/local/share/xray
     cap_add:
       - NET_ADMIN
     ulimits:
@@ -504,9 +572,11 @@ services:
         hard: 1048576
     volumes:
       - /dev/shm:/dev/shm
+      - ${ASSETS_DIR}/geosite.dat:/usr/local/share/xray/geosite.dat:ro
+      - ${ASSETS_DIR}/geoip.dat:/usr/local/share/xray/geoip.dat:ro
 EOF
   chmod 600 "$COMPOSE"
-  ok "docker-compose.yml создан"
+  ok "docker-compose.yml создан (с подменой geo-файлов)"
 
   cd "$DIR"
   run_step "Pull образа" "docker compose pull -q"
@@ -534,8 +604,77 @@ EOF
   echo -e "  Панель IP:        ${PANEL_IP}"
   echo -e "  NODE_PORT:        ${NODE_PORT}"
   echo -e "  SSH порт:         ${SSH_PORT}"
+  echo -e "  Geo-файлы:        ${CYAN}${ASSETS_DIR}/${NC}"
+  echo -e "  Обновление geo:   ${CYAN}remnanode-geo-update${NC}"
   echo -e "  Управление:       ${CYAN}remnanode${NC}"
   echo
+}
+
+###############################################################################
+# Переустановка только geo-файлов (для уже установленной ноды)
+###############################################################################
+reinstall_geoassets() {
+  show_header
+  echo -e "${WHITE}🌍 Обновление/установка geo-файлов${NC}"
+  echo -e "${GRAY}────────────────────────────────${NC}"
+  echo
+
+  if ! [[ -f "$COMPOSE" ]]; then
+    err "Remnanode не установлен. Сначала установи ноду."
+  fi
+
+  install_geoassets
+
+  # Проверяем, есть ли уже volume-маунт в compose
+  if ! grep -q "geosite.dat" "$COMPOSE"; then
+    info "В docker-compose.yml нет volume-маунта для geo-файлов — добавляем"
+
+    # Бэкап
+    cp "$COMPOSE" "${COMPOSE}.bak.$(date +%Y%m%d-%H%M%S)"
+
+    # Добавляем env-переменную и volumes через python (если есть) или sed
+    python3 <<PYEOF
+import re
+with open("$COMPOSE") as f:
+    content = f.read()
+
+# Добавляем XRAY_LOCATION_ASSET в environment, если его нет
+if "XRAY_LOCATION_ASSET" not in content:
+    content = re.sub(
+        r'(environment:\s*\n(?:\s+-\s+\S+\s*\n)+)',
+        r'\1      - XRAY_LOCATION_ASSET=/usr/local/share/xray\n',
+        content, count=1
+    )
+
+# Добавляем volumes
+if "geosite.dat" not in content:
+    if "volumes:" in content:
+        content = re.sub(
+            r'(volumes:\s*\n(?:\s+-\s+\S+.*\n)+)',
+            r'\1      - $ASSETS_DIR/geosite.dat:/usr/local/share/xray/geosite.dat:ro\n      - $ASSETS_DIR/geoip.dat:/usr/local/share/xray/geoip.dat:ro\n',
+            content, count=1
+        )
+    else:
+        # Если секции volumes нет — добавим её
+        content = content.rstrip() + """
+    volumes:
+      - $ASSETS_DIR/geosite.dat:/usr/local/share/xray/geosite.dat:ro
+      - $ASSETS_DIR/geoip.dat:/usr/local/share/xray/geoip.dat:ro
+"""
+
+with open("$COMPOSE", "w") as f:
+    f.write(content)
+PYEOF
+    ok "docker-compose.yml обновлён"
+  fi
+
+  run_step "Перезапуск контейнера" "cd $DIR && docker compose down && docker compose up -d"
+  sleep 3
+  if docker ps --format '{{.Names}}' | grep -q '^remnanode$'; then
+    ok "Контейнер запущен с новыми geo-файлами"
+  else
+    err "Контейнер не запустился. Логи: docker logs remnanode"
+  fi
 }
 
 ###############################################################################
@@ -549,7 +688,6 @@ install_selfsteal() {
   info "Selfsteal — это веб-сервер (Caddy/Nginx) с фейковым сайтом для маскировки Reality-трафика."
   echo
 
-  # Проверка существующей установки
   if [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]]; then
     warn "Найдена существующая установка Selfsteal."
     read -rp "  Удалить и переустановить? [y/N]: " ans
@@ -564,7 +702,6 @@ install_selfsteal() {
     fi
   fi
 
-  # Базовые проверки
   if ! command -v docker >/dev/null; then
     info "Docker не установлен — устанавливаем"
     install_docker
@@ -593,13 +730,10 @@ install_selfsteal() {
   echo -e "${GRAY}  Источник: https://github.com/DigneZzZ/remnawave-scripts${NC}"
   echo
 
-  # Запускаем оригинальный скрипт в интерактивном режиме (без --force)
-  # чтобы пользователь сам выбрал шаблон сайта и подтвердил DNS
   bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install $ws_flag
 
   local rc=$?
   if [[ $rc -eq 0 ]]; then
-    # Обновляем firewall, чтобы открыть порты Selfsteal
     if [[ -f /etc/nftables.conf ]] && grep -q "panel_ips" /etc/nftables.conf; then
       info "Обновляем firewall — добавляем порты Selfsteal"
       local panel_ip ssh_port node_port
@@ -650,12 +784,10 @@ rm -f /etc/systemd/system/warp-auto.service /usr/local/bin/warp-fix-network.sh
 systemctl daemon-reload"
   fi
 
-  # Ждём apt
   while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
     sleep 2
   done
 
-  # Маппинг codename: WARP не публикует пакеты для всех релизов
   local warp_codename="$CODENAME"
   case "$CODENAME" in
     bullseye|bookworm|jammy|noble) ;;
@@ -676,7 +808,6 @@ systemctl daemon-reload"
     err "Не удалось установить cloudflare-warp"
   fi
 
-  # Фикс /32 (VPS часто имеют /32 на основном интерфейсе)
   fix_warp_network_inline() {
     local iface prefix
     iface=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)
@@ -693,7 +824,6 @@ systemctl daemon-reload"
 
   sleep 5
 
-  # Регистрация и настройка
   run_step "Регистрация WARP" \
 "warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
 warp-cli --accept-tos registration new >/dev/null 2>&1 || (sleep 3 && warp-cli --accept-tos registration new >/dev/null 2>&1) || true"
@@ -703,7 +833,6 @@ warp-cli --accept-tos registration new >/dev/null 2>&1 || (sleep 3 && warp-cli -
 warp-cli --accept-tos proxy port $WARP_PORT >/dev/null 2>&1 || true
 warp-cli --accept-tos connect >/dev/null 2>&1 || true"
 
-  # Ждём connected
   local connected=false
   for i in {1..15}; do
     if warp-cli --accept-tos status 2>/dev/null | grep -qi "connected"; then
@@ -713,7 +842,6 @@ warp-cli --accept-tos connect >/dev/null 2>&1 || true"
     sleep 2
   done
 
-  # Скрипт фикса /32 для systemd
   cat > /usr/local/bin/warp-fix-network.sh <<'FIXSCRIPT'
 #!/bin/bash
 iface=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)
@@ -727,7 +855,6 @@ fi
 FIXSCRIPT
   chmod +x /usr/local/bin/warp-fix-network.sh
 
-  # systemd unit для автозапуска
   cat > /etc/systemd/system/warp-auto.service <<'SYSTEMD'
 [Unit]
 Description=Cloudflare WARP auto-connect
@@ -748,7 +875,6 @@ SYSTEMD
   run_step "Автозапуск WARP" \
 "systemctl daemon-reload && systemctl enable warp-auto >/dev/null 2>&1"
 
-  # Проверка через прокси
   sleep 3
   local warp_ip
   warp_ip=$(curl -s --max-time 10 --socks5 "127.0.0.1:${WARP_PORT}" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
@@ -794,13 +920,10 @@ cat > /usr/local/bin/remnanode <<'CLIEOF'
 GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; NC='\033[0m'
 
-LAUNCHER_URL="https://raw.githubusercontent.com/your-repo/remnanode-launcher/main/install.sh"
-# Если файл лежит локально:
 LAUNCHER_LOCAL="/opt/remnanode/installer.sh"
 
 pause(){ read -rp $'\nEnter для продолжения...' _; }
 
-# Получаем публичный IP с кэшем
 get_public_ip_cached() {
   local cache="/tmp/.remnanode_public_ip"
   if [[ -f "$cache" ]] && [[ $(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) )) -lt 600 ]]; then
@@ -847,18 +970,24 @@ live_panel() {
       printf "  Node:     ${RED}● stopped${NC}\n"
     fi
 
-    # Selfsteal
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '(caddy|nginx)-selfsteal'; then
       printf "  Selfsteal: ${GREEN}● running${NC}\n"
     fi
 
-    # WARP
     if command -v warp-cli >/dev/null 2>&1; then
       if warp-cli --accept-tos status 2>/dev/null | grep -qi connected; then
         printf "  WARP:     ${GREEN}● connected${NC}\n"
       else
         printf "  WARP:     ${YELLOW}● not connected${NC}\n"
       fi
+    fi
+
+    # Geo-файлы
+    if [[ -f /opt/remnanode/assets/geosite.dat ]]; then
+      GEOSITE_AGE=$(( ( $(date +%s) - $(stat -c %Y /opt/remnanode/assets/geosite.dat) ) / 86400 ))
+      printf "  GeoData:  ${GREEN}● установлено${NC} (обновлено %s дн. назад)\n" "$GEOSITE_AGE"
+    else
+      printf "  GeoData:  ${YELLOW}● не установлено${NC}\n"
     fi
 
     echo
@@ -904,6 +1033,77 @@ live_panel() {
   trap - INT
 }
 
+manage_geo() {
+  clear
+  echo -e "${BLUE}====================================="
+  echo -e "       🌍 GEO ASSETS"
+  echo -e "=====================================${NC}"
+  echo
+
+  if [[ -f /opt/remnanode/assets/geosite.dat ]]; then
+    GEOSITE_SIZE=$(du -h /opt/remnanode/assets/geosite.dat | cut -f1)
+    GEOSITE_DATE=$(stat -c '%y' /opt/remnanode/assets/geosite.dat | cut -d. -f1)
+    echo -e "  geosite.dat:  ${GREEN}${GEOSITE_SIZE}${NC}  (${GRAY}${GEOSITE_DATE}${NC})"
+  else
+    echo -e "  geosite.dat:  ${RED}не установлен${NC}"
+  fi
+
+  if [[ -f /opt/remnanode/assets/geoip.dat ]]; then
+    GEOIP_SIZE=$(du -h /opt/remnanode/assets/geoip.dat | cut -f1)
+    GEOIP_DATE=$(stat -c '%y' /opt/remnanode/assets/geoip.dat | cut -d. -f1)
+    echo -e "  geoip.dat:    ${GREEN}${GEOIP_SIZE}${NC}  (${GRAY}${GEOIP_DATE}${NC})"
+  else
+    echo -e "  geoip.dat:    ${RED}не установлен${NC}"
+  fi
+
+  echo
+  if [[ -f /etc/cron.d/remnanode-geo-update ]]; then
+    echo -e "  Автообновление: ${GREEN}включено${NC} (вс. 04:00)"
+  else
+    echo -e "  Автообновление: ${YELLOW}не настроено${NC}"
+  fi
+
+  echo
+  echo "  1) Обновить сейчас"
+  echo "  2) Показать лог автообновлений"
+  echo "  3) Откатить на v2fly (стандартный)"
+  echo "  0) Назад"
+  echo
+  read -rp "  → " ch
+
+  case "$ch" in
+    1)
+      if [[ -x /usr/local/bin/remnanode-geo-update ]]; then
+        /usr/local/bin/remnanode-geo-update
+      else
+        echo -e "${RED}Скрипт обновления не найден. Переустанови ноду.${NC}"
+      fi
+      pause
+      ;;
+    2)
+      if [[ -f /var/log/remnanode-geo-update.log ]]; then
+        tail -50 /var/log/remnanode-geo-update.log
+      else
+        echo "Лог пуст (автообновление ещё не запускалось)"
+      fi
+      pause
+      ;;
+    3)
+      echo
+      warn "Откат удалит расширенные geo-файлы и убёрет volume-mount."
+      warn "Все правила geosite:yandex-ads, vk-ads, mail-ru-ads перестанут работать!"
+      read -rp "Продолжить? [y/N]: " ans
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        rm -f /opt/remnanode/assets/geosite.dat /opt/remnanode/assets/geoip.dat
+        rm -f /etc/cron.d/remnanode-geo-update
+        rm -f /usr/local/bin/remnanode-geo-update
+        echo "Файлы удалены. Не забудь убрать volume-mount из docker-compose.yml вручную."
+      fi
+      pause
+      ;;
+  esac
+}
+
 run_speedtest() {
   clear
   echo -e "${BLUE}====================================="
@@ -911,7 +1111,6 @@ run_speedtest() {
   echo -e "=====================================${NC}"
   echo
 
-  # Проверяем наличие speedtest CLI
   if ! command -v speedtest >/dev/null 2>&1 && ! command -v speedtest-cli >/dev/null 2>&1; then
     echo "Speedtest не установлен. Установить?"
     echo "  1) Ookla speedtest (рекомендуется, точнее)"
@@ -924,7 +1123,6 @@ run_speedtest() {
         echo "Устанавливаем Ookla speedtest..."
         curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash >/dev/null 2>&1
         apt-get install -y speedtest >/dev/null 2>&1 || { echo "Ошибка установки"; pause; return; }
-        # Принимаем лицензию при первом запуске
         speedtest --accept-license --accept-gdpr >/dev/null 2>&1 || true
         ;;
       2)
@@ -944,12 +1142,12 @@ run_speedtest() {
   read -rp "→ " ch
 
   case "$ch" in
-    1)
+    1|3)
       echo
       if command -v speedtest >/dev/null 2>&1; then
         speedtest --accept-license --accept-gdpr
       else
-        speedtest-cli --simple
+        speedtest-cli ${ch:+--simple}
       fi
       ;;
     2)
@@ -962,14 +1160,6 @@ run_speedtest() {
         ' 2>/dev/null || speedtest --accept-license --accept-gdpr
       else
         speedtest-cli --simple
-      fi
-      ;;
-    3)
-      echo
-      if command -v speedtest >/dev/null 2>&1; then
-        speedtest --accept-license --accept-gdpr
-      else
-        speedtest-cli
       fi
       ;;
     *) return ;;
@@ -985,6 +1175,7 @@ run_installer() {
   echo "  1) Установить Remnanode (переустановка)"
   echo "  2) Установить Selfsteal"
   echo "  3) Установить WARP"
+  echo "  4) 🌍 Установить/обновить Geo-файлы"
   echo "  0) Назад"
   echo
   read -rp "→ " c
@@ -994,10 +1185,11 @@ run_installer() {
       1) bash "$LAUNCHER_LOCAL" install-remnanode ;;
       2) bash "$LAUNCHER_LOCAL" install-selfsteal ;;
       3) bash "$LAUNCHER_LOCAL" install-warp ;;
+      4) bash "$LAUNCHER_LOCAL" install-geoassets ;;
       *) return ;;
     esac
   else
-    echo -e "${YELLOW}Локальный установщик не найден. Запусти оригинальный скрипт установки.${NC}"
+    echo -e "${YELLOW}Локальный установщик не найден.${NC}"
     pause
   fi
 }
@@ -1019,7 +1211,8 @@ while true; do
   echo " 6) Docker stats"
   echo " 7) LIVE мониторинг"
   echo " 8) 🚀 Speedtest"
-  echo " 9) 🔧 Установщики (Remnanode/Selfsteal/WARP)"
+  echo " 9) 🌍 Geo-файлы (обновить/откатить)"
+  echo "10) 🔧 Установщики (Remnanode/Selfsteal/WARP/Geo)"
   echo " 0) Выход"
   echo "------------------------------------"
   read -rp " → " c
@@ -1032,7 +1225,8 @@ while true; do
     6) docker stats remnanode ;;
     7) live_panel ;;
     8) run_speedtest ;;
-    9) run_installer ;;
+    9) manage_geo ;;
+    10) run_installer ;;
     0) exit 0 ;;
     *) ;;
   esac
@@ -1043,7 +1237,6 @@ menu
 CLIEOF
   chmod +x /usr/local/bin/remnanode
 
-  # Копируем сам установщик в /opt, чтобы из CLI можно было вызывать установщики
   if [[ "${BASH_SOURCE[0]:-$0}" != "/opt/remnanode/installer.sh" ]]; then
     mkdir -p /opt/remnanode
     cp -f "${BASH_SOURCE[0]:-$0}" /opt/remnanode/installer.sh 2>/dev/null || true
@@ -1058,10 +1251,10 @@ main_menu() {
   while true; do
     show_header
 
-    # Статусы
     local rn_status="${RED}не установлен${NC}"
     local ss_status="${RED}не установлен${NC}"
     local wp_status="${RED}не установлен${NC}"
+    local geo_status="${RED}не установлено${NC}"
 
     docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$' \
       && rn_status="${GREEN}● running${NC}" \
@@ -1081,17 +1274,23 @@ main_menu() {
       fi
     fi
 
+    if [[ -f "$ASSETS_DIR/geosite.dat" ]]; then
+      geo_status="${GREEN}● установлено${NC}"
+    fi
+
     echo -e "  ${WHITE}Статус сервисов:${NC}"
     echo -e "    • Remnanode:  $rn_status"
     echo -e "    • Selfsteal:  $ss_status"
     echo -e "    • WARP:       $wp_status"
+    echo -e "    • GeoAssets:  $geo_status"
     echo
     echo -e "${WHITE}Что устанавливаем?${NC}"
     echo
-    echo -e "  ${WHITE}1)${NC} 🚀 Remnanode  ${GRAY}— нода Remnawave VPN${NC}"
-    echo -e "  ${WHITE}2)${NC} 🎭 Selfsteal  ${GRAY}— фейковый сайт для маскировки Reality${NC}"
-    echo -e "  ${WHITE}3)${NC} 🌍 WARP       ${GRAY}— Cloudflare SOCKS5 outbound${NC}"
-    echo -e "  ${WHITE}4)${NC} 📦 Всё сразу  ${GRAY}— Remnanode → Selfsteal → WARP${NC}"
+    echo -e "  ${WHITE}1)${NC} 🚀 Remnanode   ${GRAY}— нода Remnawave VPN (включает geo)${NC}"
+    echo -e "  ${WHITE}2)${NC} 🎭 Selfsteal   ${GRAY}— фейковый сайт для маскировки Reality${NC}"
+    echo -e "  ${WHITE}3)${NC} 🌍 WARP        ${GRAY}— Cloudflare SOCKS5 outbound${NC}"
+    echo -e "  ${WHITE}4)${NC} 🗺  GeoAssets   ${GRAY}— расширенный geosite/geoip (Loyalsoldier)${NC}"
+    echo -e "  ${WHITE}5)${NC} 📦 Всё сразу   ${GRAY}— Remnanode → Selfsteal → WARP${NC}"
     echo
     echo -e "  ${GRAY}0)${NC} Выход"
     echo
@@ -1101,7 +1300,8 @@ main_menu() {
       1) install_remnanode; echo; read -rp "Enter..." ;;
       2) install_selfsteal; echo; read -rp "Enter..." ;;
       3) install_warp; echo; read -rp "Enter..." ;;
-      4)
+      4) reinstall_geoassets; echo; read -rp "Enter..." ;;
+      5)
         install_remnanode
         install_selfsteal
         install_warp
@@ -1120,5 +1320,6 @@ case "${1:-}" in
   install-remnanode) install_remnanode ;;
   install-selfsteal) install_selfsteal ;;
   install-warp)      install_warp ;;
+  install-geoassets) reinstall_geoassets ;;
   *)                 main_menu ;;
 esac
