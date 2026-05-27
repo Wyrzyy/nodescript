@@ -2,13 +2,12 @@
 set -Eeuo pipefail
 
 APP="remnanode"
-DIR="/opt/${APP}"
-COMPOSE="${DIR}/docker-compose.yml"
+DIR="/opt/$APP"
+COMPOSE="$DIR/docker-compose.yml"
 
 export DEBIAN_FRONTEND=noninteractive
 export APT_LISTCHANGES_FRONTEND=none
 
-# ===== UI =====
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 BLUE='\033[0;34m'
@@ -18,48 +17,69 @@ NC='\033[0m'
 ok(){ echo -e "${GREEN}✔ $1${NC}"; }
 info(){ echo -e "${BLUE}ℹ $1${NC}"; }
 warn(){ echo -e "${YELLOW}⚠ $1${NC}"; }
-fail(){ echo -e "${RED}✖ $1${NC}"; exit 1; }
+err(){ echo -e "${RED}✖ $1${NC}"; exit 1; }
 
-spin() {
+spin(){
   local pid=$1 msg=$2
-  local c='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local s='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
   while kill -0 $pid 2>/dev/null; do
-    for ((i=0; i<${#c}; i++)); do
-      printf "\r%s %s" "$msg" "${c:$i:1}"
-      sleep 0.08
+    for ((i=0;i<${#s};i++)); do
+      printf "\r%s %s" "$msg" "${s:$i:1}"
+      sleep 0.07
     done
   done
   printf "\r%s ✔\n" "$msg"
 }
 
-bar() {
-  local cur=$1 total=$2 msg=$3
-  local p=$((cur*100/total))
-  local fill=$((p/10))
-
-  printf "\r[%d/%d] %-25s [" "$cur" "$total" "$msg"
-  for i in $(seq 1 10); do
-    [[ $i -le $fill ]] && printf "█" || printf "-"
+bar(){
+  local c=$1 t=$2 m=$3
+  local p=$((c*100/t))
+  local f=$((p/10))
+  printf "\r[%d/%d] %-20s [" "$c" "$t" "$m"
+  for i in {1..10}; do
+    [[ $i -le $f ]] && printf "█" || printf "-"
   done
   printf "] %d%%" "$p"
-  [[ $cur -eq $total ]] && echo
+  [[ $c -eq $t ]] && echo
 }
 
-[[ $EUID -ne 0 ]] && fail "Запусти от root"
+[[ $EUID -ne 0 ]] && err "Запусти от root"
 
 clear
-echo -e "${BLUE}===================================="
-echo -e "        🚀 REMNANODE INSTALL"
-echo -e "====================================${NC}"
+echo -e "${BLUE}==== REMNANODE INSTALL ====${NC}"
 
-########################################
-# SYSTEM INFO
-########################################
-
-RAM=$(free -m | awk '/Mem:/ {print $2}')
 CPU=$(nproc)
+RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
 
-info "RAM: ${RAM} MB | CPU: ${CPU}"
+info "CPU: $CPU | RAM: ${RAM_MB}MB"
+
+########################################
+# SWAP + ZRAM
+########################################
+
+if [[ $RAM_MB -le 4096 ]]; then
+  info "Настройка swap..."
+
+  if [[ ! -f /swapfile ]]; then
+    fallocate -l $(( RAM_MB <= 2048 ? 2 : 1 ))G /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  fi
+
+  if [[ $RAM_MB -le 2048 ]]; then
+    modprobe zram 2>/dev/null || true
+    echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+    echo $((RAM_MB * 1024 * 1024 / 2)) > /sys/block/zram0/disksize 2>/dev/null || true
+    mkswap /dev/zram0 >/dev/null 2>&1 || true
+    swapon /dev/zram0 >/dev/null 2>&1 || true
+  fi
+
+  ok "Swap/ZRAM настроены"
+else
+  info "Swap не требуется"
+fi
 
 ########################################
 # PACKAGES
@@ -67,8 +87,8 @@ info "RAM: ${RAM} MB | CPU: ${CPU}"
 
 (
 apt update -qq >/dev/null 2>&1
-apt install -y -qq curl wget git jq fail2ban iptables iptables-persistent netfilter-persistent irqbalance >/dev/null 2>&1
-) & spin $! "📦 Установка пакетов"
+apt install -y -qq curl wget git jq fail2ban iptables irqbalance >/dev/null 2>&1
+) & spin $! "Пакеты"
 
 bar 1 5 "Пакеты"
 
@@ -76,39 +96,39 @@ bar 1 5 "Пакеты"
 # SYSCTL SAFE
 ########################################
 
-cat >/etc/sysctl.d/99-remnanode.conf <<'EOF'
+cat >/etc/sysctl.d/99-remnanode.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.somaxconn=65535
-net.core.netdev_max_backlog=262144
-net.ipv4.tcp_max_syn_backlog=262144
+net.core.netdev_max_backlog=$((CPU * 2048))
+net.ipv4.tcp_max_syn_backlog=$((CPU * 2048))
 net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
 net.ipv4.ip_local_port_range=1024 65535
-fs.file-max=2097152
+fs.file-max=$((RAM_MB * 1024))
+vm.swappiness=$([[ $RAM_MB -le 2048 ]] && echo 60 || echo 20)
 EOF
 
-(sysctl --system >/dev/null 2>&1) & spin $! "⚙️ Настройка ядра"
-bar 2 5 "Ядро"
+sysctl --system >/dev/null 2>&1 & spin $! "Sysctl"
+bar 2 5 "Kernel"
 
 ########################################
 # LIMITS
 ########################################
 
-cat >/etc/security/limits.d/99-remnanode.conf <<'EOF'
+cat >/etc/security/limits.d/99-remnanode.conf <<EOF
 * soft nofile 1048576
 * hard nofile 1048576
 EOF
 
-bar 3 5 "Лимиты"
+bar 3 5 "Limits"
 
 ########################################
 # FAIL2BAN
 ########################################
 
-cat >/etc/fail2ban/jail.local <<'EOF'
+cat >/etc/fail2ban/jail.local <<EOF
 [DEFAULT]
-bantime = 12h
+bantime = 6h
 findtime = 10m
 maxretry = 5
 
@@ -131,22 +151,24 @@ apt update -qq >/dev/null 2>&1
 apt install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null 2>&1
 systemctl enable docker >/dev/null
 systemctl start docker >/dev/null
-) & spin $! "🐳 Docker"
+) & spin $! "Docker"
 fi
 
 bar 5 5 "Docker"
 
 ########################################
-# SECRET KEY SAFE
+# SECRET KEY SAFE INPUT
 ########################################
 
 echo
 while true; do
-  read -r -p "🔑 Введите SECRET_KEY: " KEY
-  read -r -p "🔑 Подтвердите: " KEY2
+  read -rsp "🔑 SECRET_KEY: " KEY1
+  echo
+  read -rsp "🔑 Подтверждение: " KEY2
+  echo
 
-  [[ -z "$KEY" ]] && { warn "Пусто"; continue; }
-  [[ "$KEY" != "$KEY2" ]] && { warn "Не совпадает"; continue; }
+  [[ -z "$KEY1" ]] && { warn "Пусто"; continue; }
+  [[ "$KEY1" != "$KEY2" ]] && { warn "Не совпадает"; continue; }
 
   break
 done
@@ -156,7 +178,7 @@ ok "Ключ принят"
 mkdir -p "$DIR"
 
 ########################################
-# COMPOSE FIXED (NO DOCKER BUG)
+# DOCKER COMPOSE (FIX NETWORK ISSUE)
 ########################################
 
 cat >"$COMPOSE" <<EOF
@@ -166,19 +188,11 @@ services:
     container_name: remnanode
     network_mode: host
     restart: unless-stopped
-
-    stop_grace_period: 10s
-
     environment:
-      - SECRET_KEY=${KEY}
+      - SECRET_KEY=${KEY1}
       - NODE_PORT=3000
-
     cap_add:
       - NET_ADMIN
-
-    security_opt:
-      - no-new-privileges:true
-
     logging:
       driver: json-file
       options:
@@ -186,90 +200,71 @@ services:
         max-file: "3"
 EOF
 
-ok "Docker конфиг создан"
-
 ########################################
-# START (silent)
+# START
 ########################################
 
 (
+docker compose down >/dev/null 2>&1 || true
 docker compose pull -q >/dev/null 2>&1
 docker compose up -d >/dev/null 2>&1
-) & spin $! "🚀 Запуск ноды"
+) & spin $! "Запуск ноды"
 
 sleep 3
 
-docker ps | grep -q remnanode || fail "Не запустилась"
+docker ps | grep -q remnanode || err "Контейнер не запустился"
 
-ok "Нода активна"
+ok "Нода работает"
 
 ########################################
-# CLI + LIVE DASHBOARD
+# CLI PANEL
 ########################################
 
 cat >/usr/local/bin/remnanode <<'EOF'
 #!/usr/bin/env bash
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+menu(){
+while true; do
+clear
+echo "🚀 REMNANODE ПАНЕЛЬ"
+echo "1) Статус"
+echo "2) Логи"
+echo "3) Перезапуск"
+echo "4) Стоп"
+echo "5) Старт"
+echo "6) Stats"
+echo "7) LIVE Dashboard"
+echo "0) Выход"
 
-dashboard() {
-  while true; do
-    clear
+read -rp "→ " c
 
-    echo -e "${BLUE}========== LIVE DASHBOARD ==========${NC}"
+case $c in
+1) docker ps | grep remnanode ;;
+2) docker logs -f --tail 50 remnanode ;;
+3) docker restart remnanode ;;
+4) docker stop remnanode ;;
+5) docker start remnanode ;;
+6) docker stats remnanode ;;
+7)
+while true; do
+clear
+echo "=== LIVE ==="
+echo "CPU/RAM:"
+top -bn1 | head -5
+echo
+echo "CONN:"
+ss -ntu | wc -l
+echo
+echo "TOP IP:"
+ss -ntu | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -5
+sleep 2
+done
+;;
+0) exit ;;
+esac
 
-    CPU=$(top -bn1 | awk '/Cpu/ {print $2+$4}')
-    MEM=$(free | awk '/Mem/ {printf "%.0f", $3/$2 * 100}')
-
-    CONN=$(ss -ntu | wc -l)
-    IPTOP=$(ss -ntu | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -5)
-
-    echo "CPU Load: ${CPU}%"
-    echo "RAM Load: ${MEM}%"
-    echo "Connections: ${CONN}"
-    echo
-    echo "TOP IPs:"
-    echo "$IPTOP"
-
-    echo -e "${BLUE}====================================${NC}"
-    echo "CTRL+C — назад"
-    sleep 2
-  done
-}
-
-menu() {
-  while true; do
-    clear
-    echo "🚀 REMNANODE PANEL"
-    echo "-------------------"
-    echo "1 📊 Статус"
-    echo "2 📜 Логи"
-    echo "3 🔄 Перезапуск"
-    echo "4 ⛔ Стоп"
-    echo "5 ▶️ Старт"
-    echo "6 📈 Stats"
-    echo "7 🧠 LIVE Dashboard"
-    echo "0 ❌ Выход"
-    echo
-
-    read -r -p "Выбор: " c
-
-    case $c in
-      1) docker ps | grep remnanode ;;
-      2) docker logs -f --tail 100 remnanode ;;
-      3) docker restart remnanode ;;
-      4) docker stop remnanode ;;
-      5) docker start remnanode ;;
-      6) docker stats remnanode ;;
-      7) dashboard ;;
-      0) exit ;;
-    esac
-
-    read -r -p "Enter..."
-  done
+read -rp "Enter..."
+done
 }
 
 menu
@@ -277,23 +272,13 @@ EOF
 
 chmod +x /usr/local/bin/remnanode
 
-ok "CLI установлен"
+ok "CLI готов"
 
 ########################################
-# FINAL
+# FINISH
 ########################################
 
 echo
-echo -e "${GREEN}====================================${NC}"
-echo -e "${GREEN}     УСТАНОВКА ЗАВЕРШЕНА 🚀${NC}"
-echo -e "${GREEN}====================================${NC}"
-echo
-echo "Команда: remnanode"
+echo -e "${GREEN}✔ УСТАНОВКА ЗАВЕРШЕНА${NC}"
+echo "Запуск: remnanode"
 echo "Порт: 3000"
-echo
-echo "LIVE dashboard показывает:"
-echo " - CPU / RAM"
-echo " - активные подключения"
-echo " - TOP IP (анализ нагрузки / DDoS)"
-echo
-echo "===================================="
