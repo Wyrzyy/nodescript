@@ -1,768 +1,365 @@
-#!/usr/bin/env bash
+#!/bin/bash
+set -e
 
-# 🚀 REMNANODE FULL SETUP
-# Безопасная автоматическая настройка сервера под RemnaNode
-
-set -Eeuo pipefail
-
-# =========================
-# Цвета
-# =========================
+# Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-PURPLE='\033[0;35m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
-# =========================
-# Глобальные переменные
-# =========================
-SCRIPT_NAME="$(basename "$0")"
-TMP_DIR="/tmp/remnanode-setup"
-SYSCTL_BBR_FILE="/etc/sysctl.d/99-remnanode-bbr.conf"
-SWAP_SYSCTL_FILE="/etc/sysctl.d/99-remnanode-swap.conf"
-SSH_BACKUP_FILE=""
-SSH_SERVICE=""
-INSTALL_REMNANODE="true"
-XRAY_INSTALL="false"
-NODE_PORT="3000"
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-mkdir -p "$TMP_DIR"
+# Проверка на root
+if [ "$EUID" -ne 0 ]; then
+    print_error "Пожалуйста, запустите скрипт с правами root (sudo)"
+    exit 1
+fi
 
-# =========================
-# Вывод
-# =========================
-print_step() {
-    echo -e "${BLUE}┌─[${NC} ${CYAN}⚡${NC} ${BLUE}]────────────────────────────────────────────${NC}"
-    echo -e "${BLUE}│${NC} ${CYAN}➜${NC} $1"
-    echo -e "${BLUE}└──────────────────────────────────────────────────────────${NC}"
-}
+# Определение основного сетевого интерфейса
+DEFAULT_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+print_info "Основной сетевой интерфейс: $DEFAULT_INTERFACE"
 
-print_success() { echo -e "${GREEN}✅ $1${NC}"; }
-print_error()   { echo -e "${RED}❌ $1${NC}" >&2; }
-print_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
-print_info()    { echo -e "${CYAN}ℹ️  $1${NC}"; }
-print_ask()     { echo -ne "${YELLOW}👉 $1 ${NC}"; }
+# ============================================
+# 1. Системные оптимизации и TCP Tuning
+# ============================================
+print_info "Настройка системных параметров и TCP..."
 
-# =========================
-# Обработчики ошибок
-# =========================
-on_error() {
-    local exit_code=$?
-    local line_no="${1:-unknown}"
-    print_error "Скрипт завершился с ошибкой на строке: $line_no (код: $exit_code)"
-    print_info "Проверь логи выше. Изменения, уже применённые до ошибки, могли сохраниться."
-    exit "$exit_code"
-}
-trap 'on_error $LINENO' ERR
+cat > /etc/sysctl.d/99-remnawave.conf <<EOF
+# ------------------------------------------------------------------
+# Remnawave Node Performance & Protection Tuning
+# ------------------------------------------------------------------
 
-# =========================
-# Проверки
-# =========================
-require_root() {
-    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-        print_error "Запусти скрипт от root: sudo bash $SCRIPT_NAME"
-        exit 1
-    fi
-}
-
-detect_ssh_service() {
-    if systemctl list-unit-files | grep -q '^ssh\.service'; then
-        SSH_SERVICE="ssh"
-    elif systemctl list-unit-files | grep -q '^sshd\.service'; then
-        SSH_SERVICE="sshd"
-    else
-        SSH_SERVICE="ssh"
-    fi
-}
-
-restart_ssh_service() {
-    detect_ssh_service
-    systemctl restart "$SSH_SERVICE"
-}
-
-validate_ssh_config() {
-    sshd -t
-}
-
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-get_docker_compose_cmd() {
-    if docker compose version >/dev/null 2>&1; then
-        echo "docker compose"
-    elif command_exists docker-compose; then
-        echo "docker-compose"
-    else
-        echo ""
-    fi
-}
-
-pause_small() {
-    sleep 1
-}
-
-# =========================
-# Меню / ввод
-# =========================
-show_menu() {
-    local title="$1"
-    shift
-    local options=("$@")
-    local choice
-    local max="${#options[@]}"
-
-    echo -e "\n${PURPLE}════════════════════════════════════════════════════════════${NC}"
-    echo -e "${PURPLE}   $title${NC}"
-    echo -e "${PURPLE}════════════════════════════════════════════════════════════${NC}"
-
-    for i in "${!options[@]}"; do
-        echo -e "  ${GREEN}[$((i+1))]${NC} ${options[$i]}"
-    done
-
-    while true; do
-        echo
-        print_ask "Выберите номер [1-$max]:"
-        read -r choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= max )); then
-            printf '%s\n' "$choice"
-            return 0
-        fi
-        print_error "Неверный ввод. Введи число от 1 до $max."
-    done
-}
-
-ask_input() {
-    local prompt="$1"
-    local default="${2:-}"
-    local value
-
-    if [[ -n "$default" ]]; then
-        print_ask "$prompt [$default]:"
-    else
-        print_ask "$prompt:"
-    fi
-
-    read -r value
-    if [[ -z "$value" ]]; then
-        value="$default"
-    fi
-    printf '%s\n' "$value"
-}
-
-ask_yes_no() {
-    local prompt="$1"
-    local default="${2:-y}"
-    local value
-
-    while true; do
-        if [[ "$default" == "y" ]]; then
-            print_ask "$prompt [Y/n]:"
-        else
-            print_ask "$prompt [y/N]:"
-        fi
-
-        read -r value
-        value="${value:-$default}"
-
-        case "$value" in
-            y|Y) return 0 ;;
-            n|N) return 1 ;;
-            *) print_error "Введи y или n." ;;
-        esac
-    done
-}
-
-# =========================
-# SSH проверки
-# =========================
-get_sshd_effective_value() {
-    local key="$1"
-    sshd -T 2>/dev/null | awk -v k="$key" '$1==k {print $2; exit}'
-}
-
-check_ssh_status() {
-    echo -e "\n${CYAN}🔍 ПРОВЕРКА SSH СТАТУСА:${NC}"
-    echo -e "${PURPLE}────────────────────────────────────────────────────────────${NC}"
-
-    local auth_file="/root/.ssh/authorized_keys"
-    local key_count=0
-    local pass_auth=""
-    local kbd_auth=""
-    local pubkey_auth=""
-
-    if [[ -f "$auth_file" ]]; then
-        key_count=$(grep -Ec '^(ssh-|ecdsa-|sk-ssh-)' "$auth_file" 2>/dev/null || true)
-        echo -e "  📄 Файл authorized_keys: ${GREEN}✅ существует${NC}"
-        echo -e "  🔑 Количество ключей: ${CYAN}${key_count}${NC}"
-    else
-        echo -e "  📄 Файл authorized_keys: ${RED}❌ отсутствует${NC}"
-    fi
-
-    pass_auth="$(get_sshd_effective_value passwordauthentication || true)"
-    kbd_auth="$(get_sshd_effective_value kbdinteractiveauthentication || true)"
-    pubkey_auth="$(get_sshd_effective_value pubkeyauthentication || true)"
-
-    echo -e "\n  ⚙️  Эффективная SSH конфигурация:"
-    echo -e "     PubkeyAuthentication: ${CYAN}${pubkey_auth:-unknown}${NC}"
-    echo -e "     PasswordAuthentication: ${CYAN}${pass_auth:-unknown}${NC}"
-    echo -e "     KbdInteractiveAuthentication: ${CYAN}${kbd_auth:-unknown}${NC}"
-
-    echo -e "\n  📊 ИТОГ:"
-    if [[ "$pubkey_auth" == "yes" && "$pass_auth" == "no" && "$kbd_auth" == "no" && "$key_count" -gt 0 ]]; then
-        echo -e "     ${GREEN}✅ SSH выглядит безопасно: вход по ключу активен, пароль отключён${NC}"
-        return 0
-    fi
-
-    echo -e "     ${YELLOW}⚠️  SSH не полностью ужесточён или ключей нет${NC}"
-    return 1
-}
-
-# =========================
-# Система
-# =========================
-update_system() {
-    print_step "Обновление системы"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get upgrade -y
-    apt-get install -y \
-        curl wget unzip ca-certificates gnupg lsb-release \
-        software-properties-common apt-transport-https \
-        ufw jq
-    print_success "Система обновлена"
-}
-
-# =========================
-# BBR
-# =========================
-enable_bbr() {
-    print_step "Проверка и включение BBR"
-
-    local current_cc
-    local available
-    current_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-    available="$(sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-
-    if [[ "$current_cc" == "bbr" ]]; then
-        print_success "BBR уже включён"
-        return 0
-    fi
-
-    if ! lsmod | grep -q '^tcp_bbr'; then
-        modprobe tcp_bbr || true
-    fi
-
-    mkdir -p /etc/modules-load.d
-    if ! grep -qx 'tcp_bbr' /etc/modules-load.d/remnanode-bbr.conf 2>/dev/null; then
-        echo 'tcp_bbr' > /etc/modules-load.d/remnanode-bbr.conf
-    fi
-
-    cat > "$SYSCTL_BBR_FILE" <<'EOF'
+# 1. BBR + FQ (для максимальной производительности TCP)
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+
+# 2. Увеличение лимитов для обработки большого числа соединений
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_abort_on_overflow = 0
+
+# 3. Оптимизация памяти для сетевых буферов
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.tcp_mem = 786432 1048576 1572864
+
+# 4. Ускорение закрытия соединений и переиспользование портов
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_tw_recycle = 0
+net.ipv4.ip_local_port_range = 1024 65535
+
+# 5. Защита от DDoS и вредоносных пакетов
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_fack = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_no_metrics_save = 1
+
+# 6. Игнорируем ICMP редиректы (безопасность)
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# 7. Защита от ICMP flood
+net.ipv4.icmp_echo_ignore_all = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# 8. Увеличение лимитов для файлов (для высоких нагрузок)
+fs.file-max = 2097152
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 524288
 EOF
 
-    sysctl --system >/dev/null
+sysctl -p /etc/sysctl.d/99-remnawave.conf
+print_success "Системные параметры применены"
 
-    current_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-    if [[ "$current_cc" == "bbr" ]]; then
-        print_success "BBR успешно включён"
-    else
-        print_warning "Не удалось подтвердить активацию BBR. Доступные алгоритмы:"
-        echo "$available"
-    fi
-}
+# ============================================
+# 2. Лимиты для пользователя (ulimits)
+# ============================================
+print_info "Настройка ulimits..."
 
-# =========================
-# Docker
-# =========================
-install_docker_if_needed() {
-    print_step "Проверка Docker"
-
-    if command_exists docker; then
-        print_success "Docker уже установлен"
-    else
-        print_info "Docker не найден, устанавливаем"
-        curl -fsSL https://get.docker.com | sh
-        systemctl enable docker
-        systemctl start docker
-        print_success "Docker установлен"
-    fi
-
-    local compose_cmd
-    compose_cmd="$(get_docker_compose_cmd)"
-    if [[ -z "$compose_cmd" ]]; then
-        print_info "Плагин docker compose не найден, пробуем установить"
-        apt-get install -y docker-compose-plugin || true
-    fi
-
-    compose_cmd="$(get_docker_compose_cmd)"
-    if [[ -z "$compose_cmd" ]]; then
-        print_error "Не удалось найти ни 'docker compose', ни 'docker-compose'"
-        exit 1
-    fi
-
-    print_success "Команда compose: $compose_cmd"
-}
-
-# =========================
-# RemnaNode
-# =========================
-prepare_existing_installation() {
-    print_step "Проверка существующей установки RemnaNode"
-
-    if [[ -d /opt/remnanode ]]; then
-        print_warning "Обнаружена существующая папка /opt/remnanode"
-
-        local compose_cmd
-        compose_cmd="$(get_docker_compose_cmd)"
-        if [[ -n "$compose_cmd" && -f /opt/remnanode/docker-compose.yml ]]; then
-            ( cd /opt/remnanode && $compose_cmd down ) || true
-        fi
-
-        local choice
-        choice="$(show_menu "УПРАВЛЕНИЕ СУЩЕСТВУЮЩЕЙ УСТАНОВКОЙ" \
-            "Удалить и установить заново" \
-            "Пропустить установку и использовать существующую" \
-            "Выйти из скрипта")"
-
-        case "$choice" in
-            1)
-                print_step "Удаление старой установки"
-                rm -rf /opt/remnanode
-                rm -rf /var/lib/remnanode
-                INSTALL_REMNANODE="true"
-                print_success "Старая установка удалена"
-                ;;
-            2)
-                INSTALL_REMNANODE="false"
-                print_info "Будет использована существующая установка"
-                ;;
-            3)
-                print_info "Выход по запросу пользователя"
-                exit 0
-                ;;
-        esac
-    else
-        INSTALL_REMNANODE="true"
-    fi
-}
-
-install_remnanode() {
-    if [[ "$INSTALL_REMNANODE" != "true" ]]; then
-        return 0
-    fi
-
-    print_step "Установка RemnaNode"
-
-    local secret_key
-    secret_key="$(ask_input "Введите SECRET_KEY из Remnawave-Panel")"
-    if [[ -z "$secret_key" ]]; then
-        print_error "SECRET_KEY не может быть пустым"
-        exit 1
-    fi
-
-    NODE_PORT="$(ask_input "Введите порт для Node" "3000")"
-    if [[ ! "$NODE_PORT" =~ ^[0-9]+$ ]] || (( NODE_PORT < 1 || NODE_PORT > 65535 )); then
-        print_error "Некорректный порт: $NODE_PORT"
-        exit 1
-    fi
-
-    local xray_choice
-    xray_choice="$(show_menu "УСТАНОВКА XRAY" \
-        "Установить Xray-core" \
-        "Пропустить установку Xray")"
-
-    if [[ "$xray_choice" == "1" ]]; then
-        XRAY_INSTALL="true"
-    else
-        XRAY_INSTALL="false"
-    fi
-
-    mkdir -p /opt/remnanode /var/lib/remnanode
-
-    curl -fsSL https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/remnanode.sh -o /usr/local/bin/remnanode
-    chmod 755 /usr/local/bin/remnanode
-
-    cat > /opt/remnanode/.env <<EOF
-### NODE ###
-NODE_PORT=${NODE_PORT}
-
-### XRAY ###
-SECRET_KEY=${secret_key}
-XTLS_API_PORT=61000
+cat > /etc/security/limits.d/99-remnawave.conf <<EOF
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc unlimited
+* hard nproc unlimited
+root soft nofile 1048576
+root hard nofile 1048576
 EOF
 
-    cat > /opt/remnanode/docker-compose.yml <<'EOF'
+# Настройка systemd лимитов
+mkdir -p /etc/systemd/system.conf.d/
+cat > /etc/systemd/system.conf.d/99-limits.conf <<EOF
+[Manager]
+DefaultLimitNOFILE=1048576
+DefaultLimitNPROC=infinity
+EOF
+
+systemctl daemon-reload
+print_success "Ulimits настроены"
+
+# ============================================
+# 3. Установка Docker
+# ============================================
+print_info "Установка Docker..."
+
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    rm get-docker.sh
+    print_success "Docker установлен"
+else
+    print_warning "Docker уже установлен"
+fi
+
+systemctl enable docker
+systemctl start docker
+
+# ============================================
+# 4. Настройка UFW (Uncomplicated Firewall)
+# ============================================
+print_info "Настройка UFW..."
+
+apt update
+apt install ufw -y
+
+# Сброс к дефолтным настройкам
+ufw --force reset
+
+# Политики по умолчанию
+ufw default deny incoming
+ufw default allow outgoing
+ufw default deny forward
+
+# Разрешаем только нужные порты
+ufw allow 22/tcp comment 'SSH'
+ufw allow 80/tcp comment 'HTTP'
+ufw allow 443/tcp comment 'HTTPS/VLESS'
+ufw allow 3000/tcp comment 'Remnawave API'
+
+# Защита от SYN flood на уровне UFW
+# (это дополнение к iptables правилам)
+cat >> /etc/ufw/before.rules <<'EOF'
+
+# === Remnawave Anti-DDoS Rules ===
+# Ограничение SYN пакетов
+-A ufw-before-input -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT
+-A ufw-before-input -p tcp --syn -j DROP
+
+# Отбрасываем невалидные пакеты
+-A ufw-before-input -m state --state INVALID -j DROP
+
+# Ограничение на количество соединений с одного IP (для 443 порта)
+-A ufw-before-input -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP
+
+# Защита от сканирования портов
+-A ufw-before-input -p tcp --tcp-flags ALL NONE -j DROP
+-A ufw-before-input -p tcp --tcp-flags ALL ALL -j DROP
+EOF
+
+ufw --force enable
+print_success "UFW настроен: открыты порты 22, 80, 443, 3000"
+
+# ============================================
+# 5. Установка и настройка Fail2Ban
+# ============================================
+print_info "Установка Fail2Ban..."
+
+apt install fail2ban -y
+
+# Создаем фильтры для защиты от DDoS
+cat > /etc/fail2ban/filter.d/remnawave-ddos.conf <<'EOF'
+[Definition]
+failregex = ^.*rate limit exceeded.*remote_ip": "<HOST>".*$
+ignoreregex =
+EOF
+
+cat > /etc/fail2ban/filter.d/remnawave-connlimit.conf <<'EOF'
+[Definition]
+failregex = ^.*connlimit.*\s<HOST>\s.*$
+ignoreregex =
+EOF
+
+# Настройка jail.local
+cat > /etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+bantime = 1h
+findtime = 60
+maxretry = 20
+banaction = iptables-multiport
+ignoreip = 127.0.0.1/8
+
+[sshd]
+enabled = true
+port = 22
+filter = sshd
+maxretry = 5
+bantime = 1h
+
+[remnawave-ddos]
+enabled = true
+port = 80,443
+filter = remnawave-ddos
+logpath = /var/log/caddy/access.log
+         /var/log/remnanode/access.log
+maxretry = 30
+findtime = 30
+bantime = 4h
+
+[remnawave-connlimit]
+enabled = true
+port = 80,443
+filter = remnawave-connlimit
+logpath = /var/log/ufw.log
+maxretry = 5
+findtime = 10
+bantime = 1h
+EOF
+
+systemctl restart fail2ban
+systemctl enable fail2ban
+print_success "Fail2Ban настроен"
+
+# ============================================
+# 6. Установка Remnawave Node
+# ============================================
+print_info "Установка Remnawave Node..."
+
+# Директория для установки
+INSTALL_DIR="/opt/remnanode"
+mkdir -p ${INSTALL_DIR}
+
+# Запрос SECRET_KEY у пользователя
+print_warning "Введите SECRET_KEY для Remnawave ноды (можно получить в панели управления):"
+read -p "SECRET_KEY: " SECRET_KEY
+
+if [ -z "$SECRET_KEY" ]; then
+    print_error "SECRET_KEY не может быть пустым!"
+    exit 1
+fi
+
+# Создание docker-compose.yml с NET_ADMIN и лимитами ресурсов
+cat > ${INSTALL_DIR}/docker-compose.yml <<EOF
 services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: ghcr.io/remnawave/node:latest
-    env_file:
-      - .env
+    image: remnawave/node:latest
     network_mode: host
     restart: always
+    
+    # Добавляем NET_ADMIN для управления соединениями
     cap_add:
       - NET_ADMIN
-    ulimits:
-      nofile:
-        soft: 1048576
-        hard: 1048576
-EOF
-
-    if [[ "$XRAY_INSTALL" == "true" ]]; then
-        install_xray
-        cat >> /opt/remnanode/docker-compose.yml <<'EOF'
+    
+    # Ограничение ресурсов контейнера
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    
+    environment:
+      - NODE_PORT=3000
+      - SECRET_KEY=${SECRET_KEY}
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        compress: "true"
+    
     volumes:
-      - /var/lib/remnanode/xray:/usr/local/bin/xray:ro
-      - /var/lib/remnanode/geoip.dat:/usr/local/share/xray/geoip.dat:ro
-      - /var/lib/remnanode/geosite.dat:/usr/local/share/xray/geosite.dat:ro
-EOF
-    fi
-
-    print_success "RemnaNode подготовлен в /opt/remnanode"
-}
-
-install_xray() {
-    print_step "Установка Xray-core"
-
-    local arch
-    local latest_release
-    local xray_filename
-    local xray_url
-
-    case "$(uname -m)" in
-        x86_64) arch="64" ;;
-        aarch64|arm64) arch="arm64-v8a" ;;
-        *) arch="64" ;;
-    esac
-
-    latest_release="$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name')"
-    if [[ -z "$latest_release" || "$latest_release" == "null" ]]; then
-        print_warning "Не удалось определить последнюю версию Xray"
-        return 0
-    fi
-
-    xray_filename="Xray-linux-${arch}.zip"
-    xray_url="https://github.com/XTLS/Xray-core/releases/download/${latest_release}/${xray_filename}"
-
-    cd /var/lib/remnanode
-    wget -qO "$xray_filename" "$xray_url"
-    unzip -o "$xray_filename" >/dev/null
-    rm -f "$xray_filename"
-
-    chmod +x /var/lib/remnanode/xray || true
-
-    [[ -f /var/lib/remnanode/geoip.dat ]] || print_warning "geoip.dat не найден"
-    [[ -f /var/lib/remnanode/geosite.dat ]] || print_warning "geosite.dat не найден"
-
-    print_success "Xray-core установлен"
-}
-
-# =========================
-# UFW
-# =========================
-setup_ufw() {
-    print_step "Настройка UFW"
-
-    local panel_ip
-    panel_ip="$(ask_input "Введите IP панели, которой разрешить доступ к NODE_PORT (${NODE_PORT})")"
-
-    if [[ -z "$panel_ip" ]]; then
-        print_error "IP панели не может быть пустым"
-        exit 1
-    fi
-
-    if ! [[ "$panel_ip" =~ ^[0-9a-fA-F:.]+(/[0-9]+)?$ ]]; then
-        print_warning "IP/сеть выглядит необычно: $panel_ip"
-        if ! ask_yes_no "Продолжить с этим значением?" "n"; then
-            exit 1
-        fi
-    fi
-
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-
-    ufw limit 22/tcp comment 'SSH rate limit'
-    ufw allow 443/tcp comment 'HTTPS/Reality'
-    ufw allow 443/udp comment 'QUIC/HTTP3'
-    ufw allow 8443/tcp comment 'HTTPS alt'
-    ufw allow 8443/udp comment 'HTTPS alt QUIC'
-    ufw allow 9999/tcp comment 'HAProxy backend public'
-    ufw allow from "$panel_ip" to any port "$NODE_PORT" proto tcp comment 'Node management panel only'
-
-    ufw --force enable
-
-    print_success "UFW настроен"
-}
-
-# =========================
-# SSH hardening
-# =========================
-configure_ssh_key_only() {
-    print_step "Настройка SSH входа только по ключу"
-
-    local ssh_dir="/root/.ssh"
-    local auth_file="${ssh_dir}/authorized_keys"
-    local user_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICp1kvEpQtmWf15TBVOhkBWQakvAVjBv+G+8ak/PGyXg Generated By Termius'
-
-    mkdir -p "$ssh_dir"
-    chmod 700 "$ssh_dir"
-    touch "$auth_file"
-    chmod 600 "$auth_file"
-
-    if [[ -f "$auth_file" ]]; then
-        cp "$auth_file" "${auth_file}.backup.$(date +%Y%m%d_%H%M%S)"
-        print_info "Бэкап authorized_keys сохранён"
-    fi
-
-    if ! grep -Fqx "$user_key" "$auth_file"; then
-        echo "$user_key" >> "$auth_file"
-        print_success "SSH ключ добавлен"
-    else
-        print_info "SSH ключ уже присутствует"
-    fi
-
-    SSH_BACKUP_FILE="/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
-    cp /etc/ssh/sshd_config "$SSH_BACKUP_FILE"
-    print_info "Бэкап sshd_config: $SSH_BACKUP_FILE"
-
-    # Убираем старые директивы, чтобы не плодить дубли
-    sed -i '/^[#[:space:]]*PasswordAuthentication[[:space:]]\+/d' /etc/ssh/sshd_config
-    sed -i '/^[#[:space:]]*ChallengeResponseAuthentication[[:space:]]\+/d' /etc/ssh/sshd_config
-    sed -i '/^[#[:space:]]*KbdInteractiveAuthentication[[:space:]]\+/d' /etc/ssh/sshd_config
-    sed -i '/^[#[:space:]]*PubkeyAuthentication[[:space:]]\+/d' /etc/ssh/sshd_config
-
-    cat >> /etc/ssh/sshd_config <<'EOF'
-
-# RemnaNode hardening
-PubkeyAuthentication yes
-PasswordAuthentication no
-ChallengeResponseAuthentication no
-KbdInteractiveAuthentication no
+      - '/var/log/remnanode:/var/log/remnanode'
+      - '/etc/timezone:/etc/timezone:ro'
+      - '/etc/localtime:/etc/localtime:ro'
 EOF
 
-    validate_ssh_config
-    restart_ssh_service
+# Запуск ноды
+cd ${INSTALL_DIR}
+docker-compose up -d
 
-    print_success "SSH конфиг применён и сервис перезапущен"
+print_success "Remnawave Node установлена и запущена"
 
-    echo
-    check_ssh_status
+# ============================================
+# 7. Дополнительные iptables правила
+# ============================================
+print_info "Применение дополнительных iptables правил..."
 
-    echo
-    print_warning "СЕЙЧАС ВАЖНО: открой вторую SSH-сессию и проверь вход по ключу."
-    if ask_yes_no "Ты успешно вошёл во второй сессии по ключу?" "n"; then
-        print_success "Подтверждено: вход по ключу работает"
-    else
-        print_warning "Откатываем изменения SSH"
-        cp "$SSH_BACKUP_FILE" /etc/ssh/sshd_config
-        validate_ssh_config
-        restart_ssh_service
-        print_success "SSH конфиг восстановлен из бэкапа"
-    fi
-}
+iptables -F
+iptables -X
 
-maybe_configure_ssh() {
-    print_step "Проверка безопасности SSH"
+# Сохраняем текущие правила UFW
+iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 
-    echo -e "\n${CYAN}📋 СОСТОЯНИЕ SSH ДО ИЗМЕНЕНИЙ:${NC}"
-    check_ssh_status || true
+# Применяем правила
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -i lo -j ACCEPT
 
-    local choice
-    choice="$(show_menu "РЕЖИМ ВХОДА ПО SSH" \
-        "Отключить пароль и оставить только вход по ключу" \
-        "Оставить вход по паролю как есть")"
+# SYN Flood защита
+iptables -A INPUT -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT
+iptables -A INPUT -p tcp --syn -j DROP
 
-    if [[ "$choice" == "1" ]]; then
-        configure_ssh_key_only
-    else
-        print_info "Настройки SSH оставлены без изменений"
-    fi
-}
+# Невалидные пакеты
+iptables -A INPUT -m state --state INVALID -j DROP
 
-# =========================
-# Swap
-# =========================
-setup_swap() {
-    print_step "Настройка swap"
+# Connlimit для порта 443
+iptables -A INPUT -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP
 
-    local choice
-    local swap_size="0"
+# Rate limit для порта 443
+iptables -A INPUT -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT
+iptables -A INPUT -p tcp --dport 443 -j DROP
 
-    choice="$(show_menu "ВЫБОР РАЗМЕРА SWAP" \
-        "Не создавать swap" \
-        "1 GB" \
-        "2 GB" \
-        "4 GB" \
-        "8 GB" \
-        "Свой размер")"
+# Сохраняем правила
+apt install iptables-persistent -y
+netfilter-persistent save
 
-    case "$choice" in
-        1) swap_size="0" ;;
-        2) swap_size="1" ;;
-        3) swap_size="2" ;;
-        4) swap_size="4" ;;
-        5) swap_size="8" ;;
-        6)
-            swap_size="$(ask_input "Введите размер swap в GB")"
-            if [[ ! "$swap_size" =~ ^[0-9]+$ ]] || (( swap_size < 1 )); then
-                print_error "Некорректный размер swap"
-                swap_size="0"
-            fi
-            ;;
-    esac
+print_success "Дополнительные iptables правила применены"
 
-    if (( swap_size == 0 )); then
-        print_info "Swap не создаётся"
-        return 0
-    fi
-
-    if swapon --show | grep -q '^/swapfile'; then
-        print_warning "Swapfile уже существует, пересоздаём"
-        swapoff /swapfile || true
-        rm -f /swapfile
-    fi
-
-    print_step "Создание swap ${swap_size}GB"
-
-    if command_exists fallocate; then
-        fallocate -l "${swap_size}G" /swapfile
-    else
-        dd if=/dev/zero of=/swapfile bs=1M count=$((swap_size * 1024)) status=progress
-    fi
-
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-
-    if ! grep -qE '^/swapfile[[:space:]]+none[[:space:]]+swap' /etc/fstab; then
-        echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    fi
-
-    cat > "$SWAP_SYSCTL_FILE" <<'EOF'
-vm.swappiness = 10
-EOF
-    sysctl --system >/dev/null
-
-    print_success "Swap ${swap_size}GB создан"
-}
-
-# =========================
-# Запуск контейнера
-# =========================
-start_remnanode() {
-    print_step "Запуск RemnaNode"
-
-    if [[ ! -f /opt/remnanode/docker-compose.yml ]]; then
-        print_warning "Файл /opt/remnanode/docker-compose.yml не найден, запуск пропущен"
-        return 0
-    fi
-
-    local compose_cmd
-    compose_cmd="$(get_docker_compose_cmd)"
-    if [[ -z "$compose_cmd" ]]; then
-        print_error "Команда docker compose не найдена"
-        exit 1
-    fi
-
-    (
-        cd /opt/remnanode
-        $compose_cmd up -d
-    )
-
-    pause_small
-    if docker ps --format '{{.Names}}' | grep -qx 'remnanode'; then
-        print_success "Контейнер remnanode запущен"
-    else
-        print_warning "Контейнер remnanode не найден среди активных"
-        print_info "Проверь логи: docker logs remnanode"
-    fi
-}
-
-# =========================
-# Финальный отчёт
-# =========================
-final_report() {
-    clear
-    echo -e "${GREEN}"
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║     ✅ НАСТРОЙКА REMNANODE ЗАВЕРШЕНА                     ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-
-    echo -e "\n${CYAN}📊 СТАТУС UFW:${NC}"
-    ufw status numbered || true
-
-    echo -e "\n${CYAN}📊 СТАТУС BBR:${NC}"
-    sysctl net.ipv4.tcp_congestion_control || true
-
-    echo -e "\n${CYAN}📊 СТАТУС SWAP:${NC}"
-    free -h || true
-    swapon --show || true
-
-    echo -e "\n${CYAN}🔐 СТАТУС SSH:${NC}"
-    check_ssh_status || true
-
-    echo -e "\n${CYAN}🚀 REMNANODE:${NC}"
-    if [[ -f /opt/remnanode/.env ]]; then
-        local final_port
-        final_port="$(grep '^NODE_PORT=' /opt/remnanode/.env | cut -d= -f2 || true)"
-        echo "   Порт: ${final_port:-3000}"
-    fi
-    echo "   Папка: /opt/remnanode"
-
-    if docker ps --format '{{.Names}}' | grep -qx 'remnanode'; then
-        echo -e "   Статус: ${GREEN}✅ РАБОТАЕТ${NC}"
-    else
-        echo -e "   Статус: ${YELLOW}⏸️  НЕ ЗАПУЩЕН${NC}"
-    fi
-
-    echo -e "\n${GREEN}════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}🔥 Сервер настроен${NC}"
-    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
-}
-
-# =========================
-# Main
-# =========================
-main() {
-    require_root
-    detect_ssh_service
-
-    clear
-    echo -e "${CYAN}"
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║        🔥 REMNANODE - АВТОМАТИЧЕСКАЯ НАСТРОЙКА           ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-
-    update_system
-
-    local bbr_choice
-    bbr_choice="$(show_menu "НАСТРОЙКА BBR" \
-        "Включить BBR (рекомендуется)" \
-        "Пропустить")"
-    if [[ "$bbr_choice" == "1" ]]; then
-        enable_bbr
-    else
-        print_info "BBR пропущен"
-    fi
-
-    install_docker_if_needed
-    prepare_existing_installation
-    install_remnanode
-    setup_ufw
-    maybe_configure_ssh
-    setup_swap
-    start_remnanode
-    final_report
-}
-
-main "$@"
+# ============================================
+# 8. Информация о установке
+# ============================================
+echo ""
+echo "=========================================="
+print_success "УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!"
+echo "=========================================="
+echo ""
+print_info "Установлены компоненты:"
+echo "  ✓ BBR + TCP Tuning"
+echo "  ✓ UFW (порты: 22, 80, 443, 3000)"
+echo "  ✓ Защита от SYN flood"
+echo "  ✓ Fail2Ban с кастомными правилами"
+echo "  ✓ Docker + Remnawave Node"
+echo ""
+print_info "Проверка статуса:"
+docker ps | grep remnanode
+echo ""
+print_info "Логи ноды:"
+echo "  docker logs -f remnanode"
+echo ""
+print_warning "Рекомендации:"
+echo "  1. Настройте Cloudflare для дополнительной защиты"
+echo "  2. Регулярно обновляйте систему: apt update && apt upgrade"
+echo "  3. Настройте мониторинг: docker stats remnanode"
+echo "=========================================="
