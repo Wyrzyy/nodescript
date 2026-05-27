@@ -19,6 +19,11 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Обновление списка пакетов и системы
+print_info "Обновление системы и пакетов..."
+apt update -y && apt upgrade -y
+apt install -y curl wget git ufw fail2ban iptables-persistent netfilter-persistent software-properties-common gnupg lsb-release ca-certificates
+
 # Определение основного сетевого интерфейса
 DEFAULT_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
 print_info "Основной сетевой интерфейс: $DEFAULT_INTERFACE"
@@ -120,28 +125,25 @@ print_success "Ulimits настроены"
 # ============================================
 print_info "Установка Docker..."
 
-if ! command -v docker &> /dev/null; then
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
-    rm get-docker.sh
-    print_success "Docker установлен"
-else
-    print_warning "Docker уже установлен"
-fi
+# Добавление официального репозитория Docker
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
+apt update -y
+apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 systemctl enable docker
 systemctl start docker
+
+print_success "Docker и Docker Compose установлены"
 
 # ============================================
 # 4. Настройка UFW (Uncomplicated Firewall)
 # ============================================
 print_info "Настройка UFW..."
 
-apt update
-apt install ufw -y
-
 # Сброс к дефолтным настройкам
-ufw --force reset
+yes | ufw reset
 
 # Политики по умолчанию
 ufw default deny incoming
@@ -174,7 +176,8 @@ cat >> /etc/ufw/before.rules <<'EOF'
 -A ufw-before-input -p tcp --tcp-flags ALL ALL -j DROP
 EOF
 
-ufw --force enable
+# Включаем UFW
+yes | ufw enable
 print_success "UFW настроен: открыты порты 22, 80, 443, 3000"
 
 # ============================================
@@ -182,7 +185,7 @@ print_success "UFW настроен: открыты порты 22, 80, 443, 3000
 # ============================================
 print_info "Установка Fail2Ban..."
 
-apt install fail2ban -y
+apt install -y fail2ban
 
 # Создаем фильтры для защиты от DDoS
 cat > /etc/fail2ban/filter.d/remnawave-ddos.conf <<'EOF'
@@ -247,6 +250,7 @@ INSTALL_DIR="/opt/remnanode"
 mkdir -p ${INSTALL_DIR}
 
 # Запрос SECRET_KEY у пользователя
+echo ""
 print_warning "Введите SECRET_KEY для Remnawave ноды (можно получить в панели управления):"
 read -p "SECRET_KEY: " SECRET_KEY
 
@@ -298,24 +302,23 @@ EOF
 
 # Запуск ноды
 cd ${INSTALL_DIR}
-docker-compose up -d
+docker compose up -d
 
 print_success "Remnawave Node установлена и запущена"
 
 # ============================================
-# 7. Дополнительные iptables правила
+# 7. Дополнительные iptables правила (дублирование защиты)
 # ============================================
 print_info "Применение дополнительных iptables правил..."
 
+# Очистка старых правил, но сохранение важных
 iptables -F
 iptables -X
 
-# Сохраняем текущие правила UFW
-iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-
-# Применяем правила
+# Базовые разрешения
 iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 
 # SYN Flood защита
 iptables -A INPUT -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT
@@ -327,12 +330,11 @@ iptables -A INPUT -m state --state INVALID -j DROP
 # Connlimit для порта 443
 iptables -A INPUT -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP
 
-# Rate limit для порта 443
+# Rate limit для порта 443 (пропускаем легитимный трафик)
 iptables -A INPUT -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT
 iptables -A INPUT -p tcp --dport 443 -j DROP
 
 # Сохраняем правила
-apt install iptables-persistent -y
 netfilter-persistent save
 
 print_success "Дополнительные iptables правила применены"
@@ -357,6 +359,9 @@ docker ps | grep remnanode
 echo ""
 print_info "Логи ноды:"
 echo "  docker logs -f remnanode"
+echo ""
+print_info "Проверка BBR:"
+echo "  sysctl net.ipv4.tcp_congestion_control"
 echo ""
 print_warning "Рекомендации:"
 echo "  1. Настройте Cloudflare для дополнительной защиты"
