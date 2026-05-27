@@ -195,49 +195,87 @@ else
 fi
 
 # ==========================================
-# 5. UFW (полностью идемпотентно, без интерактива)
+# 5. UFW (исправленная версия – всегда сброс и чистая настройка)
 # ==========================================
 info "Настройка UFW..."
-# Сброс только если UFW не активен или правила не те
-if ! ufw status | grep -q "Status: active"; then
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw default deny forward
-    ufw allow 22/tcp comment 'SSH'
-    ufw allow 80/tcp comment 'HTTP'
-    ufw allow 443/tcp comment 'HTTPS/VLESS'
-    ufw allow 3000/tcp comment 'Remnawave API'
-    # Сохраняем оригинальный before.rules
-    cp /usr/share/ufw/before.rules /etc/ufw/before.rules.orig
-    cp /etc/ufw/before.rules.orig /etc/ufw/before.rules
-fi
 
-# Добавляем анти-DDoS правила, если их нет
-if ! grep -q "# === Remnawave Anti-DDoS Rules ===" /etc/ufw/before.rules; then
-    # Удалим возможные старые вставки (по ключевому слову)
-    sed -i '/# === Remnawave Anti-DDoS Rules ===/,/# FINISH/d' /etc/ufw/before.rules
-    cat >> /etc/ufw/before.rules <<'EOF'
+# Полный сброс и настройка заново (гарантирует отсутствие старых ошибок)
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw default deny forward
 
-# === Remnawave Anti-DDoS Rules ===
--A ufw-before-input -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT
--A ufw-before-input -p tcp --syn -j DROP
--A ufw-before-input -m state --state INVALID -j DROP
--A ufw-before-input -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP
--A ufw-before-input -p tcp --tcp-flags ALL NONE -j DROP
--A ufw-before-input -p tcp --tcp-flags ALL ALL -j DROP
--A ufw-before-input -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT
--A ufw-before-input -p tcp --dport 443 -j DROP
-EOF
-    ok "Анти-DDoS правила добавлены в before.rules."
+# Разрешаем нужные порты
+ufw allow 22/tcp comment 'SSH'
+ufw allow 80/tcp comment 'HTTP'
+ufw allow 443/tcp comment 'HTTPS/VLESS'
+ufw allow 3000/tcp comment 'Remnawave API'
+
+# Восстанавливаем оригинальный before.rules из системного шаблона
+ORIG_BEFORE="/usr/share/ufw/before.rules"
+if [[ -f "$ORIG_BEFORE" ]]; then
+    cp "$ORIG_BEFORE" /etc/ufw/before.rules
 else
-    info "Анти-DDoS правила уже присутствуют."
+    warn "Оригинальный before.rules не найден, создаю новый."
+    cat > /etc/ufw/before.rules <<'EOF'
+# Описание стандартных правил (минимальный шаблон)
+*nat
+:PREROUTING ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+COMMIT
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+COMMIT
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p icmp -j ACCEPT
+COMMIT
+EOF
 fi
 
-# Принудительно включаем/перезагружаем UFW без вопросов
+# Добавляем наши анти-DDoS правила перед строкой COMMIT в секции *filter
+# Используем awk для вставки перед последним COMMIT в секции filter
+TMP_RULES=$(mktemp)
+awk '
+/^*filter$/ { in_filter=1 }
+in_filter && /^COMMIT$/ {
+    print "# === Remnawave Anti-DDoS Rules ==="
+    print "-A INPUT -p tcp --syn -m limit --limit 3/s --limit-burst 10 -j ACCEPT"
+    print "-A INPUT -p tcp --syn -j DROP"
+    print "-A INPUT -m state --state INVALID -j DROP"
+    print "-A INPUT -p tcp --dport 443 -m connlimit --connlimit-above 30 --connlimit-mask 32 -j DROP"
+    print "-A INPUT -p tcp --tcp-flags ALL NONE -j DROP"
+    print "-A INPUT -p tcp --tcp-flags ALL ALL -j DROP"
+    print "-A INPUT -p tcp --dport 443 -m limit --limit 50/s --limit-burst 100 -j ACCEPT"
+    print "-A INPUT -p tcp --dport 443 -j DROP"
+    in_filter=0
+}
+{ print }
+' /etc/ufw/before.rules > "$TMP_RULES"
+mv "$TMP_RULES" /etc/ufw/before.rules
+
+# Проверка синтаксиса перед применением
+if ! iptables-restore -t < /etc/ufw/before.rules 2>/dev/null; then
+    err "Ошибка синтаксиса в before.rules. Восстанавливаем оригинал."
+    cp "$ORIG_BEFORE" /etc/ufw/before.rules
+    # Повторная попытка без дополнительных правил
+    ufw --force enable
+    ufw reload
+    err "Не удалось применить анти-DDoS правила. UFW работает с базовыми правилами."
+fi
+
+# Принудительно включаем и перезагружаем UFW
 ufw --force enable
 ufw reload
-ok "UFW активен и правила загружены."
+ok "UFW активен и анти-DDoS правила загружены."
 
 # ==========================================
 # 6. Fail2Ban
@@ -266,7 +304,7 @@ else
 fi
 
 # ==========================================
-# 7. Удаление старой ноды (по желанию)
+# 7. Удаление старой ноды (опционально)
 # ==========================================
 check_and_remove_existing
 
@@ -277,7 +315,6 @@ info "Установка Remnawave Node..."
 INSTALL_DIR="/opt/remnanode"
 mkdir -p "$INSTALL_DIR"
 
-# Определяем SECRET_KEY
 if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
     OLD_KEY=$(grep "SECRET_KEY=" "$INSTALL_DIR/docker-compose.yml" | cut -d'=' -f2 | tr -d ' ' | head -1)
     if [[ -n "$OLD_KEY" ]]; then
