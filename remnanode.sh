@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE INSTALLER — Ubuntu 24.04 / Debian 12
 # Оптимизировано под XRay Reality (TCP) + Hysteria2 (UDP)
-# Версия: 2026.1.2
+# Версия: 2026.1.3
 ###############################################################################
 
 APP="remnanode"
@@ -78,13 +78,10 @@ CODENAME=$VERSION_CODENAME
 CPU=$(nproc)
 RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
 
-# Публичный IP (несколько источников на всякий случай)
 PUBLIC_IP=$(curl -fsS4 --max-time 3 https://api.ipify.org 2>/dev/null \
          || curl -fsS4 --max-time 3 https://ifconfig.me 2>/dev/null \
          || curl -fsS4 --max-time 3 https://icanhazip.com 2>/dev/null \
          || echo "неизвестен")
-
-# Локальный IP по дефолтному маршруту (на случай NAT)
 LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 
 info "CPU: $CPU cores | RAM: ${RAM_MB}MB | ARCH: $ARCH"
@@ -451,9 +448,9 @@ systemctl restart docker'"
 
 ###############################################################################
 # docker-compose.yml
-# (sysctls удалены — Docker не позволяет их задавать при network_mode: host.
-#  Все нужные параметры уже применены на хосте через sysctl.d/99-remnanode.conf
-#  и контейнер автоматически использует их через общий network namespace.)
+# Переменная NODE_PORT (НЕ APP_PORT!) — официальное имя у Remnawave node.
+# sysctls внутри контейнера не задаются — они применены на хосте,
+# а host network namespace их подхватывает автоматически.
 ###############################################################################
 mkdir -p "$DIR"
 
@@ -467,7 +464,7 @@ services:
     restart: always
     environment:
       - SECRET_KEY=${K1}
-      - APP_PORT=${NODE_PORT}
+      - NODE_PORT=${NODE_PORT}
     cap_add:
       - NET_ADMIN
     ulimits:
@@ -486,13 +483,18 @@ cd "$DIR"
 run_step "Pull образа" "docker compose pull -q"
 run_step "Запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
 
-sleep 3
+sleep 5
 
 if ! docker ps --format '{{.Names}}' | grep -q '^remnanode$'; then
   err "Контейнер не запустился. Логи: docker logs remnanode"
 fi
 
-ok "Контейнер remnanode работает"
+# Проверка, что NODE_PORT реально слушается
+if ss -tlnp 2>/dev/null | grep -q ":${NODE_PORT} "; then
+  ok "Контейнер remnanode работает и слушает порт ${NODE_PORT}"
+else
+  warn "Контейнер запущен, но порт ${NODE_PORT} ещё не слушается — проверь: docker logs remnanode"
+fi
 
 ###############################################################################
 # CLI panel
@@ -513,7 +515,6 @@ live_panel() {
     echo -e "  (Ctrl+C — выход в меню)"
     echo -e "====================================${NC}"
 
-    # ───── SYSTEM STATS ─────
     echo -e "${YELLOW}── SYSTEM STATS ──${NC}"
     UPTIME=$(uptime -p 2>/dev/null | sed 's/^up //')
     LOAD=$(awk '{print $1", "$2", "$3}' /proc/loadavg)
@@ -537,7 +538,6 @@ live_panel() {
       printf "  Node:     ${RED}● stopped${NC}\n"
     fi
 
-    # ───── CONNECTIONS ─────
     echo
     echo -e "${YELLOW}── CONNECTIONS ──${NC}"
     TOTAL=$(ss -ntu 2>/dev/null | tail -n +2 | wc -l)
@@ -553,7 +553,6 @@ live_panel() {
     printf "  UDP:          %s\n" "$UDP"
     printf "  Conntrack:    %s / %s\n" "$CT_USED" "$CT_MAX"
 
-    # ───── TOP IP ─────
     echo
     echo -e "${YELLOW}── TOP 10 IP (established) ──${NC}"
     ss -tn state established 2>/dev/null \
@@ -561,7 +560,6 @@ live_panel() {
       | sort | uniq -c | sort -nr | head -10 \
       | awk '{printf "  %5s  %s\n", $1, $2}'
 
-    # ───── NETWORK I/O ─────
     echo
     echo -e "${YELLOW}── NETWORK I/O (1s) ──${NC}"
     IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
