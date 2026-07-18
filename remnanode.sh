@@ -4,18 +4,16 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.12
+# Версия: 2026.7.13
 #
-# Запуск (одной командой, от root):
+# Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
 #
-# Меню лаунчера:
-#   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh)
-#
 # Скрипт сам перезапустится из tempfile (фикс Termius /dev/fd).
+# Установка ноды — пункт меню «1», не через аргумент @ install.
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.12"
+SCRIPT_VERSION="2026.7.13"
 
 # Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
 # перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
@@ -2388,13 +2386,18 @@ main_menu() {
 # Снимаем ERR-trap для интерактивных меню (иначе Ctrl+C / cancel ломают UI)
 entry_name="$(basename "${BASH_SOURCE[0]:-$0}")"
 
-# Стиль DigneZzZ: bash <(curl …) @ install
+# Стиль DigneZzZ: bash <(curl …) @ install  →  меню лаунчера (не установка ноды)
 if [[ "${1:-}" == "@" ]]; then
   shift
 fi
 
 case "${1:-}" in
-  install-remnanode|install)   install_remnanode ;;
+  # @ install / install — поставить CLI и открыть главное меню
+  install|launcher)
+    install_self_cli >/dev/null 2>&1 || true
+    main_menu
+    ;;
+  install-remnanode)           install_remnanode ;;
   install-selfsteal)           install_selfsteal ;;
   install-hysteria2|hysteria2) install_hysteria2 ;;
   fix-hysteria|fix-online)    fix_hysteria2_online ;;
@@ -2426,7 +2429,7 @@ case "${1:-}" in
   manage|node|panel)
     remnanode_menu
     ;;
-  menu|launcher)
+  menu)
     main_menu
     ;;
   *)
