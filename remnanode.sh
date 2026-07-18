@@ -4,10 +4,10 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.1
+# Версия: 2026.7.0
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.1"
+SCRIPT_VERSION="2026.7.0"
 APP="remnanode"
 DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
@@ -205,75 +205,116 @@ show_header() {
   echo
 }
 
+# Короткие статусы для пунктов меню: [установлен] / [нет] / [работает] …
 service_badge() {
   local name="$1"
   case "$name" in
     remnanode)
       if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
-        echo -e "${GREEN}● работает${NC}"
-      elif [[ -d "$DIR" ]]; then
-        echo -e "${YELLOW}● остановлен${NC}"
+        echo -e "${GREEN}[работает]${NC}"
+      elif [[ -f "$COMPOSE" ]] || [[ -d "$DIR" ]]; then
+        echo -e "${YELLOW}[установлен]${NC}"
       else
-        echo -e "${RED}● не установлен${NC}"
+        echo -e "${RED}[не установлен]${NC}"
       fi
       ;;
     selfsteal)
       if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '(caddy|nginx).*selfsteal|selfsteal'; then
-        echo -e "${GREEN}● работает${NC}"
-      elif [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]]; then
-        echo -e "${YELLOW}● остановлен${NC}"
+        echo -e "${GREEN}[работает]${NC}"
+      elif [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]] || command -v selfsteal >/dev/null 2>&1; then
+        echo -e "${YELLOW}[установлен]${NC}"
       else
-        echo -e "${RED}● не установлен${NC}"
+        echo -e "${RED}[не установлен]${NC}"
       fi
       ;;
     warp)
       if command -v warp-cli >/dev/null 2>&1; then
         if warp-cli --accept-tos status 2>/dev/null | grep -qi connected; then
-          echo -e "${GREEN}● подключён${NC}"
+          echo -e "${GREEN}[подключён]${NC}"
         else
-          echo -e "${YELLOW}● отключён${NC}"
+          echo -e "${YELLOW}[установлен]${NC}"
         fi
       else
-        echo -e "${RED}● не установлен${NC}"
+        echo -e "${RED}[не установлен]${NC}"
       fi
       ;;
     hysteria)
-      if [[ -d /opt/hysteria/certs ]] || grep -q 'hysteria' "$COMPOSE" 2>/dev/null; then
-        echo -e "${GREEN}● настроено${NC}"
+      if [[ -d /opt/hysteria/certs ]] \
+        || { [[ -f "$COMPOSE" ]] && grep -qE 'hysteria|/opt/hysteria' "$COMPOSE" 2>/dev/null; }; then
+        echo -e "${GREEN}[настроено]${NC}"
       else
-        echo -e "${RED}● не настроено${NC}"
+        echo -e "${RED}[не настроено]${NC}"
+      fi
+      ;;
+    xrayfix)
+      if [[ -f "$COMPOSE" ]] && grep -q 'custom-xray/xray' "$COMPOSE" 2>/dev/null \
+        && [[ -x "$CUSTOM_XRAY_DIR/xray" ]]; then
+        echo -e "${GREEN}[применён]${NC}"
+      elif [[ -x "$CUSTOM_XRAY_DIR/xray" ]]; then
+        echo -e "${YELLOW}[скачан]${NC}"
+      else
+        echo -e "${RED}[не применён]${NC}"
       fi
       ;;
     mtproto)
-      if systemctl is-active --quiet mtproto-proxy 2>/dev/null || command -v mtbuddy >/dev/null 2>&1; then
-        if systemctl is-active --quiet mtproto-proxy 2>/dev/null; then
-          echo -e "${GREEN}● работает${NC}"
-        else
-          echo -e "${YELLOW}● установлен${NC}"
-        fi
+      if systemctl is-active --quiet mtproto-proxy 2>/dev/null; then
+        echo -e "${GREEN}[работает]${NC}"
+      elif command -v mtbuddy >/dev/null 2>&1 || systemctl list-unit-files mtproto-proxy.service 2>/dev/null | grep -q mtproto; then
+        echo -e "${YELLOW}[установлен]${NC}"
       else
-        echo -e "${RED}● не установлен${NC}"
+        echo -e "${RED}[не установлен]${NC}"
       fi
       ;;
     swap)
       local sw
       sw=$(free -m | awk '/^Swap:/ {print $2}')
       if (( sw > 0 )); then
-        echo -e "${GREEN}● $(free -h | awk '/^Swap:/ {print $2}')${NC}"
+        echo -e "${GREEN}[включён $(free -h | awk '/^Swap:/ {print $2}')]${NC}"
       else
-        echo -e "${RED}● нет${NC}"
+        echo -e "${RED}[нет]${NC}"
       fi
       ;;
     ufw)
       if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-        echo -e "${GREEN}● активен${NC}"
-      elif command -v ufw >/dev/null 2>&1; then
-        echo -e "${YELLOW}● установлен, выключен${NC}"
+        echo -e "${GREEN}[активен]${NC}"
+      elif command -v ufw >/dev/null 2>&1 && [[ -f /etc/ufw/ufw.conf ]]; then
+        echo -e "${YELLOW}[выключен]${NC}"
       else
-        echo -e "${RED}● не настроен${NC}"
+        echo -e "${RED}[не настроен]${NC}"
+      fi
+      ;;
+    tune)
+      local cc
+      cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+      if [[ -f /etc/sysctl.d/99-remnanode.conf ]] && [[ "$cc" == "bbr" ]]; then
+        echo -e "${GREEN}[применён]${NC}"
+      elif [[ -f /etc/sysctl.d/99-remnanode.conf ]]; then
+        echo -e "${YELLOW}[частично]${NC}"
+      else
+        echo -e "${RED}[нет]${NC}"
+      fi
+      ;;
+    node_cli)
+      if [[ -x "$CLI_PATH" ]] || command -v remnanode >/dev/null 2>&1; then
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+          echo -e "${GREEN}[нода online]${NC}"
+        elif [[ -f "$COMPOSE" ]]; then
+          echo -e "${YELLOW}[доступно]${NC}"
+        else
+          echo -e "${YELLOW}[CLI есть]${NC}"
+        fi
+      else
+        echo -e "${RED}[нет CLI]${NC}"
       fi
       ;;
   esac
+}
+
+# Строка меню: номер, название, описание, статус справа
+menu_item() {
+  local num="$1" title="$2" desc="$3" badge="$4"
+  printf "    ${WHITE}%-3s${NC} %-18s ${GRAY}%-28s${NC} %s\n" \
+    "${num})" "$title" "— ${desc}" "$(service_badge "$badge")"
 }
 
 ###############################################################################
@@ -1411,22 +1452,12 @@ run_system_bench() {
   echo -e "    Disk /: $(df -h / | awk 'NR==2 {printf "%s used / %s (%s)", $3, $2, $5}')"
   echo
 
-  info "CPU bench (1 поток, 3 сек sha256)…"
-  local t0 t1 ops
+  info "CPU bench (256 МБ через sha256sum)…"
+  local t0 t1
   t0=$(date +%s.%N)
-  ops=$(timeout 3 bash -c 'n=0; while :; do echo -n "x" | sha256sum >/dev/null; n=$((n+1)); echo $n; done' 2>/dev/null | tail -1)
+  dd if=/dev/zero bs=1M count=256 2>/dev/null | sha256sum >/dev/null
   t1=$(date +%s.%N)
-  if [[ -n "$ops" ]]; then
-    local rate
-    rate=$(awk -v n="$ops" -v a="$t0" -v b="$t1" 'BEGIN{d=b-a; if(d<=0)d=3; printf "%.0f", n/d}')
-    echo -e "    Хешей/сек: ${CYAN}${rate}${NC}"
-  else
-    # fallback: dd + sha256
-    t0=$(date +%s.%N)
-    dd if=/dev/zero bs=1M count=256 2>/dev/null | sha256sum >/dev/null
-    t1=$(date +%s.%N)
-    awk -v a="$t0" -v b="$t1" 'BEGIN{printf "    256 МБ sha256: %.2f сек (≈ %.0f МБ/с)\n", b-a, 256/(b-a)}'
-  fi
+  awk -v a="$t0" -v b="$t1" 'BEGIN{printf "    256 МБ sha256: %.2f сек (≈ %.0f МБ/с)\n", b-a, 256/(b-a)}'
 
   echo
   info "Диск (запись 256 МБ)…"
@@ -1833,35 +1864,26 @@ main_menu() {
     PUBLIC_IP=$(get_public_ip)
     show_header
 
-    echo -e "  ${WHITE}Статус:${NC}"
-    echo -e "    Remnanode   $(service_badge remnanode)"
-    echo -e "    Selfsteal   $(service_badge selfsteal)"
-    echo -e "    Hysteria2   $(service_badge hysteria)"
-    echo -e "    WARP        $(service_badge warp)"
-    echo -e "    MTProto     $(service_badge mtproto)"
-    echo -e "    SWAP        $(service_badge swap)"
-    echo -e "    UFW         $(service_badge ufw)"
-    echo
     hline 56
     echo
     echo -e "  ${WHITE}${BOLD}Установка:${NC}"
-    echo -e "    ${WHITE}1)${NC} Remnanode          ${GRAY}— VPN-нода Remnawave${NC}"
-    echo -e "    ${WHITE}2)${NC} Selfsteal          ${GRAY}— маскировка Reality (DigneZzZ)${NC}"
-    echo -e "    ${WHITE}3)${NC} Hysteria2          ${GRAY}— автонастройка (h2-script)${NC}"
-    echo -e "    ${WHITE}4)${NC} Фикс онлайна H2    ${GRAY}— custom Xray (@markrouting)${NC}"
-    echo -e "    ${WHITE}5)${NC} WARP               ${GRAY}— Cloudflare SOCKS5${NC}"
-    echo -e "    ${WHITE}6)${NC} Telegram MTProto   ${GRAY}— mtproto.zig${NC}"
+    menu_item "1"  "Remnanode"        "VPN-нода Remnawave"           remnanode
+    menu_item "2"  "Selfsteal"        "маскировка Reality"            selfsteal
+    menu_item "3"  "Hysteria2"        "автонастройка certs"           hysteria
+    menu_item "4"  "Фикс онлайна H2"  "custom Xray"                   xrayfix
+    menu_item "5"  "WARP"             "Cloudflare SOCKS5"             warp
+    menu_item "6"  "Telegram MTProto" "mtproto.zig"                   mtproto
     echo
     echo -e "  ${WHITE}${BOLD}Система:${NC}"
-    echo -e "    ${WHITE}7)${NC} SWAP               ${GRAY}— файл подкачки${NC}"
-    echo -e "    ${WHITE}8)${NC} UFW и порты        ${GRAY}— защита по желанию${NC}"
-    echo -e "    ${WHITE}9)${NC} Тюнинг скорости    ${GRAY}— BBR / буферы / RPS${NC}"
+    menu_item "7"  "SWAP"             "файл подкачки"                 swap
+    menu_item "8"  "UFW и порты"      "защита по желанию"             ufw
+    menu_item "9"  "Тюнинг скорости"  "BBR / буферы / RPS"            tune
     echo
     echo -e "  ${WHITE}${BOLD}Сервис:${NC}"
-    echo -e "    ${WHITE}10)${NC} Управление нодой  ${GRAY}— меню remnanode${NC}"
-    echo -e "    ${WHITE}11)${NC} Тесты             ${GRAY}— multitest + speedtest${NC}"
+    menu_item "10" "Управление нодой" "меню remnanode"                node_cli
+    echo -e "    ${WHITE}11)${NC} Тесты              ${GRAY}— speedtest / ping / DNS / бенч${NC}"
     echo
-    echo -e "    ${GRAY}0)${NC} Выход"
+    echo -e "    ${GRAY}0)${NC}  Выход"
     echo
     read -rp "  → " choice
 
