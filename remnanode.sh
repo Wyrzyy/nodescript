@@ -4,10 +4,10 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.0
+# Версия: 2026.7.1
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.0"
+SCRIPT_VERSION="2026.7.1"
 APP="remnanode"
 DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
@@ -23,7 +23,6 @@ CLI_PATH="/usr/local/bin/remnanode"
 # Внешние скрипты
 SELFSTEAL_RAW="https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/selfsteal.sh"
 H2_RAW="https://raw.githubusercontent.com/Origamidnd/h2-script/master/setup.sh"
-MULTITEST_RAW="https://raw.githubusercontent.com/saveksme/multitest/master/multitest.sh"
 MTPROTO_BOOTSTRAP_RAW="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh"
 XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/download"
 
@@ -1224,8 +1223,236 @@ EOF
 }
 
 ###############################################################################
-# ТЕСТЫ — multitest + speedtest
+# ТЕСТЫ — свои, без внешних bash-скриптов
 ###############################################################################
+
+# Установка Ookla CLI напрямую (без packagecloud)
+ensure_ookla_speedtest() {
+  if command -v speedtest >/dev/null 2>&1; then
+    return 0
+  fi
+
+  info "Устанавливаем Ookla Speedtest CLI…"
+  local tmpdir arch_tag tgz url
+  tmpdir=$(mktemp -d)
+  case "$(uname -m)" in
+    x86_64|amd64)  arch_tag="linux-x86_64" ;;
+    aarch64|arm64) arch_tag="linux-aarch64" ;;
+    *) warn "Архитектура $(uname -m) не поддерживается Ookla CLI"; rm -rf "$tmpdir"; return 1 ;;
+  esac
+
+  # Прямой бинарник с CDN Ookla (не зависит от packagecloud)
+  url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-${arch_tag}.tgz"
+  if ! curl -fsSL --connect-timeout 10 --max-time 90 -o "$tmpdir/speedtest.tgz" "$url"; then
+    warn "Не удалось скачать Ookla с CDN"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  tar -xzf "$tmpdir/speedtest.tgz" -C "$tmpdir" 2>/dev/null || {
+    warn "Ошибка распаковки Ookla"
+    rm -rf "$tmpdir"
+    return 1
+  }
+
+  if [[ -f "$tmpdir/speedtest" ]]; then
+    install -m 0755 "$tmpdir/speedtest" /usr/local/bin/speedtest
+    ok "Ookla Speedtest установлен: /usr/local/bin/speedtest"
+    /usr/local/bin/speedtest --accept-license --accept-gdpr >/dev/null 2>&1 || true
+    rm -rf "$tmpdir"
+    return 0
+  fi
+
+  warn "Бинарник speedtest не найден в архиве"
+  rm -rf "$tmpdir"
+  return 1
+}
+
+# Свой download-speed через curl (запасной вариант без Ookla)
+run_curl_speed_test() {
+  local label="$1" url="$2" bytes="${3:-0}"
+  local out t_total speed_bps speed_mbps size
+  echo -e "  ${WHITE}${label}${NC}"
+  echo -e "  ${GRAY}${url}${NC}"
+
+  out=$(curl -L -o /dev/null -w '%{time_total} %{size_download} %{speed_download}' \
+    --connect-timeout 10 --max-time 60 "$url" 2>/dev/null) || {
+    warn "  Не удалось: $label"
+    echo
+    return 1
+  }
+
+  t_total=$(echo "$out" | awk '{print $1}')
+  size=$(echo "$out" | awk '{print $2}')
+  speed_bps=$(echo "$out" | awk '{print $3}')
+  speed_mbps=$(awk -v s="$speed_bps" 'BEGIN{printf "%.2f", s*8/1000000}')
+  local size_mb
+  size_mb=$(awk -v s="$size" 'BEGIN{printf "%.2f", s/1048576}')
+
+  printf "     Размер:  %s МБ\n" "$size_mb"
+  printf "     Время:   %.2f сек\n" "$t_total"
+  printf "     Скорость:${CYAN} %s Мбит/с${NC}\n" "$speed_mbps"
+  echo
+}
+
+run_latency_test() {
+  clear
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║              ЗАДЕРЖКА / PING                       ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+
+  local hosts=("1.1.1.1" "8.8.8.8" "9.9.9.9" "77.88.8.8" "google.com" "cloudflare.com")
+  local h
+  for h in "${hosts[@]}"; do
+    echo -e "  ${WHITE}$h${NC}"
+    if ping -c 5 -W 2 "$h" 2>/dev/null | tail -2 | sed 's/^/     /'; then
+      :
+    else
+      echo -e "     ${RED}нет ответа${NC}"
+    fi
+    echo
+  done
+}
+
+run_dns_test() {
+  clear
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║                   DNS ТЕСТ                         ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+
+  local resolvers=("1.1.1.1" "8.8.8.8" "9.9.9.9" "77.88.8.8")
+  local domains=("google.com" "cloudflare.com" "github.com" "youtube.com")
+  local r d t0 t1 ms
+
+  for r in "${resolvers[@]}"; do
+    echo -e "  ${WHITE}Резолвер ${r}${NC}"
+    for d in "${domains[@]}"; do
+      t0=$(date +%s%N)
+      if getent hosts "$d" >/dev/null 2>&1 || dig @"$r" +short +time=2 +tries=1 "$d" >/dev/null 2>&1; then
+        t1=$(date +%s%N)
+        ms=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", (b-a)/1000000}')
+        # Более точный замер через dig, если есть
+        if command -v dig >/dev/null 2>&1; then
+          local dig_ms
+          dig_ms=$(dig @"$r" +stats +time=2 +tries=1 "$d" 2>/dev/null | awk '/Query time:/ {print $4; exit}')
+          if [[ -n "$dig_ms" ]]; then
+            printf "     %-22s ${GREEN}%s ms${NC}\n" "$d" "$dig_ms"
+          else
+            printf "     %-22s ${YELLOW}%s ms${NC}\n" "$d" "$ms"
+          fi
+        else
+          printf "     %-22s ${GREEN}ok${NC} (~%s ms)\n" "$d" "$ms"
+        fi
+      else
+        printf "     %-22s ${RED}fail${NC}\n" "$d"
+      fi
+    done
+    echo
+  done
+}
+
+run_ip_info_test() {
+  clear
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║                 ИНФО ОБ IP                         ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+
+  local ip4 ip6
+  ip4=$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || curl -fsS4 --max-time 5 https://ifconfig.me 2>/dev/null || echo "н/д")
+  ip6=$(curl -fsS6 --max-time 5 https://api64.ipify.org 2>/dev/null || echo "н/д")
+
+  echo -e "  ${WHITE}IPv4:${NC}  ${CYAN}${ip4}${NC}"
+  echo -e "  ${WHITE}IPv6:${NC}  ${CYAN}${ip6}${NC}"
+  echo
+
+  if [[ "$ip4" != "н/д" ]]; then
+    info "Гео / ASN (ipinfo.io / ifconfig.co)…"
+    local geo
+    geo=$(curl -fsS --max-time 8 "https://ipinfo.io/${ip4}/json" 2>/dev/null \
+      || curl -fsS --max-time 8 "https://ifconfig.co/json" 2>/dev/null || true)
+    if [[ -n "$geo" ]] && command -v jq >/dev/null 2>&1; then
+      echo "$geo" | jq -r '
+        "  Страна:   \(.country // .country_iso // "?")",
+        "  Город:    \(.city // "?")",
+        "  Регион:   \(.region // .region_name // "?")",
+        "  Org/ASN:  \(.org // .asn // "?")",
+        "  Hostname: \(.hostname // "?")"
+      ' 2>/dev/null | sed 's/^/  /' || echo "$geo" | sed 's/^/  /'
+    elif [[ -n "$geo" ]]; then
+      echo "$geo" | sed 's/^/  /'
+    else
+      warn "Гео-данные недоступны"
+    fi
+  fi
+  echo
+}
+
+run_system_bench() {
+  clear
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║              СИСТЕМА / CPU BENCH                   ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+
+  echo -e "  ${WHITE}Система:${NC}"
+  echo -e "    OS:     $PRETTY_NAME"
+  echo -e "    Kernel: $(uname -r)"
+  echo -e "    Arch:   $(uname -m)"
+  echo -e "    CPU:    $(nproc) ядер — $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo '?')"
+  echo -e "    RAM:    $(free -h | awk '/^Mem:/ {printf "%s / %s", $3, $2}')"
+  echo -e "    Swap:   $(free -h | awk '/^Swap:/ {print $2}')"
+  echo -e "    Disk /: $(df -h / | awk 'NR==2 {printf "%s used / %s (%s)", $3, $2, $5}')"
+  echo
+
+  info "CPU bench (1 поток, 3 сек sha256)…"
+  local t0 t1 ops
+  t0=$(date +%s.%N)
+  ops=$(timeout 3 bash -c 'n=0; while :; do echo -n "x" | sha256sum >/dev/null; n=$((n+1)); echo $n; done' 2>/dev/null | tail -1)
+  t1=$(date +%s.%N)
+  if [[ -n "$ops" ]]; then
+    local rate
+    rate=$(awk -v n="$ops" -v a="$t0" -v b="$t1" 'BEGIN{d=b-a; if(d<=0)d=3; printf "%.0f", n/d}')
+    echo -e "    Хешей/сек: ${CYAN}${rate}${NC}"
+  else
+    # fallback: dd + sha256
+    t0=$(date +%s.%N)
+    dd if=/dev/zero bs=1M count=256 2>/dev/null | sha256sum >/dev/null
+    t1=$(date +%s.%N)
+    awk -v a="$t0" -v b="$t1" 'BEGIN{printf "    256 МБ sha256: %.2f сек (≈ %.0f МБ/с)\n", b-a, 256/(b-a)}'
+  fi
+
+  echo
+  info "Диск (запись 256 МБ)…"
+  local wr
+  wr=$(dd if=/dev/zero of=/tmp/.rn_disk_bench bs=1M count=256 conv=fdatasync 2>&1 | awk -F', ' '/copied|записано|copied/ {print $NF}' | tail -1)
+  rm -f /tmp/.rn_disk_bench
+  echo -e "    Запись: ${CYAN}${wr:-н/д}${NC}"
+  echo
+}
+
+run_ports_check() {
+  clear
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║            СЛУШАЮЩИЕ ПОРТЫ / СЕРВИСЫ               ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+
+  echo -e "  ${WHITE}TCP/UDP listeners:${NC}"
+  ss -tulnp 2>/dev/null | head -50 | sed 's/^/    /' || netstat -tulnp 2>/dev/null | head -50 | sed 's/^/    /'
+  echo
+  echo -e "  ${WHITE}Docker:${NC}"
+  docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null | sed 's/^/    /' || echo "    docker н/д"
+  echo
+}
+
 run_speedtest_menu() {
   clear
   echo -e "${CYAN}${BOLD}"
@@ -1234,69 +1461,68 @@ run_speedtest_menu() {
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
-  if ! command -v speedtest >/dev/null 2>&1 && ! command -v speedtest-cli >/dev/null 2>&1; then
-    echo -e "  ${WHITE}1)${NC} Установить Ookla speedtest ${GRAY}(точнее)${NC}"
-    echo -e "  ${WHITE}2)${NC} Установить speedtest-cli"
-    echo -e "  ${GRAY}0)${NC} Назад"
-    read -rp "  → " ch
-    case "$ch" in
-      1)
-        curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash >/dev/null 2>&1 || true
-        apt-get install -y -qq speedtest 2>/dev/null || apt-get install -y speedtest || { warn "Ошибка установки"; return; }
-        speedtest --accept-license --accept-gdpr >/dev/null 2>&1 || true
-        ;;
-      2) apt-get install -y -qq speedtest-cli || { warn "Ошибка"; return; } ;;
-      *) return ;;
-    esac
-  fi
-
-  echo
-  echo -e "  ${WHITE}1)${NC} Полный тест скорости"
-  echo -e "  ${WHITE}2)${NC} Только ping / jitter"
-  echo -e "  ${WHITE}3)${NC} Тест + замер времени выполнения"
+  echo -e "  ${WHITE}1)${NC} Ookla Speedtest          ${GRAY}(полный тест)${NC}"
+  echo -e "  ${WHITE}2)${NC} Ookla — только ping/jitter"
+  echo -e "  ${WHITE}3)${NC} Свой тест скачивания     ${GRAY}(curl, без Ookla)${NC}"
+  echo -e "  ${WHITE}4)${NC} Комплекс: Ookla + ping + замер времени"
   echo -e "  ${GRAY}0)${NC} Назад"
+  echo
   read -rp "  → " ch
 
   local t0 t1
   case "$ch" in
     1)
+      ensure_ookla_speedtest || { warn "Ookla недоступен — попробуйте пункт 3"; return; }
       t0=$(date +%s.%N)
-      if command -v speedtest >/dev/null 2>&1; then
-        speedtest --accept-license --accept-gdpr
-      else
-        speedtest-cli
-      fi
+      echo -e "  ${GRAY}Старт: $(date '+%F %T')${NC}"
+      speedtest --accept-license --accept-gdpr || warn "Ookla вернул ошибку"
       t1=$(date +%s.%N)
       echo
-      awk -v a="$t0" -v b="$t1" 'BEGIN{printf "  ⏱ Время теста: %.1f сек\n", b-a}'
+      awk -v a="$t0" -v b="$t1" 'BEGIN{printf "  ⏱ Длительность: %.1f сек\n", b-a}'
       ;;
     2)
-      if command -v speedtest >/dev/null 2>&1; then
-        speedtest --accept-license --accept-gdpr -f json 2>/dev/null | jq -r '
+      ensure_ookla_speedtest || { warn "Ookla недоступен"; return; }
+      if speedtest --accept-license --accept-gdpr -f json 2>/dev/null | jq -r '
           "  Ping:    \(.ping.latency) ms",
           "  Jitter:  \(.ping.jitter) ms",
-          "  Server:  \(.server.name) (\(.server.location))"
-        ' 2>/dev/null || speedtest --accept-license --accept-gdpr
+          "  Server:  \(.server.name) (\(.server.location))",
+          "  ISP:     \(.isp // "?")"
+        ' 2>/dev/null; then
+        :
       else
-        speedtest-cli --simple
+        speedtest --accept-license --accept-gdpr --ping || true
       fi
       ;;
     3)
+      echo
+      info "Замер download через несколько CDN…"
+      echo
+      t0=$(date +%s.%N)
+      run_curl_speed_test "Cloudflare 10 МБ" "https://speed.cloudflare.com/__down?bytes=10000000"
+      run_curl_speed_test "Cloudflare 25 МБ" "https://speed.cloudflare.com/__down?bytes=25000000"
+      run_curl_speed_test "Hetzner 100 МБ"   "https://speed.hetzner.de/100MB.bin"
+      run_curl_speed_test "ThinkBroadband 10 МБ" "http://ipv4.download.thinkbroadband.com/10MB.zip"
+      t1=$(date +%s.%N)
+      awk -v a="$t0" -v b="$t1" 'BEGIN{printf "  ⏱ Общее время: %.1f сек\n", b-a}'
+      echo
+      info "RTT:"
+      ping -c 4 -W 2 1.1.1.1 2>/dev/null | tail -2 | sed 's/^/  /' || true
+      ;;
+    4)
+      ensure_ookla_speedtest || warn "Ookla пропущен"
       t0=$(date +%s.%N)
       echo -e "  ${GRAY}Старт: $(date '+%F %T')${NC}"
       if command -v speedtest >/dev/null 2>&1; then
-        speedtest --accept-license --accept-gdpr
-      else
-        speedtest-cli
+        speedtest --accept-license --accept-gdpr || true
       fi
+      echo
+      run_curl_speed_test "Cloudflare 25 МБ" "https://speed.cloudflare.com/__down?bytes=25000000"
+      echo -e "  ${WHITE}Ping:${NC}"
+      ping -c 5 -W 2 1.1.1.1 2>/dev/null | tail -2 | sed 's/^/  /'
+      ping -c 5 -W 2 8.8.8.8 2>/dev/null | tail -2 | sed 's/^/  /'
       t1=$(date +%s.%N)
       echo -e "  ${GRAY}Финиш: $(date '+%F %T')${NC}"
       awk -v a="$t0" -v b="$t1" 'BEGIN{printf "  ⏱ Длительность: %.2f сек\n", b-a}'
-      # Доп. замеры задержки
-      echo
-      info "Доп. замер RTT до 1.1.1.1 и 8.8.8.8"
-      ping -c 5 -W 2 1.1.1.1 2>/dev/null | tail -2 | sed 's/^/  /'
-      ping -c 5 -W 2 8.8.8.8 2>/dev/null | tail -2 | sed 's/^/  /'
       ;;
     *) return ;;
   esac
@@ -1310,104 +1536,33 @@ tests_menu() {
     echo "  ║                      ТЕСТЫ                         ║"
     echo "  ╚════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    echo -e "  ${WHITE}Диагностика (multitest):${NC}"
-    echo -e "    ${WHITE} 1)${NC} IP Region"
-    echo -e "    ${WHITE} 2)${NC} Censorcheck — геоблок"
-    echo -e "    ${WHITE} 3)${NC} Censorcheck — DPI (РФ)"
-    echo -e "    ${WHITE} 4)${NC} iPerf3 — российские серверы"
-    echo -e "    ${WHITE} 5)${NC} iPerf3 — bench.tlab.pw"
-    echo -e "    ${WHITE} 6)${NC} YABS — бенчмарк"
-    echo -e "    ${WHITE} 7)${NC} IP Check Place"
-    echo -e "    ${WHITE} 8)${NC} bench.sh"
-    echo -e "    ${WHITE} 9)${NC} IPQuality"
-    echo -e "    ${WHITE}10)${NC} sysbench CPU"
-    echo -e "    ${YELLOW}11)${NC} ${BOLD}Мультитест — все тесты подряд${NC}"
+    echo -e "  ${WHITE}1)${NC} Speedtest              ${GRAY}— Ookla / свой curl-тест${NC}"
+    echo -e "  ${WHITE}2)${NC} Задержка (ping)"
+    echo -e "  ${WHITE}3)${NC} DNS"
+    echo -e "  ${WHITE}4)${NC} Информация об IP"
+    echo -e "  ${WHITE}5)${NC} Система / CPU / диск"
+    echo -e "  ${WHITE}6)${NC} Порты и контейнеры"
+    echo -e "  ${WHITE}7)${NC} Полный прогон          ${GRAY}— 1→6 подряд${NC}"
     echo
-    echo -e "  ${WHITE}Скорость:${NC}"
-    echo -e "    ${WHITE}12)${NC} Speedtest (с замерами)"
-    echo
-    echo -e "  ${WHITE}Прочее:${NC}"
-    echo -e "    ${WHITE}13)${NC} Запустить оригинальный multitest.sh"
-    echo -e "    ${GRAY} 0)${NC} Назад"
+    echo -e "  ${GRAY}0)${NC} Назад"
     echo
     read -rp "  → " choice
 
     case "$choice" in
-      1)
-        apt-get install -y -qq wget >/dev/null 2>&1 || true
-        bash <(wget -qO- https://ipregion.vrnt.xyz) || warn "Тест завершился с ошибкой"
-        pause
-        ;;
-      2)
-        apt-get install -y -qq wget >/dev/null 2>&1 || true
-        local cc
-        cc=$(mktemp)
-        if gh_download "https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh" "$cc"; then
-          bash "$cc" --mode geoblock || true
-        else
-          bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock || true
-        fi
-        rm -f "$cc"
-        pause
-        ;;
-      3)
-        apt-get install -y -qq wget >/dev/null 2>&1 || true
-        local cc
-        cc=$(mktemp)
-        if gh_download "https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh" "$cc"; then
-          bash "$cc" --mode dpi || true
-        else
-          bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true
-        fi
-        rm -f "$cc"
-        pause
-        ;;
-      4)
-        apt-get install -y -qq wget iperf3 >/dev/null 2>&1 || true
-        local ipf
-        ipf=$(mktemp)
-        if gh_download "https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/speedtest.sh" "$ipf"; then
-          bash "$ipf" || true
-        else
-          bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) || true
-        fi
-        rm -f "$ipf"
-        pause
-        ;;
-      5)
-        apt-get install -y -qq wget iperf3 >/dev/null 2>&1 || true
-        wget -qO- bench.tlab.pw | bash || true
-        pause
-        ;;
-      6)
-        curl -sL yabs.sh | bash -s -- -4 || true
-        pause
-        ;;
+      1) run_speedtest_menu; pause ;;
+      2) run_latency_test; pause ;;
+      3) run_dns_test; pause ;;
+      4) run_ip_info_test; pause ;;
+      5) run_system_bench; pause ;;
+      6) run_ports_check; pause ;;
       7)
-        bash <(curl -Ls IP.Check.Place) -l en || true
-        pause
-        ;;
-      8)
-        wget -qO- bench.sh | bash || true
-        pause
-        ;;
-      9)
-        bash <(curl -Ls https://Check.Place) -EI || true
-        pause
-        ;;
-      10)
-        apt-get install -y -qq sysbench >/dev/null 2>&1 || true
-        sysbench cpu run --threads=1 || true
-        pause
-        ;;
-      11)
-        info "Запуск полного multitest…"
-        gh_pipe_bash "$MULTITEST_RAW" || bash <(curl -Ls "$MULTITEST_RAW") || warn "multitest завершился с ошибкой"
-        pause
-        ;;
-      12) run_speedtest_menu; pause ;;
-      13)
-        gh_pipe_bash "$MULTITEST_RAW" || true
+        run_ip_info_test
+        run_latency_test
+        run_dns_test
+        run_speedtest_menu
+        run_system_bench
+        run_ports_check
+        ok "Полный прогон завершён"
         pause
         ;;
       0) return 0 ;;
