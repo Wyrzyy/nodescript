@@ -429,7 +429,7 @@ launcher_version() {
   if [[ -z "$v" || "$v" == "unknown" ]]; then
     local src="${BASH_SOURCE[0]:-$0}"
     if [[ -f "$src" ]]; then
-      v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"'[:space:]' || true)
+      v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
   [[ -n "$v" ]] || v="2026.7.17"
