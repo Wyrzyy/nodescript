@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.17
+# Версия: 2026.7.18
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.7.17"
+_REMNANODE_VER="2026.7.18"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -58,8 +58,8 @@ export LANG="${LANG:-C.UTF-8}"
 export LC_ALL="${LC_ALL:-C.UTF-8}"
 
 # Цвета
-GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; BOLD='\033[1m'
+GREEN='\033[1;32m'; RED='\033[1;31m'; BLUE='\033[1;34m'; YELLOW='\033[1;33m'
+CYAN='\033[1;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; BOLD='\033[1m'
 DIM='\033[2m'; NC='\033[0m'
 
 # Всегда общаемся с реальным терминалом (/dev/tty).
@@ -84,12 +84,12 @@ _msg() {
   local color="$1" icon="$2" text="$3"
   _tty_printf '%b%s %s%b\n' "$color" "$icon" "$text" "$NC"
 }
-ok()   { _msg "$GREEN" "+" "$1"; }
-info() { _msg "$CYAN" ">" "$1"; }
-warn() { _msg "$YELLOW" "!" "$1"; }
+ok()   { _msg "$GREEN" "✅" "$1"; }
+info() { _msg "$CYAN" "ℹ️ " "$1"; }
+warn() { _msg "$YELLOW" "⚠️ " "$1"; }
 err()  {
-  _msg "$RED" "x" "$1"
-  _msg "$GRAY" "#" "последние строки лога → ${LOG}"
+  _msg "$RED" "❌" "$1"
+  _msg "$GRAY" "📋" "последние строки лога → ${LOG}"
   tail -n 30 "$LOG" 2>/dev/null >"$_TTY" || tail -n 30 "$LOG" 2>/dev/null || true
   exit 1
 }
@@ -375,7 +375,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.7.17}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.7.18}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -432,7 +432,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.7.17"
+  [[ -n "$v" ]] || v="2026.7.18"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -443,24 +443,27 @@ launcher_version() {
 show_header() {
   ui_clear
   # Жёстко фиксируем версию на каждом показе шапки (защита от пустого env)
-  _REMNANODE_VER="2026.7.17"
+  _REMNANODE_VER="2026.7.18"
   RN_VERSION="$_REMNANODE_VER"
   SCRIPT_VERSION="$_REMNANODE_VER"
   local ver="$_REMNANODE_VER"
 
-  # Простая шапка БЕЗ emoji внутри линий — иначе Termius съезжает и «теряет» текст
+  # Рамка ASCII + цвет; emoji только вне линий фиксированной ширины
   _tty_printf '%b' "${CYAN}${BOLD}"
   _tty_echo "  =================================================="
-  _tty_echo "   REMNANODE LAUNCHER"
+  _tty_echo "   🚀  REMNANODE LAUNCHER"
+  _tty_printf '%b' "${NC}${CYAN}"
   _tty_echo "   версия ${ver}"
-  _tty_echo "   Нода | Selfsteal | H2 | Прокси | Тесты"
+  _tty_printf '%b' "${GRAY}"
+  _tty_echo "   🛰️ Нода · 🎭 Selfsteal · ⚡ H2 · 🔒 Прокси · 🧪 Тесты"
+  _tty_printf '%b' "${CYAN}${BOLD}"
   _tty_echo "  =================================================="
   _tty_printf '%b' "${NC}"
   _tty_echo ""
-  _tty_printf '  %b%-11s%b %s\n' "$WHITE" "OS:" "$NC" "${PRETTY_NAME:-$ID}"
-  _tty_printf '  %b%-11s%b %s\n' "$WHITE" "CPU/RAM:" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
-  _tty_printf '  %b%-11s%b %b%s%b\n' "$WHITE" "Public IP:" "$NC" "$CYAN" "${PUBLIC_IP:-n/a}" "$NC"
-  _tty_printf '  %b%-11s%b %s\n' "$WHITE" "Local IP:" "$NC" "${LOCAL_IP:-n/a}"
+  _tty_printf '  %b💻 OS:%b        %s\n' "$WHITE" "$NC" "${PRETTY_NAME:-$ID}"
+  _tty_printf '  %b🧠 CPU/RAM:%b   %s\n' "$WHITE" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
+  _tty_printf '  %b🌐 Public IP:%b %b%s%b\n' "$WHITE" "$NC" "$CYAN" "${PUBLIC_IP:-n/a}" "$NC"
+  _tty_printf '  %b🏠 Local IP:%b  %s\n' "$WHITE" "$NC" "${LOCAL_IP:-n/a}"
   _tty_echo ""
 }
 
@@ -597,17 +600,17 @@ service_badge_color() {
   esac
 }
 
-# Колонки без emoji-width:  NN)  TITLE........  DESC................  [STATUS]
-# icon оставлен для совместимости вызовов, в строку не печатаем (ломает Termius)
+# Колонки:  ICON NN)  TITLE........  DESC................  [STATUS]
+# Emoji только в начале строки; pad_right — только для ASCII/кириллицы
 menu_item() {
-  local _icon="$1" num="$2" title="$3" desc="$4" badge="${5:-}"
+  local icon="$1" num="$2" title="$3" desc="$4" badge="${5:-}"
   local num_s title_s desc_s
 
   num_s=$(pad_right "${num})" 4)
-  title_s=$(pad_right "$title" 14)
-  desc_s=$(pad_right "$desc" 22)
+  title_s=$(pad_right "$title" 12)
+  desc_s=$(pad_right "$desc" 20)
 
-  _tty_printf '  %b%s%b %s  %b%s%b' "$WHITE" "$num_s" "$NC" "$title_s" "$GRAY" "$desc_s" "$NC"
+  _tty_printf '  %s %b%s%b %b%s%b %b%s%b'     "$icon" "$WHITE" "$num_s" "$NC" "$WHITE" "$title_s" "$NC" "$GRAY" "$desc_s" "$NC"
   if [[ -n "$badge" ]]; then
     _tty_printf '  '
     service_badge_color "$badge"
@@ -618,7 +621,7 @@ menu_item() {
 section() {
   _tty_echo ""
   _tty_printf '  %b%s%b\n' "${WHITE}${BOLD}" "$1" "$NC"
-  hline 52
+  hline 56
 }
 
 ###############################################################################
@@ -2214,44 +2217,46 @@ system_menu() {
 ###############################################################################
 node_status_screen() {
   ui_clear
-  _tty_printf '%b  RemnaNode — управление%b  %bv%s%b\n' "${WHITE}${BOLD}" "$NC" "$GRAY" "$(launcher_version)" "$NC"
-  hline 52
+  local ver
+  ver=$(launcher_version)
+  _tty_printf '%b  📡 RemnaNode — управление%b  %bv%s%b\n' "${CYAN}${BOLD}" "$NC" "$GRAY" "$ver" "$NC"
+  hline 56
   _tty_echo ""
 
   if is_remnanode_up; then
     local node_port node_ver xray_ver
     node_port=$(grep -E '^NODE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)
     node_port=${node_port:-3000}
-    _tty_printf '  %bСтатус ноды: РАБОТАЕТ%b\n' "$GREEN" "$NC"
+    _tty_printf '  %b✅ Статус ноды: РАБОТАЕТ%b\n' "$GREEN" "$NC"
     _tty_echo ""
-    _tty_echo "  Подключение:"
+    _tty_printf '  %b🌐 Подключение:%b\n' "$WHITE" "$NC"
     _tty_printf '     %-10s %b%s%b\n' "IP:" "$CYAN" "$PUBLIC_IP" "$NC"
     _tty_printf '     %-10s %b%s%b\n' "Порт:" "$CYAN" "$node_port" "$NC"
     _tty_printf '     %-10s %b%s:%s%b\n' "URL:" "$CYAN" "$PUBLIC_IP" "$node_port" "$NC"
     _tty_echo ""
-    _tty_echo "  Компоненты:"
+    _tty_printf '  %b🧩 Компоненты:%b\n' "$WHITE" "$NC"
     node_ver=$(docker inspect --format '{{.Config.Image}}' remnanode 2>/dev/null || echo "?")
-    _tty_printf '     %-10s %s\n' "Образ:" "$node_ver"
+    _tty_printf '     %-10s %b%s%b\n' "Образ:" "$CYAN" "$node_ver" "$NC"
     xray_ver=$(docker exec remnanode xray version 2>/dev/null | head -1 || echo "н/д")
     _tty_printf '     %-10s %s\n' "Xray:" "$xray_ver"
     if grep -q 'custom-xray/xray' "$COMPOSE" 2>/dev/null; then
-      _tty_printf '     %bcustom Xray смонтирован (фикс онлайна)%b\n' "$YELLOW" "$NC"
+      _tty_printf '     %b⚡ custom Xray смонтирован (фикс онлайна)%b\n' "$YELLOW" "$NC"
     fi
     _tty_echo ""
-    _tty_echo "  Ресурсы:"
+    _tty_printf '  %b💾 Ресурсы:%b\n' "$WHITE" "$NC"
     local cstats
     cstats=$(docker stats --no-stream --format '{{.CPUPerc}} | {{.MemUsage}}' remnanode 2>/dev/null || echo "n/a")
     _tty_printf '     %-10s %s\n' "Контейнер:" "$cstats"
     _tty_printf '     %-10s %s\n' "RAM хоста:" "$(free -h | awk '/^Mem:/ {printf "%s / %s", $3, $2}')"
   elif is_remnanode_installed; then
-    _tty_printf '  %bСтатус ноды: ОСТАНОВЛЕНА%b\n' "$RED" "$NC"
-    _tty_echo "  Используйте пункт 2 для запуска"
+    _tty_printf '  %b❌ Статус ноды: ОСТАНОВЛЕНА%b\n' "$RED" "$NC"
+    _tty_printf '  %bИспользуйте пункт 2 для запуска%b\n' "$GRAY" "$NC"
   else
-    _tty_echo "  Статус: НЕ УСТАНОВЛЕНА"
-    _tty_echo "  Используйте пункт 1 для установки"
+    _tty_printf '  %b📦 Статус: НЕ УСТАНОВЛЕНА%b\n' "$GRAY" "$NC"
+    _tty_printf '  %bИспользуйте пункт 1 для установки%b\n' "$GRAY" "$NC"
   fi
   _tty_echo ""
-  hline 52
+  hline 56
 }
 
 remnanode_menu() {
@@ -2261,36 +2266,36 @@ remnanode_menu() {
     PUBLIC_IP=$(get_public_ip)
     node_status_screen
 
-    _tty_echo "  Установка и управление:"
-    _tty_echo "     1) Установить RemnaNode"
-    _tty_echo "     2) Запустить"
-    _tty_echo "     3) Остановить"
-    _tty_echo "     4) Перезапустить"
-    _tty_echo "     5) Удалить RemnaNode"
+    _tty_printf '  %b🛠️  Установка и управление:%b\n' "$WHITE" "$NC"
+    _tty_echo "    ${WHITE} 1)${NC} 🚀 Установить RemnaNode"
+    _tty_echo "    ${WHITE} 2)${NC} ▶️  Запустить"
+    _tty_echo "    ${WHITE} 3)${NC} ⏹️  Остановить"
+    _tty_echo "    ${WHITE} 4)${NC} 🔄 Перезапустить"
+    _tty_echo "    ${WHITE} 5)${NC} 🗑️  Удалить RemnaNode"
     _tty_echo ""
-    _tty_echo "  Мониторинг и логи:"
-    _tty_echo "     6) Статус (docker ps / compose)"
-    _tty_echo "     7) Логи контейнера"
-    _tty_echo "     8) Docker stats"
-    _tty_echo "     9) LIVE-мониторинг"
+    _tty_printf '  %b📊 Мониторинг и логи:%b\n' "$WHITE" "$NC"
+    _tty_echo "    ${WHITE} 6)${NC} 📌 Статус (docker ps / compose)"
+    _tty_echo "    ${WHITE} 7)${NC} 📋 Логи контейнера"
+    _tty_echo "    ${WHITE} 8)${NC} 📈 Docker stats"
+    _tty_echo "    ${WHITE} 9)${NC} 📺 LIVE-мониторинг"
     _tty_echo ""
-    _tty_echo "  Обновления и конфигурация:"
-    _tty_echo "    10) Обновить образ RemnaNode"
-    _tty_echo "    11) Фикс онлайна Hysteria2 / custom Xray"
-    _tty_echo "    12) Редактировать docker-compose.yml"
-    _tty_echo "    13) Редактировать .env"
-    _tty_echo "    14) Показать порты"
-    _tty_echo "    15) Тюнинг производительности"
+    _tty_printf '  %b⚙️  Обновления и конфигурация:%b\n' "$WHITE" "$NC"
+    _tty_echo "    ${WHITE}10)${NC} ⬆️  Обновить образ RemnaNode"
+    _tty_echo "    ${WHITE}11)${NC} 🔧 Фикс онлайна Hysteria2 / custom Xray"
+    _tty_echo "    ${WHITE}12)${NC} 📝 Редактировать docker-compose.yml"
+    _tty_echo "    ${WHITE}13)${NC} 🔐 Редактировать .env"
+    _tty_echo "    ${WHITE}14)${NC} 🔌 Показать порты"
+    _tty_echo "    ${WHITE}15)${NC} ⚙️  Тюнинг производительности"
     _tty_echo ""
-    _tty_echo "  Дополнительно:"
-    _tty_echo "    16) Настройка Hysteria2"
-    _tty_echo "    17) Selfsteal"
-    _tty_echo "    18) Открыть главное меню лаунчера"
+    _tty_printf '  %b✨ Дополнительно:%b\n' "$WHITE" "$NC"
+    _tty_echo "    ${WHITE}16)${NC} ⚡ Настройка Hysteria2"
+    _tty_echo "    ${WHITE}17)${NC} 🎭 Selfsteal"
+    _tty_echo "    ${WHITE}18)${NC} 🏠 Открыть главное меню лаунчера"
     _tty_echo ""
-    hline 52
-    _tty_echo "     0) Выход"
+    hline 56
+    _tty_echo "    ${GRAY}0)${NC} 🚪 Выход"
     _tty_echo ""
-    ask_choice choice "Выберите пункт [0-18]:"
+    ask_choice choice "👉 Выберите пункт [0-18]:"
 
     case "$choice" in
       1) install_remnanode; pause ;;
@@ -2442,26 +2447,26 @@ main_menu() {
     PUBLIC_IP=$(get_public_ip)
     show_header
 
-    section "Установка"
-    menu_item "-" "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
-    menu_item "-" "2"  "Selfsteal"  "маскировка Reality" selfsteal
-    menu_item "-" "3"  "Hysteria2"  "автонастройка"      hysteria
-    menu_item "-" "4"  "Фикс H2"    "custom Xray"        xrayfix
-    menu_item "-" "5"  "WARP"       "Cloudflare SOCKS5"  warp
-    menu_item "-" "6"  "MTProto"    "прокси Telegram"    mtproto
+    section "📦 Установка"
+    menu_item "🚀" "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
+    menu_item "🎭" "2"  "Selfsteal"  "маскировка Reality" selfsteal
+    menu_item "⚡" "3"  "Hysteria2"  "автонастройка"      hysteria
+    menu_item "🔧" "4"  "Фикс H2"    "custom Xray"        xrayfix
+    menu_item "☁️" "5"  "WARP"       "Cloudflare SOCKS5"  warp
+    menu_item "✈️" "6"  "MTProto"    "прокси Telegram"    mtproto
 
-    section "Система"
-    menu_item "-" "7"  "SWAP"       "файл подкачки"      swap
-    menu_item "-" "8"  "UFW"        "порты и защита"     ufw
-    menu_item "-" "9"  "Тюнинг"     "BBR / буферы / RPS" tune
+    section "🛠️  Система"
+    menu_item "💾" "7"  "SWAP"       "файл подкачки"      swap
+    menu_item "🛡️" "8"  "UFW"        "порты и защита"     ufw
+    menu_item "⚙️" "9"  "Тюнинг"     "BBR / буферы / RPS" tune
 
-    section "Сервис"
-    menu_item "-" "10" "Нода"       "меню управления"    node_cli
-    menu_item "-" "11" "Тесты"      "speed / ping / DNS"
+    section "🎛️  Сервис"
+    menu_item "📡" "10" "Нода"       "меню управления"    node_cli
+    menu_item "🧪" "11" "Тесты"      "speed / ping / DNS"
     _tty_echo ""
-    menu_item "-" "0"  "Выход"      ""
+    menu_item "🚪" "0"  "Выход"      ""
     _tty_echo ""
-    ask_choice choice
+    ask_choice choice "👉"
 
     case "$choice" in
       1)  install_remnanode; pause ;;
