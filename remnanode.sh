@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.19
+# Версия: 2026.7.20
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.7.19"
+_REMNANODE_VER="2026.7.20"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -198,6 +198,11 @@ ask_secret() {
 ask_choice() {
   local varname="$1" prompt="${2:->}"
   local _ans
+  # пробел после emoji-prompt (👉/👉 ), чтобы не слипалось с курсором
+  case "$prompt" in
+    *[[:space:]]) ;;
+    *) prompt="${prompt} " ;;
+  esac
   _tty_printf "  %b%s%b " "$WHITE" "$prompt" "$NC"
   _ans=$(_tty_read)
   printf -v "$varname" '%s' "$_ans"
@@ -378,7 +383,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.7.19}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.7.20}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -435,7 +440,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.7.19"
+  [[ -n "$v" ]] || v="2026.7.20"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -446,7 +451,7 @@ launcher_version() {
 show_header() {
   ui_clear
   # Жёстко фиксируем версию на каждом показе шапки (защита от пустого env)
-  _REMNANODE_VER="2026.7.19"
+  _REMNANODE_VER="2026.7.20"
   RN_VERSION="$_REMNANODE_VER"
   SCRIPT_VERSION="$_REMNANODE_VER"
   local ver="$_REMNANODE_VER"
@@ -603,17 +608,19 @@ service_badge_color() {
   esac
 }
 
-# Колонки:  ICON NN)  TITLE........  DESC................  [STATUS]
-# Emoji только в начале строки; pad_right — только для ASCII/кириллицы
+# Колонки:  ICON  NN)  TITLE........  DESC................  [STATUS]
+# После emoji — минимум два ASCII-пробела (Termius «съедает» один у ☁️✈️🛡️⚙️)
 menu_item() {
   local icon="$1" num="$2" title="$3" desc="$4" badge="${5:-}"
-  local num_s title_s desc_s
+  local num_s title_s desc_s gap="  "
 
+  # убрать хвостовые пробелы у icon, зазор задаём сами
+  icon="${icon%"${icon##*[![:space:]]}"}"
   num_s=$(pad_right "${num})" 4)
   title_s=$(pad_right "$title" 12)
   desc_s=$(pad_right "$desc" 20)
 
-  _tty_printf '  %s %b%s%b %b%s%b %b%s%b'     "$icon" "$WHITE" "$num_s" "$NC" "$WHITE" "$title_s" "$NC" "$GRAY" "$desc_s" "$NC"
+  _tty_printf '  %s%s%b%s%b %b%s%b %b%s%b'     "$icon" "$gap" "$WHITE" "$num_s" "$NC" "$WHITE" "$title_s" "$NC" "$GRAY" "$desc_s" "$NC"
   if [[ -n "$badge" ]]; then
     _tty_printf '  '
     service_badge_color "$badge"
@@ -622,8 +629,26 @@ menu_item() {
 }
 
 section() {
+  local title="$1"
   _tty_echo ""
-  _tty_printf '  %b%s%b\n' "${WHITE}${BOLD}" "$1" "$NC"
+  # Если заголовок начинается с emoji — гарантируем пробел после первого «слова»
+  # (на случай 📦Установка без пробела в вызове / съеденного пробела)
+  if [[ "$title" != [[":space:]]* ]] && [[ "$title" =~ ^[^[:alnum:][:space:][:punct:]] ]]; then
+    # вставить пробел после ведущего non-ascii токена, если его нет
+    if [[ ! "$title" =~ [[:space:]] ]]; then
+      :
+    fi
+  fi
+  # Нормализуем: emoji + два пробела + остальной текст
+  local lead rest
+  if [[ "$title" =~ ^(.[[:space:]️‍]*)[[:space:]]+(.*)$ ]]; then
+    # уже есть пробел после emoji-кластера — оставим два
+    lead="${title%% *}"
+    rest="${title#* }"
+    rest="${rest# }"
+    title="${lead}  ${rest}"
+  fi
+  _tty_printf '  %b%s%b\n' "${WHITE}${BOLD}" "$title" "$NC"
   hline 56
 }
 
@@ -2591,7 +2616,7 @@ main_menu() {
     PUBLIC_IP=$(get_public_ip)
     show_header
 
-    section "📦 Установка"
+    section "📦  Установка"
     menu_item "🚀" "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
     menu_item "🎭" "2"  "Selfsteal"  "маскировка Reality" selfsteal
     menu_item "⚡" "3"  "Hysteria2"  "автонастройка"      hysteria
