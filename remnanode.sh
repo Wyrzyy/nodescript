@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.16
+# Версия: 2026.7.17
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -14,9 +14,10 @@ set -Eeuo pipefail
 # Selfsteal — русифицированная копия в этом же репозитории (selfsteal.sh).
 ###############################################################################
 
-# Версия лаунчера (дублируем в RN_VERSION — защита от . /etc/os-release и т.п.)
-RN_VERSION="2026.7.16"
-SCRIPT_VERSION="$RN_VERSION"
+# Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
+_REMNANODE_VER="2026.7.17"
+RN_VERSION="$_REMNANODE_VER"
+SCRIPT_VERSION="$_REMNANODE_VER"
 
 # Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
 # перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
@@ -40,6 +41,7 @@ LAUNCHER_PATH="/opt/remnanode/installer.sh"
 CLI_PATH="/usr/local/bin/remnanode"
 
 # Внешние / наши скрипты (UI — на русском)
+LAUNCHER_RAW="https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh"
 # Selfsteal: русифицированная копия DigneZzZ в этом репо
 SELFSTEAL_RAW="https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/selfsteal.sh"
 SELFSTEAL_LOCAL="/opt/remnanode/selfsteal.sh"
@@ -371,9 +373,11 @@ run_selfsteal() {
 ###############################################################################
 require_root
 
-# os-release задаёт VERSION=... — не даём затереть версию лаунчера
+# os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-SCRIPT_VERSION="${RN_VERSION}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.7.17}"
+RN_VERSION="$_REMNANODE_VER"
+SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
   ubuntu|debian) ;;
   *) err "Поддерживается только Ubuntu/Debian. Найдено: $ID" ;;
@@ -417,19 +421,38 @@ pad_right() {
 
 # Актуальная версия лаунчера (никогда не пустая)
 launcher_version() {
-  printf '%s' "${SCRIPT_VERSION:-${RN_VERSION:-unknown}}"
+  local v=""
+  v="${_REMNANODE_VER:-}"
+  [[ -n "$v" ]] || v="${RN_VERSION:-}"
+  [[ -n "$v" ]] || v="${SCRIPT_VERSION:-}"
+  # Запасной путь: прочитать из самого файла скрипта
+  if [[ -z "$v" || "$v" == "unknown" ]]; then
+    local src="${BASH_SOURCE[0]:-$0}"
+    if [[ -f "$src" ]]; then
+      v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'\''[:space:]' || true)
+    fi
+  fi
+  [[ -n "$v" ]] || v="2026.7.17"
+  # Синхронизируем все имена
+  _REMNANODE_VER="$v"
+  RN_VERSION="$v"
+  SCRIPT_VERSION="$v"
+  printf '%s' "$v"
 }
 
 show_header() {
   ui_clear
-  local ver
+  # Версию берём напрямую — без вложенных пустых env
+  local ver="2026.7.17"
   ver=$(launcher_version)
+  [[ -n "$ver" && "$ver" != "unknown" ]] || ver="2026.7.17"
+
   # Простая шапка БЕЗ emoji внутри линий — иначе Termius съезжает и «теряет» текст
   _tty_printf '%b' "${CYAN}${BOLD}"
   _tty_echo "  =================================================="
   _tty_echo "   REMNANODE LAUNCHER"
-  _tty_echo "   version ${ver}"
-  _tty_echo "   Node | Selfsteal | H2 | Proxy | Tests"
+  _tty_echo "   версия ${ver}"
+  _tty_echo "   Нода | Selfsteal | H2 | Прокси | Тесты"
   _tty_echo "  =================================================="
   _tty_printf '%b' "${NC}"
   _tty_echo ""
@@ -1047,22 +1070,29 @@ install_self_cli() {
   local src_dir=""
   src_dir=$(cd "$(dirname "$src")" 2>/dev/null && pwd || true)
   mkdir -p "$DIR"
-  if [[ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$(readlink -f "$LAUNCHER_PATH" 2>/dev/null || echo "$LAUNCHER_PATH")" ]]; then
+
+  # Всегда обновляем установленный лаунчер из текущего файла (или с GitHub)
+  if [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]]; then
     cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
-    chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
   fi
+  # Если в установленной копии нет версии — скачать свежий с GitHub
+  if [[ ! -f "$LAUNCHER_PATH" ]] \
+     || ! grep -qE '^_REMNANODE_VER="?2026\.' "$LAUNCHER_PATH" 2>/dev/null; then
+    gh_download "$LAUNCHER_RAW" "$LAUNCHER_PATH" 2>/dev/null || true
+  fi
+  chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
+
   # Кладём/обновляем русифицированный Selfsteal рядом с лаунчером
   if [[ -n "$src_dir" && -f "$src_dir/selfsteal.sh" ]]; then
     cp -f "$src_dir/selfsteal.sh" "$SELFSTEAL_LOCAL" 2>/dev/null || true
     chmod +x "$SELFSTEAL_LOCAL" 2>/dev/null || true
   else
-    # Всегда подтягиваем свежую RU-копию из репо (фикс UI/переводов)
     gh_download "$SELFSTEAL_RAW" "$SELFSTEAL_LOCAL" 2>/dev/null || true
     chmod +x "$SELFSTEAL_LOCAL" 2>/dev/null || true
   fi
   ln -sfn "$LAUNCHER_PATH" "$CLI_PATH"
   chmod +x "$CLI_PATH" 2>/dev/null || true
-  ok "📡 Команда управления: ${CYAN}remnanode${NC}"
+  ok "Команда управления: remnanode"
 }
 
 ###############################################################################
