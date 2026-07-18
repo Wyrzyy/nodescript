@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.14
+# Версия: 2026.7.15
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -14,7 +14,7 @@ set -Eeuo pipefail
 # Selfsteal — русифицированная копия в этом же репозитории (selfsteal.sh).
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.14"
+SCRIPT_VERSION="2026.7.15"
 
 # Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
 # перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
@@ -337,26 +337,32 @@ gh_pipe_bash() {
   gh_run_bash "$url" "$@"
 }
 
-# Selfsteal: локальная русифицированная копия → иначе скачать из нашего репо
+# Selfsteal: всегда свежая RU-копия из репо (или рядом со скриптом)
 run_selfsteal() {
   local src=""
   local here_dir
   here_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)
   if [[ -n "$here_dir" && -f "$here_dir/selfsteal.sh" ]]; then
     src="$here_dir/selfsteal.sh"
-  elif [[ -f "$SELFSTEAL_LOCAL" ]]; then
-    src="$SELFSTEAL_LOCAL"
+    cp -f "$src" "$SELFSTEAL_LOCAL" 2>/dev/null || true
+  else
+    info "🎭 Selfsteal (RU): обновляю из репозитория…"
+    if gh_download "$SELFSTEAL_RAW" "$SELFSTEAL_LOCAL"; then
+      src="$SELFSTEAL_LOCAL"
+    fi
   fi
-  if [[ -n "$src" ]]; then
-    info "🎭 Selfsteal (RU): $src"
-    set +e
-    bash "$src" "$@"
-    local rc=$?
-    set -e
-    return $rc
+  if [[ -z "$src" || ! -f "$src" ]]; then
+    warn "Не удалось получить selfsteal.sh — пробую прямой запуск"
+    gh_pipe_bash "$SELFSTEAL_RAW" "$@"
+    return $?
   fi
-  info "🎭 Selfsteal (RU): скачиваю из нашего репозитория…"
-  gh_pipe_bash "$SELFSTEAL_RAW" "$@"
+  chmod +x "$src" "$SELFSTEAL_LOCAL" 2>/dev/null || true
+  info "🎭 Selfsteal (RU): $src"
+  set +e
+  bash "$src" "$@"
+  local rc=$?
+  set -e
+  return $rc
 }
 
 ###############################################################################
@@ -1041,11 +1047,12 @@ install_self_cli() {
     cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
     chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
   fi
-  # Кладём русифицированный Selfsteal рядом с лаунчером
+  # Кладём/обновляем русифицированный Selfsteal рядом с лаунчером
   if [[ -n "$src_dir" && -f "$src_dir/selfsteal.sh" ]]; then
     cp -f "$src_dir/selfsteal.sh" "$SELFSTEAL_LOCAL" 2>/dev/null || true
     chmod +x "$SELFSTEAL_LOCAL" 2>/dev/null || true
-  elif [[ ! -f "$SELFSTEAL_LOCAL" ]]; then
+  else
+    # Всегда подтягиваем свежую RU-копию из репо (фикс UI/переводов)
     gh_download "$SELFSTEAL_RAW" "$SELFSTEAL_LOCAL" 2>/dev/null || true
     chmod +x "$SELFSTEAL_LOCAL" 2>/dev/null || true
   fi

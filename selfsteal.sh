@@ -173,11 +173,47 @@ log_error() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
+
+# ── UI helpers (кириллица + Termius: без %-Ns и с /dev/tty) ──────────────
+_ui_out() {
+    if [ -w /dev/tty ]; then
+        printf '%b' "$*" > /dev/tty
+    else
+        printf '%b' "$*"
+    fi
+}
+
+# Метка + значение в две колонки (паддинг по символам UTF-8, не по байтам)
+ui_kv() {
+    local label="$1" value="$2" vcolor="${3:-$GRAY}"
+    local width=22 n=${#label} pad
+    _ui_out "  ${WHITE}${label}${NC}"
+    if [ "$n" -lt "$width" ]; then
+        pad=$((width - n))
+        _ui_out "$(printf '%*s' "$pad" '')"
+    else
+        _ui_out "  "
+    fi
+    _ui_out " ${vcolor}${value}${NC}\n"
+}
+
+# Видимый prompt → /dev/tty, ответ с /dev/tty
+ui_ask() {
+    local prompt="$1" __ans=""
+    _ui_out "  ${WHITE}${prompt}${NC} "
+    if [ -r /dev/tty ]; then
+        IFS= read -r __ans < /dev/tty || true
+    else
+        IFS= read -r __ans || true
+    fi
+    printf '%s' "$__ans"
+}
+
 # Error handler
 cleanup_on_error() {
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        log_error "Script terminated на error code: $exit_code"
+        log_error "Скрипт завершён с кодом ошибки: $exit_code"
     fi
 }
 trap cleanup_on_error EXIT
@@ -1228,10 +1264,10 @@ show_ssl_certificate_info() {
     local start
     start=$(openssl x509 -startdate -noout -in "$cert_file" 2>/dev/null | sed 's/notBefore=//')
     
-    printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Subject:" "$subject"
-    printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Issuer:" "$issuer"
-    printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Valid From:" "$start"
-    printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Valid Until:" "$expiry"
+    ui_kv "Субъект:" "$subject"
+    ui_kv "Издатель:" "$issuer"
+    ui_kv "Действует с:" "$start"
+    ui_kv "Действует до:" "$expiry"
     
     # Check status
     local status
@@ -1767,7 +1803,7 @@ validate_domain_dns() {
     
     if [ "$dns_match" = "true" ]; then
         echo -e "${GREEN}✅ Домен корректно указывает на этот сервер${NC}"
-        echo -e "${GREEN}✅ Распространение DNS: $propagation_count/4 servers${NC}"
+        echo -e "${GREEN}✅ Распространение DNS: $propagation_count/4 серверов${NC}"
         
         if [ "$propagation_count" -ge 2 ]; then
             echo -e "${GREEN}✅ Распространение DNS в порядке${NC}"
@@ -1848,7 +1884,7 @@ SELF_STEAL_PORT=$port
 # SSL: $ssl_source
 EOF
 
-    log_success ".env file created"
+    log_success "Файл .env создан"
     
     # Handle manual SSL certificates
     if [ "$use_manual_ssl" = true ]; then
@@ -2184,7 +2220,7 @@ SELF_STEAL_PORT=$port
 # SSL: $ssl_source
 EOF
 
-    log_success ".env file created"
+    log_success "Файл .env создан"
     
     [ "$DEBUG_MODE" = true ] && echo "DEBUG: Creating SSL directory"
     
@@ -2810,11 +2846,11 @@ install_command() {
         log_info "Force-режим: домен $domain"
     else
         echo -e "${WHITE}🌐 Настройка домена${NC}"
-        echo -e "${GRAY}Этот домен должен совпадать с Xray Reality (realitySettings.serverNames)${NC}"
+        echo -e "${CYAN}Этот домен должен совпадать с Xray Reality (realitySettings.serverNames)${NC}"
         echo
     
         while [ -z "$domain" ]; do
-            read -p "Введите домен (например, reality.example.com): " domain
+            domain=$(ui_ask "Введите домен (например, reality.example.com):")
             if [ -z "$domain" ]; then
                 log_error "Домен не может быть пустым!"
                 continue
@@ -2826,14 +2862,14 @@ install_command() {
             echo -e "   ${WHITE}2)${NC} ${GRAY}Пропустить проверку DNS (для тестов)${NC}"
             echo
             
-            read -p "Выберите пункт [1-2]: " dns_choice
+            dns_choice=$(ui_ask "Выберите пункт [1-2]:")
             
             case "$dns_choice" in
                 1)
                     echo
                     if ! validate_domain_dns "$domain" "$NODE_IP"; then
                         echo
-                        read -p "Попробовать другой домен? [Y/n]: " -r try_again
+                        try_again=$(ui_ask "Попробовать другой домен? [Y/n]:")
                         if [[ ! $try_again =~ ^[Nn]$ ]]; then
                             domain=""
                             continue
@@ -2861,7 +2897,7 @@ install_command() {
     # Force mode - use provided port if specified
     if [ "$FORCE_MODE" = true ] && [ -n "$FORCE_PORT" ]; then
         port="$FORCE_PORT"
-        log_info "Force mode: using port $port"
+        log_info "Force-режим: порт $port"
     fi
     
     if [ "$WEB_SERVER" = "nginx" ] && [ "$USE_SOCKET" = true ]; then
@@ -2875,10 +2911,10 @@ install_command() {
     elif [ "$FORCE_MODE" != true ]; then
         echo
         echo -e "${WHITE}🔌 Настройка порта${NC}"
-        echo -e "${GRAY}Этот порт должен совпадать с Xray Reality (realitySettings.dest)${NC}"
+        echo -e "${CYAN}Этот порт должен совпадать с Xray Reality (realitySettings.dest)${NC}"
         echo
         
-        read -p "Введите HTTPS-порт (по умолчанию: $DEFAULT_PORT): " input_port
+        input_port=$(ui_ask "Введите HTTPS-порт [по умолчанию: $DEFAULT_PORT]:")
         if [ -n "$input_port" ]; then
             port="$input_port"
         fi
@@ -2886,50 +2922,50 @@ install_command() {
 
     # Validate port
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        log_error "Invalid port number!"
+        log_error "Неверный номер порта!"
         return 1
     fi
 
     # Summary
     echo
     echo -e "${WHITE}📋 Сводка установки${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 30))${NC}"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Веб-сервер:" "$server_display_name"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Домен:" "$domain"
+    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
+    ui_kv "Веб-сервер:" "$server_display_name"
+    ui_kv "Домен:" "$domain"
     
     if [ "$WEB_SERVER" = "nginx" ] && [ "$USE_SOCKET" = true ]; then
-        printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Connection:" "Unix Socket"
-        printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Socket Path:" "$SOCKET_PATH"
+        ui_kv "Подключение:" "Unix-сокет"
+        ui_kv "Путь сокета:" "$SOCKET_PATH"
     else
-        printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "HTTPS Порт:" "$port"
+        ui_kv "HTTPS-порт:" "$port"
     fi
     
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Installation Path:" "$APP_DIR"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "HTML Path:" "$HTML_DIR"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "IP сервера:" "$NODE_IP"
+    ui_kv "Каталог:" "$APP_DIR"
+    ui_kv "HTML:" "$HTML_DIR"
+    ui_kv "IP сервера:" "$NODE_IP"
     
     if [ "$skip_dns_check" = true ]; then
-        printf "   ${WHITE}%-20s${NC} ${YELLOW}%s${NC}\n" "DNS Validation:" "SKIPPED"
+        ui_kv "Проверка DNS:" "пропущена" "$YELLOW"
     else
-        printf "   ${WHITE}%-20s${NC} ${GREEN}%s${NC}\n" "DNS Validation:" "PASSED"
+        ui_kv "Проверка DNS:" "успешно" "$GREEN"
     fi
     
     # Show manual SSL certificate info if provided
     if [ -n "$MANUAL_SSL_CERT" ] && [ -n "$MANUAL_SSL_KEY" ]; then
-        printf "   ${WHITE}%-20s${NC} ${CYAN}%s${NC}\n" "SSL Certificate:" "Manual (wildcard)"
+        ui_kv "SSL-сертификат:" "ручной (wildcard)" "$CYAN"
     fi
     
     echo
 
     # In force mode, skip confirmation
     if [ "$FORCE_MODE" != true ]; then
-        read -p "Продолжить установку? [Y/n]: " -r confirm
+        confirm=$(ui_ask "Продолжить установку? [Y/n]:")
         if [[ $confirm =~ ^[Nn]$ ]]; then
             echo -e "${GRAY}Установка отменена${NC}"
             return 0
         fi
     else
-        log_info "Force mode: proceeding на installation..."
+        log_info "Force-режим: продолжаю установку…"
     fi
 
     # Create directories
@@ -2941,7 +2977,7 @@ install_command() {
     create_dir_safe "$HTML_DIR" || return 1
     create_dir_safe "$APP_DIR/logs" || return 1
     
-    log_success "Directories created"
+    log_success "Каталоги созданы"
 
     # Create configuration files based on selected web server
     echo
@@ -3076,9 +3112,9 @@ install_command() {
     # resilient) so `docker compose up` reuses a local image instead of pulling.
     ensure_runtime_image || log_warning "Could not pre-fetch image; 'docker compose up' will attempt its own pull"
     if docker compose up -d; then
-        log_success "$server_display_name services started successfully"
+        log_success "Сервисы $server_display_name запущены"
     else
-        log_error "Failed to start $server_display_name services"
+        log_error "Не удалось запустить сервисы $server_display_name"
         return 1
     fi
 
@@ -3093,29 +3129,29 @@ install_command() {
     echo -e "${WHITE}🎉 Установка успешно завершена!${NC}"
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
     echo
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Веб-сервер:" "$server_display_name"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Домен:" "$domain"
+    ui_kv "Веб-сервер:" "$server_display_name"
+    ui_kv "Домен:" "$domain"
     
     # Show connection mode info for Nginx
     if [ "$WEB_SERVER" = "nginx" ]; then
         if [ "$USE_SOCKET" = true ]; then
-            printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Connection Mode:" "Unix Socket"
-            printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Socket Path:" "$SOCKET_PATH"
+            ui_kv "Подключение:" "Unix-сокет"
+            ui_kv "Путь сокета:" "$SOCKET_PATH"
         else
-            printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Connection Mode:" "TCP Port"
-            printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "HTTPS Порт:" "$port"
+            ui_kv "Подключение:" "TCP-порт"
+            ui_kv "HTTPS-порт:" "$port"
         fi
     else
-        printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "HTTPS Порт:" "$port"
+        ui_kv "HTTPS-порт:" "$port"
     fi
     
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Installation Path:" "$APP_DIR"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "HTML Content:" "$HTML_DIR"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Installed Template:" "$installed_template"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Management Command:" "$APP_NAME"
+    ui_kv "Каталог:" "$APP_DIR"
+    ui_kv "HTML:" "$HTML_DIR"
+    ui_kv "Шаблон:" "$installed_template"
+    ui_kv "Команда:" "$APP_NAME"
     echo
     echo -e "${WHITE}📋 Следующие шаги:${NC}"
-    echo -e "${GRAY}   • Настройте Xray Reality::${NC}"
+    echo -e "${GRAY}   • Настройте Xray Reality:${NC}"
     echo -e "${GRAY}     - serverNames: [\"$domain\"]${NC}"
     if [ "$WEB_SERVER" = "nginx" ]; then
         if [ "$USE_SOCKET" = true ]; then
@@ -3557,13 +3593,13 @@ show_download_summary() {
     echo
     echo -e "${WHITE}📊 Итог скачивания:${NC}"
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 25))${NC}"
-    printf "   ${WHITE}%-20s${NC} ${GREEN}%d${NC}\n" "Files downloaded:" "$files_count"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Template:" "$template_name"
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Location:" "$HTML_DIR"
+    ui_kv "Файлов скачано:" "$files_count" "$GREEN"
+    ui_kv "Шаблон:" "$template_name"
+    ui_kv "Путь:" "$HTML_DIR"
     
     # Показать размер
     local total_size=$(du -sh "$HTML_DIR" 2>/dev/null | cut -f1 || echo "Unknown")
-    printf "   ${WHITE}%-20s${NC} ${GRAY}%s${NC}\n" "Total size:" "$total_size"
+    ui_kv "Размер:" "$total_size"
     
     echo
     echo -e "${GREEN}✅ Шаблон успешно скачан${NC}"
@@ -3780,7 +3816,7 @@ show_template_options() {
     for i in $(seq 1 11); do
         local name="${TEMPLATE_NAMES[$i]:-}"
         if [ -n "$name" ]; then
-            printf "   ${WHITE}%-3s${NC} ${CYAN}%s${NC}\n" "$i)" "$name"
+            ui_kv "$i)" "$name" "$CYAN"
         fi
     done
     
@@ -3789,7 +3825,7 @@ show_template_options() {
     echo -e "   ${WHITE}k)${NC} ${GRAY}📝 Оставить текущий${NC}"
     echo -e "   ${WHITE}r)${NC} ${GRAY}🎲 Случайный шаблон${NC}"
     echo
-    echo -e "   ${GRAY}0)${NC} ${GRAY}⬅️  Cancel${NC}"
+    echo -e "   ${GRAY}0)${NC} ${GRAY}⬅️  Отмена${NC}"
     echo
 }
 
@@ -3978,9 +4014,9 @@ up_command() {
 
     ensure_runtime_image || log_warning "Could not pre-fetch image; 'docker compose up' will attempt its own pull"
     if docker compose up -d; then
-        log_success "$server_name services started successfully"
+        log_success "Сервисы $server_name запущены"
     else
-        log_error "Failed to start $server_name services"
+        log_error "Не удалось запустить сервисы $server_name"
         return 1
     fi
 }
@@ -4125,26 +4161,26 @@ status_command() {
     if [ -f "$APP_DIR/.env" ]; then
         domain=$(grep "SELF_STEAL_DOMAIN=" "$APP_DIR/.env" 2>/dev/null | cut -d'=' -f2 || true)
         port=$(grep "SELF_STEAL_PORT=" "$APP_DIR/.env" 2>/dev/null | cut -d'=' -f2 || true)
-        connection_mode=$(grep "Connection Mode:" "$APP_DIR/.env" 2>/dev/null | cut -d':' -f2 | tr -d ' ' || true)
+        connection_mode=$(grep "Подключение:" "$APP_DIR/.env" 2>/dev/null | cut -d':' -f2 | tr -d ' ' || true)
     fi
     
-    printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Веб-сервер:" "$server_name"
-    printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Домен:" "${domain:-N/A}"
+    ui_kv "Веб-сервер:" "$server_name"
+    ui_kv "Домен:" "${domain:-N/A}"
     
     # Show connection mode for Nginx
     if [ "$WEB_SERVER" = "nginx" ]; then
         if [ "$connection_mode" = "socket" ] || [ -z "$connection_mode" ]; then
-            printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Connection:" "Unix Socket"
-            printf "   ${WHITE}%-15s${NC} ${CYAN}%s${NC}\n" "Цель Xray:" "$SOCKET_PATH"
+            ui_kv "Подключение:" "Unix-сокет"
+            ui_kv "Цель Xray:" "$SOCKET_PATH" "$CYAN"
         else
-            printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Connection:" "TCP Port"
-            printf "   ${WHITE}%-15s${NC} ${CYAN}%s${NC}\n" "Цель Xray:" "127.0.0.1:${port:-9443}"
+            ui_kv "Подключение:" "TCP-порт"
+            ui_kv "Цель Xray:" "127.0.0.1:${port:-9443}" "$CYAN"
         fi
     else
-        printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "HTTPS Порт:" "${port:-9443}"
+        ui_kv "HTTPS-порт:" "${port:-9443}"
     fi
-    printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "HTML Path:" "$HTML_DIR"
-    printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Script Version:" "v$SCRIPT_VERSION"
+    ui_kv "HTML:" "$HTML_DIR"
+    ui_kv "Версия:" "v$SCRIPT_VERSION"
     
     # Show SSL certificate info for Nginx
     if [ "$WEB_SERVER" = "nginx" ] && [ -f "$APP_DIR/ssl/fullchain.crt" ]; then
@@ -4438,7 +4474,7 @@ reissue_caddy_cert() {
         log_error "Could not determine domain from $APP_DIR/.env"
         return 1
     fi
-    printf "   ${WHITE}%-13s${NC} ${GRAY}%s${NC}\n" "Домен:" "$domain"
+    ui_kv "Домен:" "$domain"
 
     # The Caddy image is needed for the wipe + verify helper containers.
     if ! ensure_image "caddy:${CADDY_VERSION}"; then
@@ -4453,7 +4489,7 @@ reissue_caddy_cert() {
         echo -e "${GRAY}   Try: docker volume ls | grep caddy${NC}"
         return 1
     fi
-    printf "   ${WHITE}%-13s${NC} ${GRAY}%s${NC}\n" "Data volume:" "$data_vol"
+    ui_kv "Data volume:" "$data_vol"
     echo
 
     # Rate-limit guardrail.
@@ -4511,7 +4547,7 @@ reissue_caddy_cert() {
     # 4) Start Caddy — it obtains a fresh certificate on boot for named sites.
     log_info "Starting Caddy..."
     if ! docker compose up -d >/dev/null 2>&1; then
-        log_error "Failed to start Caddy"
+        log_error "Не удалось запустить Caddy"
         log_warning "Restoring previous certificate..."
         docker compose stop >/dev/null 2>&1 || docker compose down >/dev/null 2>&1 || true
         caddy_data_exec "$data_vol" 'rm -rf /data/caddy/certificates; if [ -d /data/caddy/certificates.bak ]; then mv /data/caddy/certificates.bak /data/caddy/certificates; fi' || true
@@ -4550,9 +4586,9 @@ reissue_caddy_cert() {
         # Issuance succeeded — drop the rollback backup.
         caddy_data_exec "$data_vol" 'rm -rf /data/caddy/certificates.bak' || true
         log_success "New certificate issued"
-        printf "   ${WHITE}%-13s${NC} ${GRAY}%s${NC}\n" "Issuer:" "$issuer"
-        printf "   ${WHITE}%-13s${NC} ${GRAY}%s${NC}\n" "Valid From:" "$start"
-        printf "   ${WHITE}%-13s${NC} ${GRAY}%s${NC}\n" "Valid Until:" "$expiry"
+        ui_kv "Издатель:" "$issuer"
+        ui_kv "Действует с:" "$start"
+        ui_kv "Действует до:" "$expiry"
         echo
         echo -e "${GREEN}✅ Готово — Caddy отдаёт новый сертификат.${NC}"
         return 0
@@ -4894,7 +4930,7 @@ show_help() {
     echo -e "${WHITE}Параметры принудительной установки:${NC}"
     printf "   ${CYAN}%-22s${NC} %s\n" "--force, -f" "Skip DNS validation and prompts"
     printf "   ${CYAN}%-22s${NC} %s\n" "--domain <domain>" "Domain for installation"
-    printf "   ${CYAN}%-22s${NC} %s\n" "--port <port>" "HTTPS port (default: 9443)"
+    printf "   ${CYAN}%-22s${NC} %s\n" "--port <port>" "HTTPS-порт (по умолчанию: 9443)"
     printf "   ${CYAN}%-22s${NC} %s\n" "--template <1-11>" "Template number to install"
     echo
     echo -e "${WHITE}Ручной SSL-сертификат:${NC}"
@@ -5100,7 +5136,7 @@ guide_command() {
     if [ -f "$APP_DIR/.env" ]; then
         domain=$(grep "SELF_STEAL_DOMAIN=" "$APP_DIR/.env" 2>/dev/null | cut -d'=' -f2 || true)
         port=$(grep "SELF_STEAL_PORT=" "$APP_DIR/.env" 2>/dev/null | cut -d'=' -f2 || true)
-        connection_mode=$(grep "Connection Mode:" "$APP_DIR/.env" 2>/dev/null | cut -d':' -f2 | tr -d ' ' || true)
+        connection_mode=$(grep "Подключение:" "$APP_DIR/.env" 2>/dev/null | cut -d':' -f2 | tr -d ' ' || true)
     fi
     
     # Determine xray_target based on web server and connection mode
@@ -5379,12 +5415,12 @@ main_menu() {
                 ;;
         esac
         
-        printf "   ${WHITE}%-10s${NC} ${GRAY}%s${NC}\n" "Сервер:" "$server_name"
+        ui_kv "Сервер:" "$server_name"
         if [ -n "$domain" ]; then
-            printf "   ${WHITE}%-10s${NC} ${GRAY}%s${NC}\n" "Домен:" "$domain"
+            ui_kv "Домен:" "$domain"
         fi
         if [ -n "$port" ]; then
-            printf "   ${WHITE}%-10s${NC} ${GRAY}%s${NC}\n" "Порт:" "$port"
+            ui_kv "Порт:" "$port"
         fi
         
         if [ "$menu_status" = "Error (Restarting)" ]; then
