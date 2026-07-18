@@ -342,6 +342,7 @@ run_selfsteal() {
   local src=""
   local here_dir
   here_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)
+  mkdir -p "$(dirname "$SELFSTEAL_LOCAL")" 2>/dev/null || true
   if [[ -n "$here_dir" && -f "$here_dir/selfsteal.sh" ]]; then
     src="$here_dir/selfsteal.sh"
     cp -f "$src" "$SELFSTEAL_LOCAL" 2>/dev/null || true
