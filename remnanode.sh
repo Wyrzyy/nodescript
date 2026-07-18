@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.9
+# Версия: 2026.7.10
 #
 # Запуск (рекомендуется — скачать в файл, затем выполнить):
 #   curl -fsSL -o /tmp/remnanode.sh https://raw.githubusercontent.com/Wyrzyy/nodescript/main/remnanode.sh
@@ -14,7 +14,7 @@ set -Eeuo pipefail
 #   bash <(curl -fsSL https://raw.githubusercontent.com/Wyrzyy/nodescript/main/remnanode.sh)
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.9"
+SCRIPT_VERSION="2026.7.10"
 
 # Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
 # перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
@@ -138,11 +138,49 @@ ask() {
   printf -v "$varname" '%s' "$_ans"
 }
 
+# Секретный ввод: каждый символ → «•», Backspace работает
 ask_secret() {
-  local prompt="$1" varname="$2" _ans
+  local prompt="$1" varname="$2"
+  local _ans="" _char="" _tty_in="/dev/tty"
+  [[ -r $_tty_in ]] || _tty_in="/dev/stdin"
+
   _tty_printf "  %b%s%b: " "$WHITE" "$prompt" "$NC"
-  _ans=$(_tty_read 1)
+  local _stty_save=""
+  _stty_save=$(stty -g <"$_tty_in" 2>/dev/null || true)
+  stty -echo -icanon min 1 time 0 <"$_tty_in" 2>/dev/null || true
+
+  while true; do
+    _char=""
+    IFS= read -r -n1 -s _char <"$_tty_in" || true
+    # Enter
+    if [[ -z "$_char" || "$_char" == $'\n' || "$_char" == $'\r' ]]; then
+      break
+    fi
+    # Backspace / Delete
+    if [[ "$_char" == $'\x7f' || "$_char" == $'\b' ]]; then
+      if [[ -n "$_ans" ]]; then
+        _ans="${_ans%?}"
+        _tty_printf '\b \b'
+      fi
+      continue
+    fi
+    # Ctrl-C
+    if [[ "$_char" == $'\x03' ]]; then
+      [[ -n "$_stty_save" ]] && stty "$_stty_save" <"$_tty_in" 2>/dev/null || true
+      _tty_echo ""
+      err "Ввод прерван"
+    fi
+    _ans+="$_char"
+    _tty_printf '•'
+  done
+
+  [[ -n "$_stty_save" ]] && stty "$_stty_save" <"$_tty_in" 2>/dev/null || stty sane <"$_tty_in" 2>/dev/null || true
   _tty_echo ""
+  if [[ -n "$_ans" ]]; then
+    _tty_printf "  %b👁  Введено символов: %s%b\n" "$GRAY" "${#_ans}" "$NC"
+  else
+    _tty_printf "  %b(пусто)%b\n" "$YELLOW" "$NC"
+  fi
   printf -v "$varname" '%s' "$_ans"
 }
 
@@ -506,8 +544,70 @@ section() {
 ###############################################################################
 # Базовые пакеты (без SWAP/UFW — они отдельными пунктами)
 ###############################################################################
+
+# Убрать битые apt-репозитории (частая причина падения apt update)
+sanitize_apt_repos() {
+  local removed=0 f
+  # Ookla speedtest через packagecloud — часто ломает noble/новые Ubuntu
+  for f in \
+    /etc/apt/sources.list.d/ookla_speedtest-cli.list \
+    /etc/apt/sources.list.d/ookla-speedtest-cli.list \
+    /etc/apt/sources.list.d/packagecloud_ookla_speedtest-cli.list \
+    /etc/apt/sources.list.d/*ookla* \
+    /etc/apt/sources.list.d/*speedtest*
+  do
+    # glob may stay literal if no match
+    [[ -e "$f" ]] || continue
+    rm -f "$f" && removed=1
+  done
+  # На всякий случай — строки packagecloud/ookla в sources.list
+  if [[ -f /etc/apt/sources.list ]] && grep -qE 'packagecloud\.io/ookla|ookla/speedtest' /etc/apt/sources.list 2>/dev/null; then
+    sed -i '/packagecloud\.io\/ookla/d;/ookla\/speedtest/d' /etc/apt/sources.list
+    removed=1
+  fi
+  # Битые list-файлы без Release (мягкая зачистка по логу не нужна — просто убираем известные)
+  if [[ "$removed" -eq 1 ]]; then
+    info "🧹 Удалены проблемные apt-репозитории (Ookla/packagecloud)"
+  fi
+  return 0
+}
+
+apt_update_safe() {
+  sanitize_apt_repos
+  # Первый попытка
+  if apt-get update -qq 2>/tmp/rn-apt-update.err; then
+    return 0
+  fi
+  # Если снова packagecloud/ookla или иной битый source — вычистить и повторить
+  if grep -qE 'packagecloud|ookla|does not have a Release file|NO_PUBKEY' /tmp/rn-apt-update.err 2>/dev/null; then
+    warn "apt update упал из‑за битого репозитория — чищу и повторяю…"
+    cat /tmp/rn-apt-update.err >&3 2>/dev/null || true
+    sanitize_apt_repos
+    # Отключить любые list с packagecloud/ookla
+    grep -rlE 'packagecloud\.io/ookla|ookla/speedtest' /etc/apt/sources.list.d 2>/dev/null \
+      | while read -r f; do rm -f "$f"; done || true
+    apt-get update -qq 2>/tmp/rn-apt-update.err && return 0
+  fi
+  # Последняя попытка: update с продолжением при ошибках отдельных источников (apt 2.x)
+  apt-get update --allow-releaseinfo-change -qq 2>>/tmp/rn-apt-update.err || true
+  # Если всё ещё критично — показать хвост ошибки
+  if ! apt-get update -qq; then
+    warn "apt update завершился с ошибками — смотри /tmp/rn-apt-update.err"
+    return 1
+  fi
+  return 0
+}
+
 ensure_packages() {
-  run_step "Обновление apt" "apt-get update -qq"
+  # Сразу чистим битый Ookla/packagecloud — иначе apt update падает на noble
+  sanitize_apt_repos
+  info "⏳ Обновление apt…"
+  if apt_update_safe; then
+    ok "Обновление apt"
+  else
+    warn "└─ подробности: /tmp/rn-apt-update.err и ${LOG}"
+    err "Ошибка на шаге: Обновление apt"
+  fi
   run_step "Установка пакетов" \
 "apt-get install -y -qq curl wget ca-certificates gnupg lsb-release \
  jq htop iftop ethtool irqbalance dnsutils unzip \
