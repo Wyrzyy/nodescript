@@ -330,19 +330,21 @@ pad_right() {
 }
 
 show_header() {
-  clear
+  if [[ -w /dev/tty ]]; then clear > /dev/tty; else clear; fi
   # Рамка без «центрирования по ${#}» — эмодзи ломают ширину в Termius
-  echo -e "${CYAN}${BOLD}"
-  echo "  ╔══════════════════════════════════════════════════════╗"
-  echo "  ║  🚀 REMNANODE LAUNCHER  v${SCRIPT_VERSION}                     ║"
-  echo "  ║  🛰️  Нода · 🎭 Selfsteal · ⚡ H2 · 🔒 Прокси · 🧪 Тесты ║"
-  echo "  ╚══════════════════════════════════════════════════════╝"
-  echo -e "${NC}"
-  printf "  %b%-12s%b %s\n" "$WHITE" "💻 OS:" "$NC" "$PRETTY_NAME"
-  printf "  %b%-12s%b %s\n" "$WHITE" "🧠 CPU/RAM:" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
-  printf "  %b%-12s%b %b%s%b\n" "$WHITE" "🌐 Public IP:" "$NC" "$CYAN" "$PUBLIC_IP" "$NC"
-  printf "  %b%-12s%b %s\n" "$WHITE" "🏠 Local IP:" "$NC" "${LOCAL_IP:-n/a}"
-  echo
+  {
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔══════════════════════════════════════════════════════╗"
+    echo "  ║  🚀 REMNANODE LAUNCHER  v${SCRIPT_VERSION}                     ║"
+    echo "  ║  🛰️  Нода · 🎭 Selfsteal · ⚡ H2 · 🔒 Прокси · 🧪 Тесты ║"
+    echo "  ╚══════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    printf "  %b%-12s%b %s\n" "$WHITE" "💻 OS:" "$NC" "$PRETTY_NAME"
+    printf "  %b%-12s%b %s\n" "$WHITE" "🧠 CPU/RAM:" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
+    printf "  %b%-12s%b %b%s%b\n" "$WHITE" "🌐 Public IP:" "$NC" "$CYAN" "$PUBLIC_IP" "$NC"
+    printf "  %b%-12s%b %s\n" "$WHITE" "🏠 Local IP:" "$NC" "${LOCAL_IP:-n/a}"
+    echo
+  } | { if [[ -w /dev/tty ]]; then cat > /dev/tty; else cat; fi; }
 }
 
 # Статус без паддинга: [текст]
