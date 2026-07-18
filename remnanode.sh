@@ -4,10 +4,10 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.5
+# Версия: 2026.7.6
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.5"
+SCRIPT_VERSION="2026.7.6"
 APP="remnanode"
 DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
@@ -38,12 +38,12 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; BOLD='\033[1m'
 DIM='\033[2m'; NC='\033[0m'
 
-ok()   { echo -e "${GREEN}✔ ${1}${NC}"; }
-info() { echo -e "${BLUE}ℹ ${1}${NC}"; }
-warn() { echo -e "${YELLOW}⚠ ${1}${NC}"; }
+ok()   { echo -e "${GREEN}✅ ${1}${NC}"; }
+info() { echo -e "${BLUE}ℹ️  ${1}${NC}"; }
+warn() { echo -e "${YELLOW}⚠️  ${1}${NC}"; }
 err()  {
-  echo -e "${RED}✖ ${1}${NC}"
-  echo -e "${GRAY}── последние строки лога ──${NC}"
+  echo -e "${RED}❌ ${1}${NC}"
+  echo -e "${GRAY}── 📋 последние строки лога ──${NC}"
   tail -n 30 "$LOG" 2>/dev/null || true
   exit 1
 }
@@ -53,7 +53,7 @@ mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 exec 3>>"$LOG" 2>/dev/null || exec 3>/dev/null
 
 hline() { echo -e "${GRAY}$(printf '─%.0s' $(seq 1 "${1:-56}"))${NC}"; }
-pause() { read -rp $'\nНажмите Enter для продолжения...' _; }
+pause() { read -rp $'\n⏎  Нажмите Enter для продолжения...' _; }
 
 spin() {
   local pid=$1 msg=$2
@@ -213,24 +213,24 @@ pad_right() {
 
 show_header() {
   clear
-  local line1="REMNANODE LAUNCHER  v${SCRIPT_VERSION}"
-  local line2="Нода · Selfsteal · Hysteria2 · Прокси · Тесты"
-  local w=52
+  local line1="🚀 REMNANODE LAUNCHER  v${SCRIPT_VERSION}"
+  local line2="🛰️ Нода · 🎭 Selfsteal · ⚡ H2 · 🔒 Прокси · 🧪 Тесты"
+  local w=56
   local pad1=$(( (w - ${#line1}) / 2 ))
   local pad2=$(( (w - ${#line2}) / 2 ))
   (( pad1 < 0 )) && pad1=0
   (( pad2 < 0 )) && pad2=0
 
   echo -e "${CYAN}${BOLD}"
-  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ╔════════════════════════════════════════════════════════╗"
   printf "  ║%*s%s%*s║\n" "$pad1" "" "$line1" "$((w - pad1 - ${#line1}))" ""
   printf "  ║%*s%s%*s║\n" "$pad2" "" "$line2" "$((w - pad2 - ${#line2}))" ""
-  echo "  ╚════════════════════════════════════════════════════╝"
+  echo "  ╚════════════════════════════════════════════════════════╝"
   echo -e "${NC}"
-  printf "  %b%-10s%b %s\n" "$WHITE" "OS:" "$NC" "$PRETTY_NAME"
-  printf "  %b%-10s%b %s\n" "$WHITE" "CPU/RAM:" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
-  printf "  %b%-10s%b %b%s%b\n" "$WHITE" "Public IP:" "$NC" "$CYAN" "$PUBLIC_IP" "$NC"
-  printf "  %b%-10s%b %s\n" "$WHITE" "Local IP:" "$NC" "${LOCAL_IP:-n/a}"
+  printf "  %b%-10s%b %s\n" "$WHITE" "💻 OS:" "$NC" "$PRETTY_NAME"
+  printf "  %b%-10s%b %s\n" "$WHITE" "🧠 CPU/RAM:" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
+  printf "  %b%-10s%b %b%s%b\n" "$WHITE" "🌐 Public:" "$NC" "$CYAN" "$PUBLIC_IP" "$NC"
+  printf "  %b%-10s%b %s\n" "$WHITE" "🏠 Local:" "$NC" "${LOCAL_IP:-n/a}"
 }
 
 # Статус: всегда [xxxxxx] — 6 символов внутри
@@ -316,17 +316,16 @@ service_badge_color() {
   esac
 }
 
-# Колонки:  NN)  TITLE........  DESC................  [STATUS]
-#            4    12             20                     8
+# Колонки:  😀 NN)  TITLE........  DESC................  [STATUS]
 menu_item() {
-  local num="$1" title="$2" desc="$3" badge="${4:-}"
+  local icon="$1" num="$2" title="$3" desc="$4" badge="${5:-}"
   local num_s title_s desc_s
 
   num_s=$(pad_right "${num})" 4)
   title_s=$(pad_right "$title" 12)
   desc_s=$(pad_right "$desc" 20)
 
-  printf '  %b%s%b %s  %b%s%b' "$WHITE" "$num_s" "$NC" "$title_s" "$GRAY" "$desc_s" "$NC"
+  printf '  %s %b%s%b %s  %b%s%b' "$icon" "$WHITE" "$num_s" "$NC" "$title_s" "$GRAY" "$desc_s" "$NC"
   if [[ -n "$badge" ]]; then
     printf '  '
     service_badge_color "$badge"
@@ -355,7 +354,7 @@ ensure_packages() {
 # Тюнинг производительности ноды (актуально на 2026)
 ###############################################################################
 apply_performance_tuning() {
-  info "Применяем тюнинг производительности VPN-ноды (BBR / буферы / RPS)"
+  info "⚙️  Применяем тюнинг производительности VPN-ноды (BBR / буферы / RPS)"
 
   run_step "Swappiness" \
 "bash -c 'cat > /etc/sysctl.d/98-swap.conf <<EOF
@@ -565,7 +564,7 @@ install_self_cli() {
   fi
   ln -sfn "$LAUNCHER_PATH" "$CLI_PATH"
   chmod +x "$CLI_PATH" 2>/dev/null || true
-  ok "Команда управления: ${CYAN}remnanode${NC}"
+  ok "📡 Команда управления: ${CYAN}remnanode${NC}"
 }
 
 ###############################################################################
@@ -597,11 +596,11 @@ remove_existing_remnanode() {
 
 install_remnanode() {
   show_header
-  echo -e "${WHITE}${BOLD}  Установка Remnanode${NC}"
+  echo -e "${WHITE}${BOLD}  🚀 Установка Remnanode${NC}"
   hline 56
   echo
-  info "Стабильная установка ноды Remnawave (без сторонних «тяжёлых» установщиков)."
-  info "UFW / SWAP — отдельные пункты меню и не ставятся вместе с нодой."
+  info "🚀 Стабильная установка ноды Remnawave (без сторонних «тяжёлых» установщиков)."
+  info "🛡️  UFW / 💾 SWAP — отдельные пункты меню и не ставятся вместе с нодой."
   echo
 
   if is_remnanode_installed; then
@@ -620,7 +619,7 @@ install_remnanode() {
   XTLS_API_PORT=${XTLS_API_PORT:-61000}
 
   echo
-  info "SECRET_KEY скопируйте из панели Remnawave → Nodes → Create"
+  info "🔑 SECRET_KEY скопируйте из панели Remnawave → Nodes → Create"
   local K1 K2
   while true; do
     read -rsp "  SECRET_KEY: " K1; echo
@@ -629,7 +628,7 @@ install_remnanode() {
     [[ "$K1" != "$K2" ]] && { warn "Не совпадает"; continue; }
     break
   done
-  ok "Ключ принят (${#K1} символов)"
+  ok "🔑 Ключ принят (${#K1} символов)"
 
   ensure_packages
   apply_performance_tuning
@@ -695,7 +694,7 @@ EOF
   echo
   echo -e "${GREEN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║           ✔  REMNANODE УСТАНОВЛЕН                  ║"
+  echo "  ║        ✅  REMNANODE УСТАНОВЛЕН                   ║"
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
   echo -e "  Public IP:     ${CYAN}${PUBLIC_IP}${NC}"
@@ -704,7 +703,7 @@ EOF
   echo -e "  XTLS_API:      ${XTLS_API_PORT}"
   echo -e "  Управление:    ${CYAN}remnanode${NC}"
   echo
-  echo -e "  ${YELLOW}Рекомендуется отдельно:${NC}"
+  echo -e "  ${YELLOW}💡 Рекомендуется отдельно:${NC}"
   echo -e "    • пункт меню «Защита UFW» — ограничить NODE_PORT только IP панели"
   echo -e "    • пункт «SWAP» — если мало RAM"
   echo -e "    • «Hysteria2» — если нужен UDP-протокол"
@@ -716,10 +715,10 @@ EOF
 ###############################################################################
 install_selfsteal() {
   show_header
-  echo -e "${WHITE}${BOLD}  Установка Selfsteal (Reality-маскировка)${NC}"
+  echo -e "${WHITE}${BOLD}  🎭 Установка Selfsteal (Reality-маскировка)${NC}"
   hline 56
   echo
-  info "Официальный установщик DigneZzZ (Caddy / Nginx)."
+  info "🎭 Официальный установщик DigneZzZ (Caddy / Nginx)."
   echo -e "  ${GRAY}Источник: github.com/DigneZzZ/remnawave-scripts${NC}"
   echo
 
@@ -729,9 +728,9 @@ install_selfsteal() {
     install_docker
   fi
 
-  echo -e "  ${WHITE}Веб-сервер:${NC}"
-  echo -e "    ${WHITE}1)${NC} Caddy   ${GRAY}(проще, авто-SSL)${NC}"
-  echo -e "    ${WHITE}2)${NC} Nginx   ${GRAY}(Unix socket + acme.sh)${NC}"
+  echo -e "  ${WHITE}🌐 Веб-сервер:${NC}"
+  echo -e "    ${WHITE}1)${NC} 🟩 Caddy   ${GRAY}(проще, авто-SSL)${NC}"
+  echo -e "    ${WHITE}2)${NC} 🟧 Nginx   ${GRAY}(Unix socket + acme.sh)${NC}"
   echo
   read -rp "  Выбор [1]: " ws_choice
   ws_choice=${ws_choice:-1}
@@ -755,7 +754,7 @@ install_selfsteal() {
     echo
     echo -e "${GREEN}${BOLD}"
     echo "  ╔════════════════════════════════════════════════════╗"
-    echo "  ║           ✔  SELFSTEAL УСТАНОВЛЕН                  ║"
+    echo "  ║        ✅  SELFSTEAL УСТАНОВЛЕН                   ║"
     echo "  ╚════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo -e "  Управление:  ${CYAN}selfsteal${NC}"
@@ -772,13 +771,13 @@ install_selfsteal() {
 ###############################################################################
 install_hysteria2() {
   show_header
-  echo -e "${WHITE}${BOLD}  Автонастройка Hysteria2${NC}"
+  echo -e "${WHITE}${BOLD}  ⚡ Автонастройка Hysteria2${NC}"
   hline 56
   echo
   info "Скрипт Origamidnd/h2-script: certbot, сертификаты, volume в remnanode, BBR."
   echo -e "  ${GRAY}https://github.com/Origamidnd/h2-script${NC}"
   echo
-  warn "Нода Remnanode уже должна быть установлена."
+  warn "⚠️  Нода Remnanode уже должна быть установлена."
   echo
 
   if ! is_remnanode_installed; then
@@ -799,7 +798,7 @@ install_hysteria2() {
   if [[ $rc -eq 0 ]]; then
     ok "Hysteria2 настроен"
     echo
-    echo -e "  ${WHITE}Дополнительно:${NC}"
+    echo -e "  ${WHITE}✨ Дополнительно:${NC}"
     echo -e "    • Привяжите Hysteria2 config profile в панели Remnawave"
     echo -e "    • Порт 80/tcp нужен только для ACME — можно закрыть после выпуска"
     echo
@@ -816,20 +815,20 @@ install_hysteria2() {
 ###############################################################################
 fix_hysteria2_online() {
   show_header
-  echo -e "${WHITE}${BOLD}  Фикс онлайна Hysteria2 (custom Xray)${NC}"
+  echo -e "${WHITE}${BOLD}  🔧 Фикс онлайна Hysteria2 (custom Xray)${NC}"
   hline 56
   echo
   echo -e "  ${GRAY}Проблема:${NC} с ядром ~26.3.27 Remna не видит онлайн и не считает трафик."
   echo -e "  ${GRAY}Решение:${NC}  прокинуть более новое ядро Xray в контейнер ноды."
   echo
-  echo -e "  ${CYAN}Способ описал @markrouting — благодарите его.${NC}"
+  echo -e "  ${CYAN}🙏 Способ описал @markrouting — благодарите его.${NC}"
   echo
-  echo -e "  ${WHITE}1)${NC} Применить патч (скачать Xray ${XRAY_VERSION_DEFAULT} и смонтировать)"
-  echo -e "  ${WHITE}2)${NC} Откатить патч (убрать volume, вернуть штатное ядро)"
-  echo -e "  ${WHITE}3)${NC} Проверить версию Xray в контейнере"
-  echo -e "  ${GRAY}0)${NC} Назад"
+  echo -e "  ${WHITE}1)${NC} ✅ Применить патч (скачать Xray ${XRAY_VERSION_DEFAULT} и смонтировать)"
+  echo -e "  ${WHITE}2)${NC} ↩️  Откатить патч (убрать volume, вернуть штатное ядро)"
+  echo -e "  ${WHITE}3)${NC} 🔍 Проверить версию Xray в контейнере"
+  echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  → " ch
+  read -rp "  👉 " ch
 
   case "$ch" in
     1) apply_custom_xray_patch ;;
@@ -913,7 +912,7 @@ PY
   info "Версия Xray в контейнере:"
   docker exec remnanode xray version 2>/dev/null || warn "Проверьте вручную: docker exec -it remnanode xray version"
   echo
-  ok "Патч применён. Если не помогло — откатите через пункт 2."
+  ok "✅ Патч применён. Если не помогло — откатите через пункт 2."
 }
 
 rollback_custom_xray_patch() {
@@ -936,7 +935,7 @@ rollback_custom_xray_patch() {
 ###############################################################################
 install_warp() {
   show_header
-  echo -e "${WHITE}${BOLD}  Cloudflare WARP (SOCKS5)${NC}"
+  echo -e "${WHITE}${BOLD}  ☁️  Cloudflare WARP (SOCKS5)${NC}"
   hline 56
   echo
   info "Исходящий IP Cloudflare — outbound в XRay для ChatGPT / Spotify и т.п."
@@ -1031,7 +1030,7 @@ SYSTEMD
   echo
   echo -e "${GREEN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║           ✔  WARP УСТАНОВЛЕН                       ║"
+  echo "  ║        ✅  WARP УСТАНОВЛЕН                        ║"
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
   echo -e "  SOCKS5:  ${CYAN}127.0.0.1:${WARP_PORT}${NC}"
@@ -1045,19 +1044,19 @@ SYSTEMD
 ###############################################################################
 install_mtproto() {
   show_header
-  echo -e "${WHITE}${BOLD}  Прокси Telegram (mtproto.zig)${NC}"
+  echo -e "${WHITE}${BOLD}  ✈️  Прокси Telegram (mtproto.zig)${NC}"
   hline 56
   echo
   info "Лёгкий MTProto-прокси со маскировкой под HTTPS (TLS 1.3)."
   echo -e "  ${GRAY}https://github.com/sleep3r/mtproto.zig${NC}"
   echo
-  echo -e "  ${WHITE}1)${NC} Установить mtbuddy (bootstrap) и запустить мастер"
-  echo -e "  ${WHITE}2)${NC} Быстрая установка (порт / домен)"
-  echo -e "  ${WHITE}3)${NC} Управление: mtbuddy --interactive"
-  echo -e "  ${WHITE}4)${NC} Статус сервиса"
-  echo -e "  ${GRAY}0)${NC} Назад"
+  echo -e "  ${WHITE}1)${NC} 📦 Установить mtbuddy (bootstrap) и запустить мастер"
+  echo -e "  ${WHITE}2)${NC} ⚡ Быстрая установка (порт / домен)"
+  echo -e "  ${WHITE}3)${NC} 🎛️  Управление: mtbuddy --interactive"
+  echo -e "  ${WHITE}4)${NC} 📌 Статус сервиса"
+  echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  → " ch
+  read -rp "  👉 " ch
 
   case "$ch" in
     1)
@@ -1106,10 +1105,10 @@ install_mtproto() {
 ###############################################################################
 setup_swap() {
   show_header
-  echo -e "${WHITE}${BOLD}  Управление SWAP${NC}"
+  echo -e "${WHITE}${BOLD}  💾 Управление SWAP${NC}"
   hline 56
   echo
-  echo -e "  ${WHITE}Текущее состояние:${NC}"
+  echo -e "  ${WHITE}📊 Текущее состояние:${NC}"
   free -h | sed 's/^/    /'
   echo
   if [[ -f /swapfile ]]; then
@@ -1121,15 +1120,15 @@ setup_swap() {
     echo -e "  Файл ${GRAY}/swapfile${NC}: не создан"
   fi
   echo
-  echo -e "  ${WHITE}1)${NC} Создать / включить SWAP 1 ГБ  ${GRAY}(рекомендуется)${NC}"
-  echo -e "  ${WHITE}2)${NC} Создать / включить SWAP 2 ГБ"
-  echo -e "  ${WHITE}3)${NC} Создать / включить SWAP 4 ГБ"
-  echo -e "  ${WHITE}4)${NC} Свой размер (ГБ)"
-  echo -e "  ${WHITE}5)${NC} Отключить и удалить /swapfile"
-  echo -e "  ${WHITE}6)${NC} Показать free -h"
-  echo -e "  ${GRAY}0)${NC} Назад"
+  echo -e "  ${WHITE}1)${NC} 💾 Создать / включить SWAP 1 ГБ  ${GRAY}(рекомендуется)${NC}"
+  echo -e "  ${WHITE}2)${NC} 💾 Создать / включить SWAP 2 ГБ"
+  echo -e "  ${WHITE}3)${NC} 💾 Создать / включить SWAP 4 ГБ"
+  echo -e "  ${WHITE}4)${NC} ✏️  Свой размер (ГБ)"
+  echo -e "  ${WHITE}5)${NC} 🗑️  Отключить и удалить /swapfile"
+  echo -e "  ${WHITE}6)${NC} 📊 Показать free -h"
+  echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  → " ch
+  read -rp "  👉 " ch
 
   local size_gb=""
   case "$ch" in
@@ -1173,7 +1172,7 @@ EOF
   sysctl -p /etc/sysctl.d/98-swap.conf >/dev/null 2>&1 || true
 
   echo
-  ok "SWAP ${size_gb}G активен"
+  ok "💾 SWAP ${size_gb}G активен"
   echo
   free -h
   echo
@@ -1185,7 +1184,7 @@ EOF
 ###############################################################################
 setup_ufw() {
   show_header
-  echo -e "${WHITE}${BOLD}  Защита UFW и порты${NC}"
+  echo -e "${WHITE}${BOLD}  🛡️  Защита UFW и порты${NC}"
   hline 56
   echo
   info "Настраивается отдельно от установки ноды — по желанию."
@@ -1200,16 +1199,16 @@ setup_ufw() {
   ssh_port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -1)
   ssh_port=${ssh_port:-22}
 
-  echo -e "  ${WHITE}1)${NC} Быстрая защита ноды (SSH + NODE_PORT только с панели + 443)"
-  echo -e "  ${WHITE}2)${NC} Мастер настройки портов"
-  echo -e "  ${WHITE}3)${NC} Открыть порт"
-  echo -e "  ${WHITE}4)${NC} Закрыть порт"
-  echo -e "  ${WHITE}5)${NC} Статус UFW"
-  echo -e "  ${WHITE}6)${NC} Отключить UFW"
-  echo -e "  ${WHITE}7)${NC} Fail2Ban (базовый jail для SSH)"
-  echo -e "  ${GRAY}0)${NC} Назад"
+  echo -e "  ${WHITE}1)${NC} 🛡️  Быстрая защита ноды (SSH + NODE_PORT с панели + 443)"
+  echo -e "  ${WHITE}2)${NC} 🧙 Мастер настройки портов"
+  echo -e "  ${WHITE}3)${NC} 🔓 Открыть порт"
+  echo -e "  ${WHITE}4)${NC} 🔒 Закрыть порт"
+  echo -e "  ${WHITE}5)${NC} 📋 Статус UFW"
+  echo -e "  ${WHITE}6)${NC} ⛔ Отключить UFW"
+  echo -e "  ${WHITE}7)${NC} 🚨 Fail2Ban (базовый jail для SSH)"
+  echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  → " ch
+  read -rp "  👉 " ch
 
   case "$ch" in
     1)
@@ -1236,7 +1235,7 @@ setup_ufw() {
         ufw allow 80/tcp comment 'ACME/HTTP'
       fi
       ufw --force enable
-      ok "UFW включён"
+      ok "🛡️  UFW включён"
       ufw status numbered
       echo "$panel_ip" > "$DIR/.panel_ip" 2>/dev/null || true
       echo "$node_port" > "$DIR/.node_port" 2>/dev/null || true
@@ -1363,7 +1362,7 @@ run_latency_test() {
   clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║              ЗАДЕРЖКА / PING                       ║"
+  echo "  ║              📶 ЗАДЕРЖКА / PING                    ║"
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
@@ -1384,7 +1383,7 @@ run_dns_test() {
   clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║                   DNS ТЕСТ                         ║"
+  echo "  ║                  🧭 DNS ТЕСТ                       ║"
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
@@ -1423,7 +1422,7 @@ run_ip_info_test() {
   clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║                 ИНФО ОБ IP                         ║"
+  echo "  ║                 🌐 ИНФО ОБ IP                      ║"
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
@@ -1461,7 +1460,7 @@ run_system_bench() {
   clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║              СИСТЕМА / CPU BENCH                   ║"
+  echo "  ║              🖥️  СИСТЕМА / CPU BENCH               ║"
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
@@ -1495,7 +1494,7 @@ run_ports_check() {
   clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║            СЛУШАЮЩИЕ ПОРТЫ / СЕРВИСЫ               ║"
+  echo "  ║            🔌 СЛУШАЮЩИЕ ПОРТЫ / СЕРВИСЫ            ║"
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
@@ -1511,17 +1510,17 @@ run_speedtest_menu() {
   clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║                   SPEEDTEST                        ║"
+  echo "  ║                 🚀 SPEEDTEST                       ║"
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
-  echo -e "  ${WHITE}1)${NC} Ookla Speedtest          ${GRAY}(полный тест)${NC}"
-  echo -e "  ${WHITE}2)${NC} Ookla — только ping/jitter"
-  echo -e "  ${WHITE}3)${NC} Свой тест скачивания     ${GRAY}(curl, без Ookla)${NC}"
-  echo -e "  ${WHITE}4)${NC} Комплекс: Ookla + ping + замер времени"
-  echo -e "  ${GRAY}0)${NC} Назад"
+  echo -e "  ${WHITE}1)${NC} 🚀 Ookla Speedtest       ${GRAY}(полный тест)${NC}"
+  echo -e "  ${WHITE}2)${NC} 📶 Ookla — только ping/jitter"
+  echo -e "  ${WHITE}3)${NC} 📥 Свой тест скачивания  ${GRAY}(curl, без Ookla)${NC}"
+  echo -e "  ${WHITE}4)${NC} 📊 Комплекс: Ookla + ping + замер времени"
+  echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  → " ch
+  read -rp "  👉 " ch
 
   local t0 t1
   case "$ch" in
@@ -1549,7 +1548,7 @@ run_speedtest_menu() {
       ;;
     3)
       echo
-      info "Замер download через несколько CDN…"
+      info "📥 Замер download через несколько CDN…"
       echo
       t0=$(date +%s.%N)
       run_curl_speed_test "Cloudflare 10 МБ" "https://speed.cloudflare.com/__down?bytes=10000000"
@@ -1587,20 +1586,20 @@ tests_menu() {
     clear
     echo -e "${CYAN}${BOLD}"
     echo "  ╔════════════════════════════════════════════════════╗"
-    echo "  ║                      ТЕСТЫ                         ║"
+    echo "  ║                     🧪 ТЕСТЫ                       ║"
     echo "  ╚════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    echo -e "  ${WHITE}1)${NC} Speedtest              ${GRAY}— Ookla / свой curl-тест${NC}"
-    echo -e "  ${WHITE}2)${NC} Задержка (ping)"
-    echo -e "  ${WHITE}3)${NC} DNS"
-    echo -e "  ${WHITE}4)${NC} Информация об IP"
-    echo -e "  ${WHITE}5)${NC} Система / CPU / диск"
-    echo -e "  ${WHITE}6)${NC} Порты и контейнеры"
-    echo -e "  ${WHITE}7)${NC} Полный прогон          ${GRAY}— 1→6 подряд${NC}"
+    echo -e "  ${WHITE}1)${NC} 🚀 Speedtest           ${GRAY}— Ookla / свой curl-тест${NC}"
+    echo -e "  ${WHITE}2)${NC} 📶 Задержка (ping)"
+    echo -e "  ${WHITE}3)${NC} 🧭 DNS"
+    echo -e "  ${WHITE}4)${NC} 🌐 Информация об IP"
+    echo -e "  ${WHITE}5)${NC} 🖥️  Система / CPU / диск"
+    echo -e "  ${WHITE}6)${NC} 🔌 Порты и контейнеры"
+    echo -e "  ${WHITE}7)${NC} 🏁 Полный прогон       ${GRAY}— 1→6 подряд${NC}"
     echo
-    echo -e "  ${GRAY}0)${NC} Назад"
+    echo -e "  ${GRAY}0)${NC} 🔙 Назад"
     echo
-    read -rp "  → " choice
+    read -rp "  👉 " choice
 
     case "$choice" in
       1) run_speedtest_menu; pause ;;
@@ -1616,7 +1615,7 @@ tests_menu() {
         run_speedtest_menu
         run_system_bench
         run_ports_check
-        ok "Полный прогон завершён"
+        ok "🏁 Полный прогон завершён"
         pause
         ;;
       0) return 0 ;;
@@ -1631,18 +1630,18 @@ tests_menu() {
 system_menu() {
   while true; do
     show_header
-    echo -e "${WHITE}${BOLD}  Система и защита${NC}"
+    echo -e "${WHITE}${BOLD}  🛠️  Система и защита${NC}"
     hline 56
     echo -e "  SWAP:  $(service_badge swap)"
     echo -e "  UFW:   $(service_badge ufw)"
     echo
-    echo -e "  ${WHITE}1)${NC} SWAP — создать / удалить"
-    echo -e "  ${WHITE}2)${NC} UFW и порты"
-    echo -e "  ${WHITE}3)${NC} Тюнинг производительности (BBR, буферы, RPS)"
-    echo -e "  ${WHITE}4)${NC} Только базовые пакеты"
-    echo -e "  ${GRAY}0)${NC} Назад"
+    echo -e "  ${WHITE}1)${NC} 💾 SWAP — создать / удалить"
+    echo -e "  ${WHITE}2)${NC} 🛡️  UFW и порты"
+    echo -e "  ${WHITE}3)${NC} ⚙️  Тюнинг производительности (BBR, буферы, RPS)"
+    echo -e "  ${WHITE}4)${NC} 📦 Только базовые пакеты"
+    echo -e "  ${GRAY}0)${NC} 🔙 Назад"
     echo
-    read -rp "  → " ch
+    read -rp "  👉 " ch
     case "$ch" in
       1) setup_swap; pause ;;
       2) setup_ufw; pause ;;
@@ -1659,7 +1658,7 @@ system_menu() {
 ###############################################################################
 node_status_screen() {
   clear
-  echo -e "${WHITE}${BOLD}  RemnaNode — управление${NC}  ${GRAY}v${SCRIPT_VERSION}${NC}"
+  echo -e "${WHITE}${BOLD}  📡 RemnaNode — управление${NC}  ${GRAY}v${SCRIPT_VERSION}${NC}"
   hline 56
   echo
 
@@ -1667,14 +1666,14 @@ node_status_screen() {
     local node_port node_ver xray_ver
     node_port=$(grep -E '^NODE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)
     node_port=${node_port:-3000}
-    echo -e "  ${GREEN}✔ Статус ноды: РАБОТАЕТ${NC}"
+    echo -e "  ${GREEN}✅ Статус ноды: РАБОТАЕТ${NC}"
     echo
-    echo -e "  ${WHITE}Подключение:${NC}"
+    echo -e "  ${WHITE}🌐 Подключение:${NC}"
     printf "     %-14s ${CYAN}%s${NC}\n" "IP:" "$PUBLIC_IP"
     printf "     %-14s ${CYAN}%s${NC}\n" "Порт:" "$node_port"
     printf "     %-14s ${CYAN}%s:%s${NC}\n" "URL:" "$PUBLIC_IP" "$node_port"
     echo
-    echo -e "  ${WHITE}Компоненты:${NC}"
+    echo -e "  ${WHITE}🧩 Компоненты:${NC}"
     node_ver=$(docker inspect --format '{{.Config.Image}}' remnanode 2>/dev/null || echo "?")
     printf "     %-14s %s\n" "Образ:" "$node_ver"
     xray_ver=$(docker exec remnanode xray version 2>/dev/null | head -1 || echo "н/д")
@@ -1683,13 +1682,13 @@ node_status_screen() {
       echo -e "     ${YELLOW}custom Xray смонтирован (фикс онлайна)${NC}"
     fi
     echo
-    echo -e "  ${WHITE}Ресурсы:${NC}"
+    echo -e "  ${WHITE}💾 Ресурсы:${NC}"
     local cstats
     cstats=$(docker stats --no-stream --format '{{.CPUPerc}} | {{.MemUsage}}' remnanode 2>/dev/null || echo "n/a")
     printf "     %-14s %s\n" "Контейнер:" "$cstats"
     printf "     %-14s %s\n" "RAM хоста:" "$(free -h | awk '/^Mem:/ {printf "%s / %s", $3, $2}')"
   elif is_remnanode_installed; then
-    echo -e "  ${RED}✖ Статус ноды: ОСТАНОВЛЕНА${NC}"
+    echo -e "  ${RED}❌ Статус ноды: ОСТАНОВЛЕНА${NC}"
     echo -e "  ${GRAY}Используйте пункт 2 для запуска${NC}"
   else
     echo -e "  ${GRAY}📦 Статус: НЕ УСТАНОВЛЕНА${NC}"
@@ -1706,36 +1705,36 @@ remnanode_menu() {
     PUBLIC_IP=$(get_public_ip)
     node_status_screen
 
-    echo -e "  ${WHITE}Установка и управление:${NC}"
-    echo -e "    ${WHITE} 1)${NC} Установить RemnaNode"
-    echo -e "    ${WHITE} 2)${NC} Запустить"
-    echo -e "    ${WHITE} 3)${NC} Остановить"
-    echo -e "    ${WHITE} 4)${NC} Перезапустить"
-    echo -e "    ${WHITE} 5)${NC} Удалить RemnaNode"
+    echo -e "  ${WHITE}🛠️  Установка и управление:${NC}"
+    echo -e "    ${WHITE} 1)${NC} 🚀 Установить RemnaNode"
+    echo -e "    ${WHITE} 2)${NC} ▶️  Запустить"
+    echo -e "    ${WHITE} 3)${NC} ⏹️  Остановить"
+    echo -e "    ${WHITE} 4)${NC} 🔄 Перезапустить"
+    echo -e "    ${WHITE} 5)${NC} 🗑️  Удалить RemnaNode"
     echo
-    echo -e "  ${WHITE}Мониторинг и логи:${NC}"
-    echo -e "    ${WHITE} 6)${NC} Статус (docker ps / compose)"
-    echo -e "    ${WHITE} 7)${NC} Логи контейнера"
-    echo -e "    ${WHITE} 8)${NC} Docker stats"
-    echo -e "    ${WHITE} 9)${NC} LIVE-мониторинг"
+    echo -e "  ${WHITE}📊 Мониторинг и логи:${NC}"
+    echo -e "    ${WHITE} 6)${NC} 📌 Статус (docker ps / compose)"
+    echo -e "    ${WHITE} 7)${NC} 📋 Логи контейнера"
+    echo -e "    ${WHITE} 8)${NC} 📈 Docker stats"
+    echo -e "    ${WHITE} 9)${NC} 📺 LIVE-мониторинг"
     echo
-    echo -e "  ${WHITE}Обновления и конфигурация:${NC}"
-    echo -e "    ${WHITE}10)${NC} Обновить образ RemnaNode"
-    echo -e "    ${WHITE}11)${NC} Фикс онлайна Hysteria2 / custom Xray"
-    echo -e "    ${WHITE}12)${NC} Редактировать docker-compose.yml"
-    echo -e "    ${WHITE}13)${NC} Редактировать .env"
-    echo -e "    ${WHITE}14)${NC} Показать порты"
-    echo -e "    ${WHITE}15)${NC} Тюнинг производительности"
+    echo -e "  ${WHITE}⚙️  Обновления и конфигурация:${NC}"
+    echo -e "    ${WHITE}10)${NC} ⬆️  Обновить образ RemnaNode"
+    echo -e "    ${WHITE}11)${NC} 🔧 Фикс онлайна Hysteria2 / custom Xray"
+    echo -e "    ${WHITE}12)${NC} 📝 Редактировать docker-compose.yml"
+    echo -e "    ${WHITE}13)${NC} 🔐 Редактировать .env"
+    echo -e "    ${WHITE}14)${NC} 🔌 Показать порты"
+    echo -e "    ${WHITE}15)${NC} ⚙️  Тюнинг производительности"
     echo
-    echo -e "  ${WHITE}Дополнительно:${NC}"
-    echo -e "    ${WHITE}16)${NC} Настройка Hysteria2"
-    echo -e "    ${WHITE}17)${NC} Selfsteal"
-    echo -e "    ${WHITE}18)${NC} Открыть главное меню лаунчера"
+    echo -e "  ${WHITE}✨ Дополнительно:${NC}"
+    echo -e "    ${WHITE}16)${NC} ⚡ Настройка Hysteria2"
+    echo -e "    ${WHITE}17)${NC} 🎭 Selfsteal"
+    echo -e "    ${WHITE}18)${NC} 🏠 Открыть главное меню лаунчера"
     echo
     hline 56
-    echo -e "    ${GRAY}0)${NC} Выход"
+    echo -e "    ${GRAY}0)${NC} 🚪 Выход"
     echo
-    read -rp "  Выберите пункт [0-18]: " choice
+    read -rp "  👉 Выберите пункт [0-18]: " choice
 
     case "$choice" in
       1) install_remnanode; pause ;;
@@ -1824,7 +1823,7 @@ live_panel() {
   trap 'return 0' INT
   while true; do
     clear
-    echo -e "${BLUE}${BOLD}  LIVE PANEL${NC}  ${GRAY}(Ctrl+C — в меню)${NC}"
+    echo -e "${BLUE}${BOLD}  📺 LIVE PANEL${NC}  ${GRAY}(Ctrl+C — в меню)${NC}"
     hline 56
     UPTIME=$(uptime -p 2>/dev/null | sed 's/^up //')
     LOAD=$(awk '{print $1", "$2", "$3}' /proc/loadavg)
@@ -1848,13 +1847,13 @@ live_panel() {
     fi
 
     echo
-    echo -e "${YELLOW}── Соединения ──${NC}"
+    echo -e "${YELLOW}── 🔗 Соединения ──${NC}"
     TOTAL=$(ss -ntu 2>/dev/null | tail -n +2 | wc -l)
     EST=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)
     printf "  Total: %s | Established: %s\n" "$TOTAL" "$EST"
 
     echo
-    echo -e "${YELLOW}── TOP IP ──${NC}"
+    echo -e "${YELLOW}── 🏆 TOP IP ──${NC}"
     ss -tn state established 2>/dev/null \
       | awk 'NR>1 {split($5,a,":"); print a[1]}' \
       | sort | uniq -c | sort -nr | head -8 \
@@ -1887,26 +1886,26 @@ main_menu() {
     PUBLIC_IP=$(get_public_ip)
     show_header
 
-    section "Установка"
-    menu_item "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
-    menu_item "2"  "Selfsteal"  "маскировка Reality" selfsteal
-    menu_item "3"  "Hysteria2"  "автонастройка"      hysteria
-    menu_item "4"  "Фикс H2"    "custom Xray"        xrayfix
-    menu_item "5"  "WARP"       "Cloudflare SOCKS5"  warp
-    menu_item "6"  "MTProto"    "прокси Telegram"    mtproto
+    section "📦 Установка"
+    menu_item "🚀" "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
+    menu_item "🎭" "2"  "Selfsteal"  "маскировка Reality" selfsteal
+    menu_item "⚡" "3"  "Hysteria2"  "автонастройка"      hysteria
+    menu_item "🔧" "4"  "Фикс H2"    "custom Xray"        xrayfix
+    menu_item "☁️ " "5"  "WARP"       "Cloudflare SOCKS5"  warp
+    menu_item "✈️ " "6"  "MTProto"    "прокси Telegram"    mtproto
 
-    section "Система"
-    menu_item "7"  "SWAP"       "файл подкачки"      swap
-    menu_item "8"  "UFW"        "порты и защита"     ufw
-    menu_item "9"  "Тюнинг"     "BBR / буферы / RPS" tune
+    section "🛠️  Система"
+    menu_item "💾" "7"  "SWAP"       "файл подкачки"      swap
+    menu_item "🛡️ " "8"  "UFW"        "порты и защита"     ufw
+    menu_item "⚙️ " "9"  "Тюнинг"     "BBR / буферы / RPS" tune
 
-    section "Сервис"
-    menu_item "10" "Нода"       "меню управления"    node_cli
-    menu_item "11" "Тесты"      "speed / ping / DNS"
+    section "🎛️  Сервис"
+    menu_item "📡" "10" "Нода"       "меню управления"    node_cli
+    menu_item "🧪" "11" "Тесты"      "speed / ping / DNS"
     echo
-    menu_item "0"  "Выход"      ""
+    menu_item "🚪" "0"  "Выход"      ""
     echo
-    read -rp "  → " choice
+    read -rp "  👉 " choice
 
     case "$choice" in
       1)  install_remnanode; pause ;;
