@@ -4,10 +4,10 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.3
+# Версия: 2026.7.4
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.3"
+SCRIPT_VERSION="2026.7.4"
 APP="remnanode"
 DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
@@ -29,6 +29,9 @@ XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/download"
 export DEBIAN_FRONTEND=noninteractive
 export APT_LISTCHANGES_FRONTEND=none
 export NEEDRESTART_MODE=a
+# Нужно для корректной ширины кириллицы в меню
+export LANG="${LANG:-C.UTF-8}"
+export LC_ALL="${LC_ALL:-C.UTF-8}"
 
 # Цвета
 GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
@@ -188,59 +191,66 @@ PUBLIC_IP=$(get_public_ip)
 LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 
 ###############################################################################
-# UI
+# UI — выравнивание через абсолютные колонки (\033[nG), устойчиво к UTF-8
 ###############################################################################
+COL_TITLE=7
+COL_DESC=28
+COL_STATUS=56
+
+goto_col() { printf '\033[%sG' "$1"; }
+
 show_header() {
   clear
+  local line1 line2 pad1 pad2 w=54
+  line1="REMNANODE LAUNCHER  v${SCRIPT_VERSION}"
+  line2="Node · Selfsteal · Hysteria2 · Proxy · Tests"
+  pad1=$(( (w - ${#line1}) / 2 ))
+  pad2=$(( (w - ${#line2}) / 2 ))
+  (( pad1 < 0 )) && pad1=0
+  (( pad2 < 0 )) && pad2=0
+
   echo -e "${CYAN}${BOLD}"
-  echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║           REMNANODE LAUNCHER  ·  ${SCRIPT_VERSION}           ║"
-  echo "  ║     Нода · Selfsteal · Hysteria2 · Прокси · Тесты  ║"
-  echo "  ╚════════════════════════════════════════════════════╝"
+  echo "  ╔══════════════════════════════════════════════════════╗"
+  printf "  ║%*s%s%*s║\n" "$pad1" "" "$line1" "$((w - pad1 - ${#line1}))" ""
+  printf "  ║%*s%s%*s║\n" "$pad2" "" "$line2" "$((w - pad2 - ${#line2}))" ""
+  echo "  ╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
-  echo -e "  ${WHITE}OS:${NC}        $PRETTY_NAME"
-  echo -e "  ${WHITE}CPU/RAM:${NC}   $CPU ядер | ${RAM_MB} МБ | $ARCH"
-  echo -e "  ${WHITE}Public IP:${NC} ${CYAN}${PUBLIC_IP}${NC}"
-  echo -e "  ${WHITE}Local IP:${NC}  ${LOCAL_IP:-неизвестен}"
+  printf "  ${WHITE}%-11s${NC} %s\n" "OS:" "$PRETTY_NAME"
+  printf "  ${WHITE}%-11s${NC} %s\n" "CPU/RAM:" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
+  printf "  ${WHITE}%-11s${NC} ${CYAN}%s${NC}\n" "Public IP:" "${PUBLIC_IP}"
+  printf "  ${WHITE}%-11s${NC} %s\n" "Local IP:" "${LOCAL_IP:-n/a}"
   echo
 }
 
-# Дополнить строку пробелами до ширины (по символам UTF-8, без ANSI)
-pad_right() {
-  local s="$1" w="$2" len=${#s} pad
-  if (( len >= w )); then
-    printf '%s' "$s"
-    return
-  fi
-  pad=$((w - len))
-  printf '%s%*s' "$s" "$pad" ''
-}
-
-# Цветной бейдж фиксированной ширины
+# Бейдж фиксированной ширины (паддинг по символам UTF-8)
 _badge() {
-  local color="$1" text="$2" inner
-  inner=$(pad_right "$text" 12)
-  echo -ne "${color}[${inner}]${NC}"
+  local color="$1" text="$2" plain="$2" pad
+  if (( ${#plain} > 10 )); then
+    plain="${plain:0:10}"
+  else
+    pad=$((10 - ${#plain}))
+    printf -v plain '%s%*s' "$plain" "$pad" ''
+  fi
+  printf '%b[%s]%b' "$color" "$plain" "$NC"
 }
 
-# Короткие статусы для пунктов меню
 service_badge() {
   local name="$1"
   case "$name" in
     remnanode)
       if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
-        _badge "$GREEN" "работает"
+        _badge "$GREEN" "онлайн"
       elif [[ -f "$COMPOSE" ]] || [[ -d "$DIR" ]]; then
-        _badge "$YELLOW" "установлен"
+        _badge "$YELLOW" "есть"
       else
         _badge "$RED" "нет"
       fi
       ;;
     selfsteal)
       if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '(caddy|nginx).*selfsteal|selfsteal'; then
-        _badge "$GREEN" "работает"
+        _badge "$GREEN" "онлайн"
       elif [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]] || command -v selfsteal >/dev/null 2>&1; then
-        _badge "$YELLOW" "установлен"
+        _badge "$YELLOW" "есть"
       else
         _badge "$RED" "нет"
       fi
@@ -248,9 +258,9 @@ service_badge() {
     warp)
       if command -v warp-cli >/dev/null 2>&1; then
         if warp-cli --accept-tos status 2>/dev/null | grep -qi connected; then
-          _badge "$GREEN" "подключён"
+          _badge "$GREEN" "онлайн"
         else
-          _badge "$YELLOW" "установлен"
+          _badge "$YELLOW" "есть"
         fi
       else
         _badge "$RED" "нет"
@@ -259,7 +269,7 @@ service_badge() {
     hysteria)
       if [[ -d /opt/hysteria/certs ]] \
         || { [[ -f "$COMPOSE" ]] && grep -qE 'hysteria|/opt/hysteria' "$COMPOSE" 2>/dev/null; }; then
-        _badge "$GREEN" "настроено"
+        _badge "$GREEN" "готово"
       else
         _badge "$RED" "нет"
       fi
@@ -267,7 +277,7 @@ service_badge() {
     xrayfix)
       if [[ -f "$COMPOSE" ]] && grep -q 'custom-xray/xray' "$COMPOSE" 2>/dev/null \
         && [[ -x "$CUSTOM_XRAY_DIR/xray" ]]; then
-        _badge "$GREEN" "применён"
+        _badge "$GREEN" "ок"
       elif [[ -x "$CUSTOM_XRAY_DIR/xray" ]]; then
         _badge "$YELLOW" "скачан"
       else
@@ -276,9 +286,9 @@ service_badge() {
       ;;
     mtproto)
       if systemctl is-active --quiet mtproto-proxy 2>/dev/null; then
-        _badge "$GREEN" "работает"
+        _badge "$GREEN" "онлайн"
       elif command -v mtbuddy >/dev/null 2>&1 || systemctl list-unit-files mtproto-proxy.service 2>/dev/null | grep -q mtproto; then
-        _badge "$YELLOW" "установлен"
+        _badge "$YELLOW" "есть"
       else
         _badge "$RED" "нет"
       fi
@@ -288,16 +298,16 @@ service_badge() {
       sw=$(free -m | awk '/^Swap:/ {print $2}')
       if (( sw > 0 )); then
         sw_h=$(free -h | awk '/^Swap:/ {print $2}')
-        _badge "$GREEN" "есть ${sw_h}"
+        _badge "$GREEN" "$sw_h"
       else
         _badge "$RED" "нет"
       fi
       ;;
     ufw)
       if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-        _badge "$GREEN" "активен"
+        _badge "$GREEN" "вкл"
       elif command -v ufw >/dev/null 2>&1 && [[ -f /etc/ufw/ufw.conf ]]; then
-        _badge "$YELLOW" "выключен"
+        _badge "$YELLOW" "выкл"
       else
         _badge "$RED" "нет"
       fi
@@ -306,9 +316,9 @@ service_badge() {
       local cc
       cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
       if [[ -f /etc/sysctl.d/99-remnanode.conf ]] && [[ "$cc" == "bbr" ]]; then
-        _badge "$GREEN" "применён"
+        _badge "$GREEN" "ок"
       elif [[ -f /etc/sysctl.d/99-remnanode.conf ]]; then
-        _badge "$YELLOW" "частично"
+        _badge "$YELLOW" "часть"
       else
         _badge "$RED" "нет"
       fi
@@ -316,11 +326,11 @@ service_badge() {
     node_cli)
       if [[ -x "$CLI_PATH" ]] || command -v remnanode >/dev/null 2>&1; then
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
-          _badge "$GREEN" "online"
+          _badge "$GREEN" "онлайн"
         elif [[ -f "$COMPOSE" ]]; then
-          _badge "$YELLOW" "доступно"
+          _badge "$YELLOW" "готово"
         else
-          _badge "$YELLOW" "CLI есть"
+          _badge "$YELLOW" "cli"
         fi
       else
         _badge "$RED" "нет"
@@ -329,22 +339,27 @@ service_badge() {
   esac
 }
 
-# Строка меню с ровными колонками:
-#   NN)  Название..............  описание................  [статус]
+# Абсолютные колонки терминала — ровно даже с кириллицей
 menu_item() {
   local num="$1" title="$2" desc="$3" badge="${4:-}"
-  local num_col title_col desc_col
-  num_col=$(pad_right "${num})" 4)
-  title_col=$(pad_right "$title" 18)
-  desc_col=$(pad_right "$desc" 24)
-
-  # Номер цветной, название и описание — моноширинные колонки, статус справа
-  echo -ne "    ${WHITE}${num_col}${NC} ${title_col}  ${GRAY}${desc_col}${NC}"
+  printf '  %b%-3s%b' "$WHITE" "${num})" "$NC"
+  goto_col "$COL_TITLE"
+  printf '%s' "$title"
+  goto_col "$COL_DESC"
+  printf '%b%s%b' "$GRAY" "$desc" "$NC"
   if [[ -n "$badge" ]]; then
-    echo -ne "  "
+    goto_col "$COL_STATUS"
     service_badge "$badge"
   fi
+  printf '\n'
+}
+
+section() {
   echo
+  printf '  %b%s%b\n' "${WHITE}${BOLD}" "$1" "$NC"
+  printf '  %b' "$GRAY"
+  printf '─%.0s' {1..60}
+  printf '%b\n' "$NC"
 }
 
 ###############################################################################
@@ -1894,26 +1909,24 @@ main_menu() {
     PUBLIC_IP=$(get_public_ip)
     show_header
 
-    hline 64
+    section "Установка"
+    menu_item "1"  "Remnanode"       "VPN-нода Remnawave"   remnanode
+    menu_item "2"  "Selfsteal"       "маскировка Reality"   selfsteal
+    menu_item "3"  "Hysteria2"       "certs + volume"       hysteria
+    menu_item "4"  "H2 online fix"   "custom Xray"          xrayfix
+    menu_item "5"  "WARP"            "Cloudflare SOCKS5"    warp
+    menu_item "6"  "MTProto"         "Telegram proxy"       mtproto
+
+    section "Система"
+    menu_item "7"  "SWAP"            "файл подкачки"        swap
+    menu_item "8"  "UFW"             "порты и защита"       ufw
+    menu_item "9"  "Tune"            "BBR / buffers / RPS"  tune
+
+    section "Сервис"
+    menu_item "10" "Node panel"      "управление нодой"     node_cli
+    menu_item "11" "Tests"           "speed / ping / DNS"
     echo
-    echo -e "  ${WHITE}${BOLD}Установка${NC}"
-    menu_item "1"  "Remnanode"         "VPN-нода Remnawave"      remnanode
-    menu_item "2"  "Selfsteal"         "маскировка Reality"      selfsteal
-    menu_item "3"  "Hysteria2"         "автонастройка certs"     hysteria
-    menu_item "4"  "Фикс онлайна H2"   "custom Xray"             xrayfix
-    menu_item "5"  "WARP"              "Cloudflare SOCKS5"       warp
-    menu_item "6"  "Telegram MTProto"  "mtproto.zig"             mtproto
-    echo
-    echo -e "  ${WHITE}${BOLD}Система${NC}"
-    menu_item "7"  "SWAP"              "файл подкачки"           swap
-    menu_item "8"  "UFW и порты"       "защита по желанию"       ufw
-    menu_item "9"  "Тюнинг скорости"   "BBR / буферы / RPS"      tune
-    echo
-    echo -e "  ${WHITE}${BOLD}Сервис${NC}"
-    menu_item "10" "Управление нодой"  "меню remnanode"          node_cli
-    menu_item "11" "Тесты"             "speed / ping / DNS"
-    echo
-    menu_item "0"  "Выход"             ""
+    menu_item "0"  "Exit"            "выход"
     echo
     read -rp "  → " choice
 
