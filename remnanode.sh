@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.10
+# Версия: 2026.7.11
 #
 # Запуск (рекомендуется — скачать в файл, затем выполнить):
 #   curl -fsSL -o /tmp/remnanode.sh https://raw.githubusercontent.com/Wyrzyy/nodescript/main/remnanode.sh
@@ -12,9 +12,11 @@ set -Eeuo pipefail
 #
 # Или одной строкой (скрипт сам перезапустится из файла):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/Wyrzyy/nodescript/main/remnanode.sh)
+#
+# Не запускайте старый /tmp/remnanode.sh — всегда скачивайте заново.
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.10"
+SCRIPT_VERSION="2026.7.11"
 
 # Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
 # перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
@@ -545,73 +547,232 @@ section() {
 # Базовые пакеты (без SWAP/UFW — они отдельными пунктами)
 ###############################################################################
 
-# Убрать битые apt-репозитории (частая причина падения apt update)
+# Паттерны битых/ненужных сторонних репозиториев (ломают apt update на noble+)
+_APT_BAD_RE_='packagecloud\.io/ookla|ookla/speedtest|speedtest-cli|packagecloud\.io/.*/speedtest'
+
+# Отключить файл источника apt (не удаляем навсегда — .disabled-by-remnanode)
+_apt_disable_file() {
+  local f="$1"
+  [[ -e "$f" ]] || return 0
+  # уже отключён
+  [[ "$f" == *.disabled-by-remnanode ]] && return 0
+  local dest="${f}.disabled-by-remnanode"
+  if mv -f "$f" "$dest" 2>/dev/null; then
+    echo "=== $(date '+%F %T') | apt: disabled $f → $dest ===" >&3
+    return 0
+  fi
+  rm -f "$f" 2>/dev/null || true
+  echo "=== $(date '+%F %T') | apt: removed $f ===" >&3
+}
+
+# Закомментировать строки в sources.list по regex (grep -E)
+_apt_comment_lines() {
+  local file="$1" pattern="$2"
+  [[ -f "$file" ]] || return 0
+  local tmp lines
+  tmp=$(mktemp)
+  lines=$(grep -n -iE "$pattern" "$file" 2>/dev/null | cut -d: -f1 || true)
+  if [[ -z "$lines" ]]; then
+    rm -f "$tmp"
+    return 0
+  fi
+  cp -a "$file" "$tmp"
+  local n
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    sed -i -E "${n}s|^[[:space:]]*([^#])|# remnanode-disabled \\1|" "$tmp" 2>/dev/null || true
+  done <<< "$lines"
+  mv -f "$tmp" "$file"
+}
+
+# Жёсткая зачистка известных проблемных репозиториев (по имени и по содержимому)
 sanitize_apt_repos() {
-  local removed=0 f
-  # Ookla speedtest через packagecloud — часто ломает noble/новые Ubuntu
+  local f removed=0
+  shopt -s nullglob
+
+  # 1) По имени файла
   for f in \
     /etc/apt/sources.list.d/ookla_speedtest-cli.list \
     /etc/apt/sources.list.d/ookla-speedtest-cli.list \
     /etc/apt/sources.list.d/packagecloud_ookla_speedtest-cli.list \
     /etc/apt/sources.list.d/*ookla* \
-    /etc/apt/sources.list.d/*speedtest*
+    /etc/apt/sources.list.d/*speedtest* \
+    /etc/apt/sources.list.d/*packagecloud*
   do
-    # glob may stay literal if no match
     [[ -e "$f" ]] || continue
-    rm -f "$f" && removed=1
+    # packagecloud бывает не только Ookla — отключаем файл только если внутри ookla/speedtest
+    if [[ "$f" == *packagecloud* && "$f" != *ookla* && "$f" != *speedtest* ]]; then
+      if ! grep -qiE "$_APT_BAD_RE_" "$f" 2>/dev/null; then
+        continue
+      fi
+    fi
+    _apt_disable_file "$f" && removed=1
   done
-  # На всякий случай — строки packagecloud/ookla в sources.list
-  if [[ -f /etc/apt/sources.list ]] && grep -qE 'packagecloud\.io/ookla|ookla/speedtest' /etc/apt/sources.list 2>/dev/null; then
-    sed -i '/packagecloud\.io\/ookla/d;/ookla\/speedtest/d' /etc/apt/sources.list
+
+  # 2) По содержимому — любой .list / .sources
+  for f in /etc/apt/sources.list.d/*; do
+    [[ -f "$f" ]] || continue
+    [[ "$f" == *.disabled-by-remnanode ]] && continue
+    if grep -qiE "$_APT_BAD_RE_" "$f" 2>/dev/null; then
+      _apt_disable_file "$f" && removed=1
+    fi
+  done
+
+  # 3) Основной sources.list
+  if [[ -f /etc/apt/sources.list ]] && grep -qiE "$_APT_BAD_RE_" /etc/apt/sources.list 2>/dev/null; then
+    _apt_comment_lines /etc/apt/sources.list "$_APT_BAD_RE_"
     removed=1
   fi
-  # Битые list-файлы без Release (мягкая зачистка по логу не нужна — просто убираем известные)
+
+  # 4) Кэш списков битого репо (иначе apt иногда продолжает ругаться)
+  rm -f /var/lib/apt/lists/*ookla* /var/lib/apt/lists/*speedtest* \
+        /var/lib/apt/lists/*packagecloud* 2>/dev/null || true
+
+  shopt -u nullglob
   if [[ "$removed" -eq 1 ]]; then
-    info "🧹 Удалены проблемные apt-репозитории (Ookla/packagecloud)"
+    info "🧹 Отключены проблемные apt-репозитории (Ookla/packagecloud/speedtest)"
   fi
   return 0
 }
 
+# По stderr apt-get update — найти URL битых репо и отключить файлы, где они прописаны
+apt_disable_from_errors() {
+  local errfile="$1"
+  [[ -f "$errfile" ]] || return 0
+  local url hostpath f disabled=0
+  local urls
+  urls=$(grep -oE "https?://[^'\"[:space:]]+" "$errfile" 2>/dev/null | sed 's|[)/]*$||' | sort -u || true)
+  [[ -z "$urls" ]] && return 0
+
+  while IFS= read -r url; do
+    [[ -z "$url" ]] && continue
+    # укоротить до «схемы+хост+путь» без хвоста Release
+    url="${url%%/Release*}"
+    url="${url%/InRelease}"
+    hostpath="${url#http://}"
+    hostpath="${hostpath#https://}"
+
+    shopt -s nullglob
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+      [[ -f "$f" ]] || continue
+      [[ "$f" == *.disabled-by-remnanode ]] && continue
+      if grep -qF "$url" "$f" 2>/dev/null || grep -qF "$hostpath" "$f" 2>/dev/null; then
+        if [[ "$f" == "/etc/apt/sources.list" ]]; then
+          # литеральный hostpath, разделитель sed — #
+          local hp_esc
+          hp_esc=$(printf '%s' "$hostpath" | sed 's/[#|&]/\\&/g')
+          sed -i -E "\\#${hp_esc}#s|^[[:space:]]*([^#])|# remnanode-disabled \\1|" "$f" 2>/dev/null || true
+          disabled=1
+        else
+          _apt_disable_file "$f" && disabled=1
+        fi
+      fi
+    done
+    shopt -u nullglob
+  done <<< "$urls"
+
+  # Типичные маркеры без URL в удобном виде
+  if grep -qiE 'does not have a Release file|NO_PUBKEY|not signed|Release file' "$errfile" 2>/dev/null; then
+    sanitize_apt_repos
+  fi
+
+  [[ "$disabled" -eq 1 ]] && return 0
+  return 0
+}
+
+# Надёжный apt-get update: чистит битые third-party репо и повторяет.
+# Возвращает 0 если индекс обновлён (хотя бы основными зеркалами).
 apt_update_safe() {
+  local errfile="/tmp/rn-apt-update.err"
+  local attempt=1
+  local max=6
+
   sanitize_apt_repos
-  # Первый попытка
-  if apt-get update -qq 2>/tmp/rn-apt-update.err; then
+
+  while (( attempt <= max )); do
+    echo "=== $(date '+%F %T') | apt-get update (попытка ${attempt}/${max}) ===" >&3
+    # Не используем -qq на ошибках: нужен полный текст для парсинга URL
+    if apt-get update -o Acquire::Retries=3 >"$errfile" 2>&1; then
+      return 0
+    fi
+    cat "$errfile" >&3 2>/dev/null || true
+
+    # Битый third-party / Release / ключ — отключаем и пробуем снова
+    if grep -qiE 'does not have a Release file|NO_PUBKEY|not signed|Release file|404[[:space:]]+Not Found|packagecloud|ookla|speedtest' "$errfile" 2>/dev/null; then
+      warn "apt: битый репозиторий — отключаю и повторяю (${attempt}/${max})…"
+      apt_disable_from_errors "$errfile"
+      sanitize_apt_repos
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    # Иное: пробуем allow-releaseinfo-change
+    if apt-get update --allow-releaseinfo-change -o Acquire::Retries=3 >"$errfile" 2>&1; then
+      return 0
+    fi
+    cat "$errfile" >&3 2>/dev/null || true
+    apt_disable_from_errors "$errfile"
+    sanitize_apt_repos
+    attempt=$((attempt + 1))
+  done
+
+  # Последний резерв: только основной sources.list (без sources.list.d)
+  warn "apt: обновляю только основной sources.list (без сторонних)"
+  if apt-get update \
+      -o Dir::Etc::sourcelist=/etc/apt/sources.list \
+      -o Dir::Etc::sourceparts=/dev/null \
+      -o APT::Get::List-Cleanup=0 \
+      -o Acquire::Retries=3 >"$errfile" 2>&1; then
+    ok "apt update (основные репозитории)"
     return 0
   fi
-  # Если снова packagecloud/ookla или иной битый source — вычистить и повторить
-  if grep -qE 'packagecloud|ookla|does not have a Release file|NO_PUBKEY' /tmp/rn-apt-update.err 2>/dev/null; then
-    warn "apt update упал из‑за битого репозитория — чищу и повторяю…"
-    cat /tmp/rn-apt-update.err >&3 2>/dev/null || true
-    sanitize_apt_repos
-    # Отключить любые list с packagecloud/ookla
-    grep -rlE 'packagecloud\.io/ookla|ookla/speedtest' /etc/apt/sources.list.d 2>/dev/null \
-      | while read -r f; do rm -f "$f"; done || true
-    apt-get update -qq 2>/tmp/rn-apt-update.err && return 0
+
+  # Ubuntu 24.04+ часто держит источники в /etc/apt/sources.list.d/ubuntu.sources
+  if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] || [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
+    local tmpparts
+    tmpparts=$(mktemp -d /tmp/rn-apt-parts.XXXXXX)
+    [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] && cp -a /etc/apt/sources.list.d/ubuntu.sources "$tmpparts/" || true
+    [[ -f /etc/apt/sources.list.d/debian.sources ]] && cp -a /etc/apt/sources.list.d/debian.sources "$tmpparts/" || true
+    # плюс docker/cloudflare если уже добавлены нами — чтобы install не сломался
+    [[ -f /etc/apt/sources.list.d/docker.list ]] && cp -a /etc/apt/sources.list.d/docker.list "$tmpparts/" || true
+    [[ -f /etc/apt/sources.list.d/cloudflare-client.list ]] && cp -a /etc/apt/sources.list.d/cloudflare-client.list "$tmpparts/" || true
+    if apt-get update \
+        -o Dir::Etc::sourcelist=/dev/null \
+        -o Dir::Etc::sourceparts="$tmpparts" \
+        -o APT::Get::List-Cleanup=0 \
+        -o Acquire::Retries=3 >"$errfile" 2>&1; then
+      rm -rf "$tmpparts"
+      ok "apt update (системные .sources)"
+      return 0
+    fi
+    rm -rf "$tmpparts"
   fi
-  # Последняя попытка: update с продолжением при ошибках отдельных источников (apt 2.x)
-  apt-get update --allow-releaseinfo-change -qq 2>>/tmp/rn-apt-update.err || true
-  # Если всё ещё критично — показать хвост ошибки
-  if ! apt-get update -qq; then
-    warn "apt update завершился с ошибками — смотри /tmp/rn-apt-update.err"
-    return 1
-  fi
-  return 0
+
+  warn "apt update с ошибками — см. ${errfile} и ${LOG}"
+  return 1
 }
 
 ensure_packages() {
-  # Сразу чистим битый Ookla/packagecloud — иначе apt update падает на noble
   sanitize_apt_repos
   info "⏳ Обновление apt…"
   if apt_update_safe; then
     ok "Обновление apt"
   else
-    warn "└─ подробности: /tmp/rn-apt-update.err и ${LOG}"
-    err "Ошибка на шаге: Обновление apt"
+    warn "apt update не идеален — пробую установить пакеты из кэша/основных зеркал"
   fi
-  run_step "Установка пакетов" \
-"apt-get install -y -qq curl wget ca-certificates gnupg lsb-release \
- jq htop iftop ethtool irqbalance dnsutils unzip \
- ufw fail2ban || true"
+  # Установка не должна валить весь сценарий из‑за одного optional пакета
+  if ! apt-get install -y -qq \
+      curl wget ca-certificates gnupg lsb-release \
+      jq htop iftop ethtool irqbalance dnsutils unzip \
+      ufw fail2ban; then
+    warn "Повтор apt update + install…"
+    apt_update_safe || true
+    apt-get install -y -qq \
+      curl wget ca-certificates gnupg lsb-release \
+      jq unzip ca-certificates || \
+      err "Не удалось установить базовые пакеты (curl/ca-certificates)"
+  fi
+  ok "Базовые пакеты"
 }
 
 ###############################################################################
@@ -783,12 +944,19 @@ install_docker() {
   if command -v docker >/dev/null 2>&1; then
     info "Docker уже установлен"
   else
-    run_step "Docker репозиторий" \
-"install -m 0755 -d /etc/apt/keyrings && \
- curl -fsSL https://download.docker.com/linux/${ID}/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
- chmod a+r /etc/apt/keyrings/docker.gpg && \
- echo \"deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable\" > /etc/apt/sources.list.d/docker.list && \
- apt_update_safe"
+    info "🐳 Добавляю репозиторий Docker…"
+    install -m 0755 -d /etc/apt/keyrings
+    if ! curl -fsSL "https://download.docker.com/linux/${ID}/gpg" \
+        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
+      err "Не удалось скачать GPG-ключ Docker"
+    fi
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
+      > /etc/apt/sources.list.d/docker.list
+    if ! apt_update_safe; then
+      err "apt update после добавления Docker-репозитория не удался"
+    fi
+    ok "Репозиторий Docker"
 
     run_step "Установка Docker" \
 "apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
@@ -905,6 +1073,8 @@ install_remnanode() {
 
   echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги видны ниже)${NC}"
   hline 40
+  info "0️⃣  Проверка apt-репозиториев"
+  sanitize_apt_repos
   info "1️⃣  Базовые пакеты"
   ensure_packages
   info "2️⃣  Тюнинг производительности"
@@ -1257,11 +1427,15 @@ systemctl daemon-reload"
     *) warn "Codename '$CODENAME' — используем noble"; warp_codename="noble" ;;
   esac
 
-  run_step "Репозиторий Cloudflare" \
-"curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
- gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && \
- echo \"deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${warp_codename} main\" > /etc/apt/sources.list.d/cloudflare-client.list && \
- apt_update_safe"
+  info "☁️  Добавляю репозиторий Cloudflare WARP…"
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
+    gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${warp_codename} main" \
+    > /etc/apt/sources.list.d/cloudflare-client.list
+  if ! apt_update_safe; then
+    err "apt update после добавления Cloudflare-репозитория не удался"
+  fi
+  ok "Репозиторий Cloudflare"
 
   run_step "Установка cloudflare-warp" "apt-get install -y -qq cloudflare-warp"
 
