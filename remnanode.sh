@@ -4,10 +4,10 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.7
+# Версия: 2026.7.8
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.7"
+SCRIPT_VERSION="2026.7.8"
 APP="remnanode"
 DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
@@ -53,30 +53,67 @@ mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 exec 3>>"$LOG" 2>/dev/null || exec 3>/dev/null
 
 hline() { echo -e "${GRAY}$(printf '─%.0s' $(seq 1 "${1:-56}"))${NC}"; }
-pause() { read -rp $'\n⏎  Нажмите Enter для продолжения...' _; }
+pause() {
+  echo
+  echo -ne "  ⏎  Нажмите Enter для продолжения..."
+  read -r _
+}
+
+# Видимый вопрос (echo + read) — read -p в Termius/pipe часто не рисует prompt
+ask() {
+  local prompt="$1" varname="$2" default="${3:-}"
+  local _ans
+  if [[ -n "$default" ]]; then
+    echo -ne "  ${WHITE}${prompt}${NC} ${GRAY}[${default}]${NC}: "
+  else
+    echo -ne "  ${WHITE}${prompt}${NC}: "
+  fi
+  # shellcheck disable=SC2162
+  read -r _ans || true
+  if [[ -z "$_ans" && -n "$default" ]]; then
+    _ans="$default"
+  fi
+  printf -v "$varname" '%s' "$_ans"
+}
+
+ask_secret() {
+  local prompt="$1" varname="$2"
+  local _ans
+  echo -ne "  ${WHITE}${prompt}${NC}: "
+  read -rs _ans || true
+  echo
+  printf -v "$varname" '%s' "$_ans"
+}
 
 spin() {
   local pid=$1 msg=$2
   local s='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
+  # Сразу показываем строку шага (без \r-магии в начале)
+  printf "  ${CYAN}⏳${NC} %s " "$msg"
   while kill -0 "$pid" 2>/dev/null; do
-    printf "\r%s %s" "$msg" "${s:$((i++ % ${#s})):1}"
-    sleep 0.08
+    printf "\b%s" "${s:$((i++ % ${#s})):1}"
+    sleep 0.1
   done
   wait "$pid"
   local rc=$?
   if [[ $rc -eq 0 ]]; then
-    printf "\r${GREEN}✔${NC} %s\n" "$msg"
+    printf "\b ${GREEN}✅${NC}\n"
   else
-    printf "\r${RED}✖${NC} %s\n" "$msg"
+    printf "\b ${RED}❌${NC}\n"
     return $rc
   fi
 }
 
+# Шаг с видимым статусом; подробности — в лог, итог — на экран
 run_step() {
   local msg="$1" cmd="$2"
-  echo "=== $msg ===" >&3
+  echo "=== $(date '+%F %T') | $msg ===" >&3
   ( eval "$cmd" >&3 2>&3 ) &
-  spin $! "$msg" || err "Ошибка на шаге: $msg"
+  local pid=$!
+  spin "$pid" "$msg" || {
+    echo -e "  ${RED}└─ смотри лог: ${LOG}${NC}"
+    err "Ошибка на шаге: $msg"
+  }
 }
 
 require_root() {
@@ -213,24 +250,18 @@ pad_right() {
 
 show_header() {
   clear
-  local line1="🚀 REMNANODE LAUNCHER  v${SCRIPT_VERSION}"
-  local line2="🛰️ Нода · 🎭 Selfsteal · ⚡ H2 · 🔒 Прокси · 🧪 Тесты"
-  local w=56
-  local pad1=$(( (w - ${#line1}) / 2 ))
-  local pad2=$(( (w - ${#line2}) / 2 ))
-  (( pad1 < 0 )) && pad1=0
-  (( pad2 < 0 )) && pad2=0
-
+  # Рамка без «центрирования по ${#}» — эмодзи ломают ширину в Termius
   echo -e "${CYAN}${BOLD}"
-  echo "  ╔════════════════════════════════════════════════════════╗"
-  printf "  ║%*s%s%*s║\n" "$pad1" "" "$line1" "$((w - pad1 - ${#line1}))" ""
-  printf "  ║%*s%s%*s║\n" "$pad2" "" "$line2" "$((w - pad2 - ${#line2}))" ""
-  echo "  ╚════════════════════════════════════════════════════════╝"
+  echo "  ╔══════════════════════════════════════════════════════╗"
+  echo "  ║  🚀 REMNANODE LAUNCHER  v${SCRIPT_VERSION}                     ║"
+  echo "  ║  🛰️  Нода · 🎭 Selfsteal · ⚡ H2 · 🔒 Прокси · 🧪 Тесты ║"
+  echo "  ╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
-  printf "  %b%-10s%b %s\n" "$WHITE" "💻 OS:" "$NC" "$PRETTY_NAME"
-  printf "  %b%-10s%b %s\n" "$WHITE" "🧠 CPU/RAM:" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
-  printf "  %b%-10s%b %b%s%b\n" "$WHITE" "🌐 Public:" "$NC" "$CYAN" "$PUBLIC_IP" "$NC"
-  printf "  %b%-10s%b %s\n" "$WHITE" "🏠 Local:" "$NC" "${LOCAL_IP:-n/a}"
+  printf "  %b%-12s%b %s\n" "$WHITE" "💻 OS:" "$NC" "$PRETTY_NAME"
+  printf "  %b%-12s%b %s\n" "$WHITE" "🧠 CPU/RAM:" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
+  printf "  %b%-12s%b %b%s%b\n" "$WHITE" "🌐 Public IP:" "$NC" "$CYAN" "$PUBLIC_IP" "$NC"
+  printf "  %b%-12s%b %s\n" "$WHITE" "🏠 Local IP:" "$NC" "${LOCAL_IP:-n/a}"
+  echo
 }
 
 # Статус без паддинга: [текст]
@@ -626,19 +657,26 @@ is_remnanode_up() { docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remn
 remove_existing_remnanode() {
   warn "Найдена существующая установка Remnanode."
   echo
-  [[ -d "$DIR" ]] && echo -e "    • Директория: ${GRAY}$DIR${NC}"
-  is_remnanode_up && echo -e "    • Контейнер: ${GRAY}remnanode${NC}"
+  [[ -d "$DIR" ]] && echo -e "    • 📁 Директория: ${GRAY}$DIR${NC}"
+  if is_remnanode_up; then
+    echo -e "    • 🐳 Контейнер: ${GRAY}remnanode${NC}"
+  fi
   echo
-  read -rp "  Удалить старую установку перед продолжением? [y/N]: " ans
+  local ans=""
+  ask "❓ Удалить старую установку перед продолжением? [y/N]" ans
   if [[ ! "$ans" =~ ^[Yy]$ ]]; then
     warn "Установка отменена."
     return 1
   fi
+  echo
+  info "🧹 Удаляю старую установку…"
   if [[ -f "$COMPOSE" ]]; then
-    run_step "Остановка контейнера" "cd $DIR && docker compose down -v 2>/dev/null || true"
+    run_step "Остановка контейнера" "cd '$DIR' && docker compose down -v 2>/dev/null || true"
   fi
   docker rm -f remnanode 2>/dev/null || true
-  [[ -d "$DIR" ]] && run_step "Удаление файлов" "rm -rf $DIR"
+  if [[ -d "$DIR" ]]; then
+    run_step "Удаление файлов" "rm -rf '$DIR'"
+  fi
   ok "Старая установка удалена"
   echo
   return 0
@@ -649,40 +687,47 @@ install_remnanode() {
   echo -e "${WHITE}${BOLD}  🚀 Установка Remnanode${NC}"
   hline 56
   echo
-  info "🚀 Стабильная установка ноды Remnawave (без сторонних «тяжёлых» установщиков)."
-  info "🛡️  UFW / 💾 SWAP — отдельные пункты меню и не ставятся вместе с нодой."
+  info "Стабильная установка ноды Remnawave."
+  info "UFW / SWAP — отдельные пункты меню, с нодой не ставятся."
   echo
 
   if is_remnanode_installed; then
     remove_existing_remnanode || return 0
   fi
 
-  read -rp "  IP панели Remnawave [${PANEL_IP_DEFAULT}]: " PANEL_IP
-  PANEL_IP=${PANEL_IP:-$PANEL_IP_DEFAULT}
+  echo -e "  ${WHITE}${BOLD}📝 Параметры ноды${NC}"
+  hline 40
+  local PANEL_IP="" NODE_PORT="" XTLS_API_PORT=""
+  ask "🌐 IP панели Remnawave" PANEL_IP "$PANEL_IP_DEFAULT"
   [[ "$PANEL_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || err "Некорректный IP: $PANEL_IP"
 
-  read -rp "  NODE_PORT [3000]: " NODE_PORT
-  NODE_PORT=${NODE_PORT:-3000}
+  ask "🔌 NODE_PORT" NODE_PORT "3000"
   [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || err "NODE_PORT должен быть числом"
 
-  read -rp "  XTLS_API_PORT [61000]: " XTLS_API_PORT
-  XTLS_API_PORT=${XTLS_API_PORT:-61000}
+  ask "🔗 XTLS_API_PORT" XTLS_API_PORT "61000"
 
   echo
   info "🔑 SECRET_KEY скопируйте из панели Remnawave → Nodes → Create"
-  local K1 K2
+  local K1="" K2=""
   while true; do
-    read -rsp "  SECRET_KEY: " K1; echo
-    read -rsp "  Повтор:     " K2; echo
-    [[ -z "$K1" ]] && { warn "Пусто"; continue; }
-    [[ "$K1" != "$K2" ]] && { warn "Не совпадает"; continue; }
+    ask_secret "SECRET_KEY" K1
+    ask_secret "Повтор SECRET_KEY" K2
+    [[ -z "$K1" ]] && { warn "Пусто — введите ключ"; continue; }
+    [[ "$K1" != "$K2" ]] && { warn "Не совпадает — ещё раз"; continue; }
     break
   done
-  ok "🔑 Ключ принят (${#K1} символов)"
+  ok "Ключ принят (${#K1} символов)"
+  echo
 
+  echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги видны ниже)${NC}"
+  hline 40
+  info "1️⃣  Базовые пакеты"
   ensure_packages
+  info "2️⃣  Тюнинг производительности"
   apply_performance_tuning
+  info "3️⃣  Docker"
   install_docker
+  info "4️⃣  Конфиг и запуск ноды"
 
   mkdir -p "$DIR"
 
@@ -697,6 +742,7 @@ SECRET_KEY=${K1}
 XTLS_API_PORT=${XTLS_API_PORT}
 EOF
   chmod 600 "$ENV_FILE"
+  ok ".env сохранён"
 
   cat > "$COMPOSE" <<EOF
 services:
@@ -725,38 +771,53 @@ EOF
   echo "$NODE_PORT" > "$DIR/.node_port"
 
   cd "$DIR"
-  run_step "Pull образа" "docker compose pull"
+  info "5️⃣  Скачивание образа (может занять время)…"
+  run_step "Pull образа remnawave/node" "docker compose pull"
+  info "6️⃣  Запуск контейнера"
   run_step "Запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
 
-  sleep 4
+  echo -n "  ⏳ Жду готовности контейнера"
+  local i
+  for i in 1 2 3 4 5 6; do
+    sleep 1
+    echo -n "."
+    is_remnanode_up && break
+  done
+  echo
+
   if ! is_remnanode_up; then
+    echo -e "  ${RED}Логи контейнера:${NC}"
+    docker logs --tail 40 remnanode 2>&1 | sed 's/^/    /' || true
     err "Контейнер не запустился. Логи: docker logs remnanode"
   fi
+  ok "Контейнер remnanode запущен"
 
   if ss -tlnp 2>/dev/null | grep -q ":${NODE_PORT} "; then
     ok "Нода слушает порт ${NODE_PORT}"
   else
-    warn "Контейнер запущен, порт ${NODE_PORT} пока может подниматься"
+    warn "Порт ${NODE_PORT} пока может подниматься — проверьте через пару секунд"
   fi
 
+  info "7️⃣  Установка команды управления"
   install_self_cli
 
   echo
   echo -e "${GREEN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║        ✅  REMNANODE УСТАНОВЛЕН                   ║"
+  echo "  ║           ✅  REMNANODE УСТАНОВЛЕН                 ║"
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
-  echo -e "  Public IP:     ${CYAN}${PUBLIC_IP}${NC}"
-  echo -e "  Панель IP:     ${PANEL_IP}"
-  echo -e "  NODE_PORT:     ${NODE_PORT}"
-  echo -e "  XTLS_API:      ${XTLS_API_PORT}"
-  echo -e "  Управление:    ${CYAN}remnanode${NC}"
+  echo -e "  🌐 Public IP:   ${CYAN}${PUBLIC_IP}${NC}"
+  echo -e "  🖥️  Панель IP:   ${PANEL_IP}"
+  echo -e "  🔌 NODE_PORT:   ${NODE_PORT}"
+  echo -e "  🔗 XTLS_API:    ${XTLS_API_PORT}"
+  echo -e "  📡 Управление:  ${CYAN}remnanode${NC}"
+  echo -e "  📋 Лог:         ${GRAY}${LOG}${NC}"
   echo
   echo -e "  ${YELLOW}💡 Рекомендуется отдельно:${NC}"
-  echo -e "    • пункт меню «Защита UFW» — ограничить NODE_PORT только IP панели"
-  echo -e "    • пункт «SWAP» — если мало RAM"
-  echo -e "    • «Hysteria2» — если нужен UDP-протокол"
+  echo -e "    • 🛡️  UFW — ограничить NODE_PORT только IP панели"
+  echo -e "    • 💾 SWAP — если мало RAM"
+  echo -e "    • ⚡ Hysteria2 — если нужен UDP-протокол"
   echo
 }
 
