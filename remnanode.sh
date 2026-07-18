@@ -4,19 +4,18 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.11
+# Версия: 2026.7.12
 #
-# Запуск (рекомендуется — скачать в файл, затем выполнить):
-#   curl -fsSL -o /tmp/remnanode.sh https://raw.githubusercontent.com/Wyrzyy/nodescript/main/remnanode.sh
-#   sudo bash /tmp/remnanode.sh
+# Запуск (одной командой, от root):
+#   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
 #
-# Или одной строкой (скрипт сам перезапустится из файла):
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Wyrzyy/nodescript/main/remnanode.sh)
+# Меню лаунчера:
+#   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh)
 #
-# Не запускайте старый /tmp/remnanode.sh — всегда скачивайте заново.
+# Скрипт сам перезапустится из tempfile (фикс Termius /dev/fd).
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.11"
+SCRIPT_VERSION="2026.7.12"
 
 # Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
 # перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
@@ -2388,6 +2387,11 @@ main_menu() {
 ###############################################################################
 # Снимаем ERR-trap для интерактивных меню (иначе Ctrl+C / cancel ломают UI)
 entry_name="$(basename "${BASH_SOURCE[0]:-$0}")"
+
+# Стиль DigneZzZ: bash <(curl …) @ install
+if [[ "${1:-}" == "@" ]]; then
+  shift
+fi
 
 case "${1:-}" in
   install-remnanode|install)   install_remnanode ;;
