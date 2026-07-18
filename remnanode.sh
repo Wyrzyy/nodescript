@@ -779,6 +779,7 @@ systemctl enable irqbalance >/dev/null 2>&1 && systemctl restart irqbalance || t
 # Docker
 ###############################################################################
 install_docker() {
+  sanitize_apt_repos
   if command -v docker >/dev/null 2>&1; then
     info "Docker уже установлен"
   else
@@ -787,7 +788,7 @@ install_docker() {
  curl -fsSL https://download.docker.com/linux/${ID}/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
  chmod a+r /etc/apt/keyrings/docker.gpg && \
  echo \"deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable\" > /etc/apt/sources.list.d/docker.list && \
- apt-get update -qq"
+ apt_update_safe"
 
     run_step "Установка Docker" \
 "apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
@@ -1260,7 +1261,7 @@ systemctl daemon-reload"
 "curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
  gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && \
  echo \"deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${warp_codename} main\" > /etc/apt/sources.list.d/cloudflare-client.list && \
- apt-get update -qq"
+ apt_update_safe"
 
   run_step "Установка cloudflare-warp" "apt-get install -y -qq cloudflare-warp"
 
