@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.18
+# Версия: 2026.7.19
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.7.18"
+_REMNANODE_VER="2026.7.19"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -33,6 +33,9 @@ DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
 ENV_FILE="$DIR/.env"
 LOG="/var/log/${APP}-install.log"
+SPEEDTEST_DIR="$DIR/tests"
+SPEEDTEST_LAST="$SPEEDTEST_DIR/speedtest-last.txt"
+SPEEDTEST_LOG="$SPEEDTEST_DIR/speedtest-history.log"
 CUSTOM_XRAY_DIR="$DIR/custom-xray"
 XRAY_VERSION_DEFAULT="v26.6.1"
 PANEL_IP_DEFAULT="141.98.7.57"
@@ -375,7 +378,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.7.18}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.7.19}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -432,7 +435,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.7.18"
+  [[ -n "$v" ]] || v="2026.7.19"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -443,7 +446,7 @@ launcher_version() {
 show_header() {
   ui_clear
   # Жёстко фиксируем версию на каждом показе шапки (защита от пустого env)
-  _REMNANODE_VER="2026.7.18"
+  _REMNANODE_VER="2026.7.19"
   RN_VERSION="$_REMNANODE_VER"
   SCRIPT_VERSION="$_REMNANODE_VER"
   local ver="$_REMNANODE_VER"
@@ -1890,6 +1893,101 @@ ensure_ookla_speedtest() {
   return 1
 }
 
+# --- Сохранение результатов Speedtest (чтобы можно было открыть после skip) ---
+speedtest_prepare_store() {
+  mkdir -p "$SPEEDTEST_DIR" 2>/dev/null || true
+}
+
+# Запустить блок теста: вывод на экран + сохранение в last/history
+# usage: speedtest_capture "Название"  bash -c '...'
+speedtest_capture() {
+  local title="$1"
+  shift
+  speedtest_prepare_store
+  local tmp rc=0
+  tmp=$(mktemp /tmp/rn-speedtest.XXXXXX)
+
+  {
+    echo "============================================================"
+    echo "  Speedtest: ${title}"
+    echo "  Дата:      $(date '+%F %T')"
+    echo "  Хост:      $(hostname 2>/dev/null || echo '?') | IP: ${PUBLIC_IP:-?}"
+    echo "============================================================"
+    echo
+  } >"$tmp"
+
+  set +e
+  # shellcheck disable=SC2068
+  "$@" 2>&1 | tee -a "$tmp"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  {
+    echo
+    echo "------------------------------------------------------------"
+    echo "  Конец: $(date '+%F %T')  (код: ${rc})"
+    echo "============================================================"
+  } | tee -a "$tmp" >/dev/null
+  # хвост тоже на экран
+  tail -n 3 "$tmp" | head -n 2
+
+  cp -f "$tmp" "$SPEEDTEST_LAST"
+  {
+    echo
+    cat "$tmp"
+    echo
+  } >>"$SPEEDTEST_LOG"
+  # История не раздуваем бесконечно (~200 КБ)
+  if [[ -f "$SPEEDTEST_LOG" ]] && [[ "$(wc -c <"$SPEEDTEST_LOG")" -gt 200000 ]]; then
+    tail -c 150000 "$SPEEDTEST_LOG" >"${SPEEDTEST_LOG}.tmp" && mv -f "${SPEEDTEST_LOG}.tmp" "$SPEEDTEST_LOG"
+  fi
+  rm -f "$tmp"
+  echo
+  ok "Результат сохранён"
+  info "Последний:  ${SPEEDTEST_LAST}"
+  info "История:    ${SPEEDTEST_LOG}"
+  return "$rc"
+}
+
+show_speedtest_last() {
+  speedtest_prepare_store
+  ui_clear
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║           📄 ПОСЛЕДНИЙ SPEEDTEST                   ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+  if [[ ! -f "$SPEEDTEST_LAST" || ! -s "$SPEEDTEST_LAST" ]]; then
+    warn "Сохранённых результатов ещё нет — сначала запустите тест"
+    return 0
+  fi
+  echo -e "  ${GRAY}${SPEEDTEST_LAST}${NC}"
+  echo
+  # Без ANSI-цветов файл читается нормально; на экран — как есть
+  sed 's/\x1b\[[0-9;]*m//g' "$SPEEDTEST_LAST" | sed 's/^/  /'
+  echo
+}
+
+show_speedtest_history() {
+  speedtest_prepare_store
+  ui_clear
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║           📚 ИСТОРИЯ SPEEDTEST                     ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+  if [[ ! -f "$SPEEDTEST_LOG" || ! -s "$SPEEDTEST_LOG" ]]; then
+    warn "История пуста — сначала запустите тест"
+    return 0
+  fi
+  echo -e "  ${GRAY}${SPEEDTEST_LOG}${NC}"
+  echo -e "  ${GRAY}(показаны последние ~80 строк)${NC}"
+  echo
+  sed 's/\x1b\[[0-9;]*m//g' "$SPEEDTEST_LOG" | tail -n 80 | sed 's/^/  /'
+  echo
+  info "Полный файл: less ${SPEEDTEST_LOG}"
+}
+
 # Свой download-speed через curl (запасной вариант без Ookla)
 run_curl_speed_test() {
   local label="$1" url="$2" bytes="${3:-0}"
@@ -2073,10 +2171,17 @@ run_speedtest_menu() {
   echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
+  if [[ -f "$SPEEDTEST_LAST" && -s "$SPEEDTEST_LAST" ]]; then
+    echo -e "  ${GRAY}Есть сохранённый результат: ${SPEEDTEST_LAST}${NC}"
+    echo
+  fi
+
   echo -e "  ${WHITE}1)${NC} 🚀 Ookla Speedtest       ${GRAY}(полный тест)${NC}"
   echo -e "  ${WHITE}2)${NC} 📶 Ookla — только ping/jitter"
   echo -e "  ${WHITE}3)${NC} 📥 Свой тест скачивания  ${GRAY}(curl, без Ookla)${NC}"
   echo -e "  ${WHITE}4)${NC} 📊 Комплекс: Ookla + ping + замер времени"
+  echo -e "  ${WHITE}5)${NC} 📄 Показать последний результат"
+  echo -e "  ${WHITE}6)${NC} 📚 История результатов"
   echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
   ask_choice ch
@@ -2085,57 +2190,93 @@ run_speedtest_menu() {
   case "$ch" in
     1)
       ensure_ookla_speedtest || { warn "Ookla недоступен — попробуйте пункт 3"; return; }
-      t0=$(date +%s.%N)
-      echo -e "  ${GRAY}Старт: $(date '+%F %T')${NC}"
-      speedtest --accept-license --accept-gdpr || warn "Ookla вернул ошибку"
-      t1=$(date +%s.%N)
-      echo
-      awk -v a="$t0" -v b="$t1" 'BEGIN{printf "  ⏱ Длительность: %.1f сек\n", b-a}'
+      speedtest_capture "Ookla полный" bash -c '
+        t0=$(date +%s.%N)
+        echo "  Старт: $(date "+%F %T")"
+        speedtest --accept-license --accept-gdpr || echo "  Ookla вернул ошибку"
+        t1=$(date +%s.%N)
+        echo
+        awk -v a="$t0" -v b="$t1" "BEGIN{printf \"  Длительность: %.1f сек\\n\", b-a}"
+      '
       ;;
     2)
       ensure_ookla_speedtest || { warn "Ookla недоступен"; return; }
-      if speedtest --accept-license --accept-gdpr -f json 2>/dev/null | jq -r '
-          "  Ping:    \(.ping.latency) ms",
-          "  Jitter:  \(.ping.jitter) ms",
-          "  Server:  \(.server.name) (\(.server.location))",
-          "  ISP:     \(.isp // "?")"
-        ' 2>/dev/null; then
-        :
-      else
-        speedtest --accept-license --accept-gdpr --ping || true
-      fi
+      speedtest_capture "Ookla ping/jitter" bash -c '
+        if speedtest --accept-license --accept-gdpr -f json 2>/dev/null | jq -r "
+            \"  Ping:    \\(.ping.latency) ms\",
+            \"  Jitter:  \\(.ping.jitter) ms\",
+            \"  Server:  \\(.server.name) (\\(.server.location))\",
+            \"  ISP:     \\(.isp // \"?\")\"
+          " 2>/dev/null; then
+          :
+        else
+          speedtest --accept-license --accept-gdpr --ping || true
+        fi
+      '
       ;;
     3)
-      echo
-      info "📥 Замер download через несколько CDN…"
-      echo
-      t0=$(date +%s.%N)
-      run_curl_speed_test "Cloudflare 10 МБ" "https://speed.cloudflare.com/__down?bytes=10000000"
-      run_curl_speed_test "Cloudflare 25 МБ" "https://speed.cloudflare.com/__down?bytes=25000000"
-      run_curl_speed_test "Hetzner 100 МБ"   "https://speed.hetzner.de/100MB.bin"
-      run_curl_speed_test "ThinkBroadband 10 МБ" "http://ipv4.download.thinkbroadband.com/10MB.zip"
-      t1=$(date +%s.%N)
-      awk -v a="$t0" -v b="$t1" 'BEGIN{printf "  ⏱ Общее время: %.1f сек\n", b-a}'
-      echo
-      info "RTT:"
-      ping -c 4 -W 2 1.1.1.1 2>/dev/null | tail -2 | sed 's/^/  /' || true
+      speedtest_capture "Curl download CDN" bash -c '
+        echo "  Замер download через несколько CDN…"
+        echo
+        t0=$(date +%s.%N)
+        # функции скрипта недоступны в subshell — вызываем curl напрямую
+        for item in \
+          "Cloudflare 10МБ|https://speed.cloudflare.com/__down?bytes=10000000" \
+          "Cloudflare 25МБ|https://speed.cloudflare.com/__down?bytes=25000000" \
+          "Hetzner 100МБ|https://speed.hetzner.de/100MB.bin" \
+          "ThinkBroadband 10МБ|http://ipv4.download.thinkbroadband.com/10MB.zip"
+        do
+          label="${item%%|*}"; url="${item#*|}"
+          echo "  $label"
+          echo "  $url"
+          out=$(curl -L -o /dev/null -w "%{time_total} %{size_download} %{speed_download}" \
+            --connect-timeout 10 --max-time 60 "$url" 2>/dev/null) || { echo "  Не удалось"; echo; continue; }
+          t_total=$(echo "$out" | awk "{print \$1}")
+          size=$(echo "$out" | awk "{print \$2}")
+          speed_bps=$(echo "$out" | awk "{print \$3}")
+          speed_mbps=$(awk -v s="$speed_bps" "BEGIN{printf \"%.2f\", s*8/1000000}")
+          size_mb=$(awk -v s="$size" "BEGIN{printf \"%.2f\", s/1048576}")
+          printf "     Размер:  %s МБ\n" "$size_mb"
+          printf "     Время:   %.2f сек\n" "$t_total"
+          printf "     Скорость: %s Мбит/с\n" "$speed_mbps"
+          echo
+        done
+        t1=$(date +%s.%N)
+        awk -v a="$t0" -v b="$t1" "BEGIN{printf \"  Общее время: %.1f сек\\n\", b-a}"
+        echo
+        echo "  RTT:"
+        ping -c 4 -W 2 1.1.1.1 2>/dev/null | tail -2 | sed "s/^/  /" || true
+      '
       ;;
     4)
       ensure_ookla_speedtest || warn "Ookla пропущен"
-      t0=$(date +%s.%N)
-      echo -e "  ${GRAY}Старт: $(date '+%F %T')${NC}"
-      if command -v speedtest >/dev/null 2>&1; then
-        speedtest --accept-license --accept-gdpr || true
-      fi
-      echo
-      run_curl_speed_test "Cloudflare 25 МБ" "https://speed.cloudflare.com/__down?bytes=25000000"
-      echo -e "  ${WHITE}Ping:${NC}"
-      ping -c 5 -W 2 1.1.1.1 2>/dev/null | tail -2 | sed 's/^/  /'
-      ping -c 5 -W 2 8.8.8.8 2>/dev/null | tail -2 | sed 's/^/  /'
-      t1=$(date +%s.%N)
-      echo -e "  ${GRAY}Финиш: $(date '+%F %T')${NC}"
-      awk -v a="$t0" -v b="$t1" 'BEGIN{printf "  ⏱ Длительность: %.2f сек\n", b-a}'
+      speedtest_capture "Комплекс Ookla+curl+ping" bash -c '
+        t0=$(date +%s.%N)
+        echo "  Старт: $(date "+%F %T")"
+        if command -v speedtest >/dev/null 2>&1; then
+          speedtest --accept-license --accept-gdpr || true
+        fi
+        echo
+        echo "  Cloudflare 25 МБ"
+        out=$(curl -L -o /dev/null -w "%{time_total} %{size_download} %{speed_download}" \
+          --connect-timeout 10 --max-time 60 \
+          "https://speed.cloudflare.com/__down?bytes=25000000" 2>/dev/null) || out=""
+        if [[ -n "$out" ]]; then
+          speed_bps=$(echo "$out" | awk "{print \$3}")
+          speed_mbps=$(awk -v s="$speed_bps" "BEGIN{printf \"%.2f\", s*8/1000000}")
+          printf "     Скорость: %s Мбит/с\n" "$speed_mbps"
+        fi
+        echo
+        echo "  Ping:"
+        ping -c 5 -W 2 1.1.1.1 2>/dev/null | tail -2 | sed "s/^/  /"
+        ping -c 5 -W 2 8.8.8.8 2>/dev/null | tail -2 | sed "s/^/  /"
+        t1=$(date +%s.%N)
+        echo "  Финиш: $(date "+%F %T")"
+        awk -v a="$t0" -v b="$t1" "BEGIN{printf \"  Длительность: %.2f сек\\n\", b-a}"
+      '
       ;;
+    5) show_speedtest_last ;;
+    6) show_speedtest_history ;;
     *) return ;;
   esac
 }
@@ -2149,12 +2290,13 @@ tests_menu() {
     echo "  ╚════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo -e "  ${WHITE}1)${NC} 🚀 Speedtest           ${GRAY}— Ookla / свой curl-тест${NC}"
-    echo -e "  ${WHITE}2)${NC} 📶 Задержка (ping)"
-    echo -e "  ${WHITE}3)${NC} 🧭 DNS"
-    echo -e "  ${WHITE}4)${NC} 🌐 Информация об IP"
-    echo -e "  ${WHITE}5)${NC} 🖥️  Система / CPU / диск"
-    echo -e "  ${WHITE}6)${NC} 🔌 Порты и контейнеры"
-    echo -e "  ${WHITE}7)${NC} 🏁 Полный прогон       ${GRAY}— 1→6 подряд${NC}"
+    echo -e "  ${WHITE}2)${NC} 📄 Последний Speedtest ${GRAY}— если скипнули результат${NC}"
+    echo -e "  ${WHITE}3)${NC} 📶 Задержка (ping)"
+    echo -e "  ${WHITE}4)${NC} 🧭 DNS"
+    echo -e "  ${WHITE}5)${NC} 🌐 Информация об IP"
+    echo -e "  ${WHITE}6)${NC} 🖥️  Система / CPU / диск"
+    echo -e "  ${WHITE}7)${NC} 🔌 Порты и контейнеры"
+    echo -e "  ${WHITE}8)${NC} 🏁 Полный прогон       ${GRAY}— speed + ping + DNS…${NC}"
     echo
     echo -e "  ${GRAY}0)${NC} 🔙 Назад"
     echo
@@ -2162,12 +2304,13 @@ tests_menu() {
 
     case "$choice" in
       1) run_speedtest_menu; pause ;;
-      2) run_latency_test; pause ;;
-      3) run_dns_test; pause ;;
-      4) run_ip_info_test; pause ;;
-      5) run_system_bench; pause ;;
-      6) run_ports_check; pause ;;
-      7)
+      2) show_speedtest_last; pause ;;
+      3) run_latency_test; pause ;;
+      4) run_dns_test; pause ;;
+      5) run_ip_info_test; pause ;;
+      6) run_system_bench; pause ;;
+      7) run_ports_check; pause ;;
+      8)
         run_ip_info_test
         run_latency_test
         run_dns_test
