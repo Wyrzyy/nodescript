@@ -429,7 +429,7 @@ launcher_version() {
   if [[ -z "$v" || "$v" == "unknown" ]]; then
     local src="${BASH_SOURCE[0]:-$0}"
     if [[ -f "$src" ]]; then
-      v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'\''[:space:]' || true)
+      v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"'[:space:]' || true)
     fi
   fi
   [[ -n "$v" ]] || v="2026.7.17"
@@ -442,10 +442,11 @@ launcher_version() {
 
 show_header() {
   ui_clear
-  # Версию берём напрямую — без вложенных пустых env
-  local ver="2026.7.17"
-  ver=$(launcher_version)
-  [[ -n "$ver" && "$ver" != "unknown" ]] || ver="2026.7.17"
+  # Жёстко фиксируем версию на каждом показе шапки (защита от пустого env)
+  _REMNANODE_VER="2026.7.17"
+  RN_VERSION="$_REMNANODE_VER"
+  SCRIPT_VERSION="$_REMNANODE_VER"
+  local ver="$_REMNANODE_VER"
 
   # Простая шапка БЕЗ emoji внутри линий — иначе Termius съезжает и «теряет» текст
   _tty_printf '%b' "${CYAN}${BOLD}"
