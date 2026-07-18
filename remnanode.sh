@@ -4,10 +4,27 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.8
+# Версия: 2026.7.9
+#
+# Запуск (рекомендуется — скачать в файл, затем выполнить):
+#   curl -fsSL -o /tmp/remnanode.sh https://raw.githubusercontent.com/Wyrzyy/nodescript/main/remnanode.sh
+#   sudo bash /tmp/remnanode.sh
+#
+# Или одной строкой (скрипт сам перезапустится из файла):
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Wyrzyy/nodescript/main/remnanode.sh)
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.8"
+SCRIPT_VERSION="2026.7.9"
+
+# Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
+# перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
+_SRC="${BASH_SOURCE[0]:-$0}"
+if [[ "$_SRC" == /dev/fd/* || "$_SRC" == /proc/self/fd/* || "$_SRC" == /dev/stdin ]]; then
+  _RN_TMP="$(mktemp /tmp/remnanode-run.XXXXXX.sh)"
+  cat "$_SRC" > "$_RN_TMP"
+  chmod +x "$_RN_TMP"
+  exec bash "$_RN_TMP" "$@"
+fi
 APP="remnanode"
 DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
@@ -38,13 +55,28 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; BOLD='\033[1m'
 DIM='\033[2m'; NC='\033[0m'
 
-ok()   { echo -e "${GREEN}✅ ${1}${NC}"; }
-info() { echo -e "${BLUE}ℹ️  ${1}${NC}"; }
-warn() { echo -e "${YELLOW}⚠️  ${1}${NC}"; }
+# UI-вывод всегда в /dev/tty (если есть) — один раз, без потери в pipe/<(curl)
+_msg() {
+  local color="$1" icon="$2" text="$3"
+  local line
+  printf -v line '%b%s %s%b' "$color" "$icon" "$text" "$NC"
+  if [[ -w /dev/tty ]]; then
+    echo -e "$line" > /dev/tty
+  else
+    echo -e "$line"
+  fi
+}
+ok()   { _msg "$GREEN" "✅" "$1"; }
+info() { _msg "$BLUE" "ℹ️ " "$1"; }
+warn() { _msg "$YELLOW" "⚠️ " "$1"; }
 err()  {
-  echo -e "${RED}❌ ${1}${NC}"
-  echo -e "${GRAY}── 📋 последние строки лога ──${NC}"
-  tail -n 30 "$LOG" 2>/dev/null || true
+  _msg "$RED" "❌" "$1"
+  _msg "$GRAY" "📋" "последние строки лога → ${LOG}"
+  if [[ -w /dev/tty ]]; then
+    tail -n 30 "$LOG" 2>/dev/null > /dev/tty || true
+  else
+    tail -n 30 "$LOG" 2>/dev/null || true
+  fi
   exit 1
 }
 
@@ -53,23 +85,53 @@ mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 exec 3>>"$LOG" 2>/dev/null || exec 3>/dev/null
 
 hline() { echo -e "${GRAY}$(printf '─%.0s' $(seq 1 "${1:-56}"))${NC}"; }
-pause() {
-  echo
-  echo -ne "  ⏎  Нажмите Enter для продолжения..."
-  read -r _
+
+# Всегда общаемся с реальным терминалом (/dev/tty).
+# Нужно для bash <(curl …) / Termius: иначе prompt и ввод «пропадают».
+_TTY="/dev/tty"
+if [[ ! -r $_TTY || ! -w $_TTY ]]; then
+  _TTY="/dev/stdin"
+fi
+
+_tty_printf() { printf "$@" >"$_TTY" 2>/dev/null || printf "$@"; }
+_tty_echo()   { echo -e "$@" >"$_TTY" 2>/dev/null || echo -e "$@"; }
+
+# Прочитать строку с терминала (не из pipe скрипта)
+_tty_read() {
+  local _silent="${1:-0}" _ans=""
+  if [[ -r /dev/tty ]]; then
+    if [[ "$_silent" == "1" ]]; then
+      read -rs _ans < /dev/tty || true
+    else
+      read -r _ans < /dev/tty || true
+    fi
+  else
+    if [[ "$_silent" == "1" ]]; then
+      read -rs _ans || true
+    else
+      read -r _ans || true
+    fi
+  fi
+  printf '%s' "$_ans"
 }
 
-# Видимый вопрос (echo + read) — read -p в Termius/pipe часто не рисует prompt
+pause() {
+  _tty_echo ""
+  _tty_printf "  ⏎  Нажмите Enter для продолжения..."
+  _tty_read >/dev/null
+  _tty_echo ""
+}
+
+# Видимый вопрос → переменная. Всегда пишет prompt в /dev/tty.
+# ask "Текст" VAR [default]
 ask() {
-  local prompt="$1" varname="$2" default="${3:-}"
-  local _ans
+  local prompt="$1" varname="$2" default="${3:-}" _ans
   if [[ -n "$default" ]]; then
-    echo -ne "  ${WHITE}${prompt}${NC} ${GRAY}[${default}]${NC}: "
+    _tty_printf "  %b%s%b %b[%s]%b: " "$WHITE" "$prompt" "$NC" "$GRAY" "$default" "$NC"
   else
-    echo -ne "  ${WHITE}${prompt}${NC}: "
+    _tty_printf "  %b%s%b: " "$WHITE" "$prompt" "$NC"
   fi
-  # shellcheck disable=SC2162
-  read -r _ans || true
+  _ans=$(_tty_read)
   if [[ -z "$_ans" && -n "$default" ]]; then
     _ans="$default"
   fi
@@ -77,29 +139,48 @@ ask() {
 }
 
 ask_secret() {
-  local prompt="$1" varname="$2"
+  local prompt="$1" varname="$2" _ans
+  _tty_printf "  %b%s%b: " "$WHITE" "$prompt" "$NC"
+  _ans=$(_tty_read 1)
+  _tty_echo ""
+  printf -v "$varname" '%s' "$_ans"
+}
+
+# Короткий выбор пункта меню
+ask_choice() {
+  local varname="$1" prompt="${2:-👉}"
   local _ans
-  echo -ne "  ${WHITE}${prompt}${NC}: "
-  read -rs _ans || true
-  echo
+  _tty_printf "  %b%s%b " "$WHITE" "$prompt" "$NC"
+  _ans=$(_tty_read)
+  printf -v "$varname" '%s' "$_ans"
+}
+
+ask_yes_no() {
+  # ask_yes_no "Вопрос?" VAR [default N|Y]
+  local prompt="$1" varname="$2" default="${3:-N}" _ans _hint
+  if [[ "$default" =~ ^[Yy]$ ]]; then _hint="Y/n"; else _hint="y/N"; fi
+  _tty_printf "  %b%s%b %b[%s]%b: " "$WHITE" "$prompt" "$NC" "$GRAY" "$_hint" "$NC"
+  _ans=$(_tty_read)
+  if [[ -z "$_ans" ]]; then _ans="$default"; fi
   printf -v "$varname" '%s' "$_ans"
 }
 
 spin() {
   local pid=$1 msg=$2
-  local s='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
-  # Сразу показываем строку шага (без \r-магии в начале)
-  printf "  ${CYAN}⏳${NC} %s " "$msg"
+  local s='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0 out=/dev/tty
+  [[ -w $out ]] || out=/dev/stdout
+  # Сразу показываем строку шага
+  printf "  ${CYAN}⏳${NC} %s " "$msg" >"$out"
   while kill -0 "$pid" 2>/dev/null; do
-    printf "\b%s" "${s:$((i++ % ${#s})):1}"
+    printf "\b%s" "${s:$((i++ % ${#s})):1}" >"$out"
     sleep 0.1
   done
   wait "$pid"
   local rc=$?
   if [[ $rc -eq 0 ]]; then
-    printf "\b ${GREEN}✅${NC}\n"
+    printf "\b ${GREEN}✅${NC}\n" >"$out"
   else
-    printf "\b ${RED}❌${NC}\n"
+    printf "\b ${RED}❌${NC}\n" >"$out"
     return $rc
   fi
 }
@@ -111,7 +192,7 @@ run_step() {
   ( eval "$cmd" >&3 2>&3 ) &
   local pid=$!
   spin "$pid" "$msg" || {
-    echo -e "  ${RED}└─ смотри лог: ${LOG}${NC}"
+    warn "└─ подробности в логе: ${LOG}"
     err "Ошибка на шаге: $msg"
   }
 }
@@ -663,7 +744,7 @@ remove_existing_remnanode() {
   fi
   echo
   local ans=""
-  ask "❓ Удалить старую установку перед продолжением? [y/N]" ans
+  ask_yes_no "❓ Удалить старую установку перед продолжением?" ans N
   if [[ ! "$ans" =~ ^[Yy]$ ]]; then
     warn "Установка отменена."
     return 1
@@ -843,8 +924,7 @@ install_selfsteal() {
   echo -e "    ${WHITE}1)${NC} 🟩 Caddy   ${GRAY}(проще, авто-SSL)${NC}"
   echo -e "    ${WHITE}2)${NC} 🟧 Nginx   ${GRAY}(Unix socket + acme.sh)${NC}"
   echo
-  read -rp "  Выбор [1]: " ws_choice
-  ws_choice=${ws_choice:-1}
+  ask "🌐 Выбор веб-сервера" ws_choice "1"
 
   local ws_flag="--caddy"
   case "$ws_choice" in
@@ -939,7 +1019,7 @@ fix_hysteria2_online() {
   echo -e "  ${WHITE}3)${NC} 🔍 Проверить версию Xray в контейнере"
   echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  👉 " ch
+  ask_choice ch
 
   case "$ch" in
     1) apply_custom_xray_patch ;;
@@ -960,8 +1040,7 @@ apply_custom_xray_patch() {
     err "Remnanode не установлен"
   fi
 
-  read -rp "  Версия Xray [${XRAY_VERSION_DEFAULT}]: " XV
-  XV=${XV:-$XRAY_VERSION_DEFAULT}
+  ask "📦 Версия Xray" XV "$XRAY_VERSION_DEFAULT"
   [[ "$XV" == v* ]] || XV="v${XV}"
 
   local arch_zip="Xray-linux-64.zip"
@@ -1054,7 +1133,7 @@ install_warp() {
 
   if command -v warp-cli >/dev/null 2>&1; then
     warn "WARP уже установлен: $(warp-cli --version 2>/dev/null | head -1)"
-    read -rp "  Переустановить? [y/N]: " ans
+    ask_yes_no "🔄 Переустановить?" ans N
     if [[ ! "$ans" =~ ^[Yy]$ ]]; then
       return 0
     fi
@@ -1167,7 +1246,7 @@ install_mtproto() {
   echo -e "  ${WHITE}4)${NC} 📌 Статус сервиса"
   echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  👉 " ch
+  ask_choice ch
 
   case "$ch" in
     1)
@@ -1190,12 +1269,10 @@ install_mtproto() {
         info "Сначала ставим mtbuddy…"
         gh_pipe_bash "$MTPROTO_BOOTSTRAP_RAW" || err "Bootstrap не удался"
       fi
-      read -rp "  Порт [443]: " mp_port
-      mp_port=${mp_port:-443}
-      read -rp "  Домен-маскировка (например rutube.ru): " mp_domain
+      ask "🔌 Порт" mp_port "443"
+      ask "🌐 Домен-маскировка (например rutube.ru)" mp_domain
       [[ -z "$mp_domain" ]] && { warn "Домен обязателен"; return 0; }
-      read -rp "  Имя пользователя [user]: " mp_user
-      mp_user=${mp_user:-user}
+      ask "👤 Имя пользователя" mp_user "user"
       echo
       mtbuddy install --port "$mp_port" --domain "$mp_domain" --user "$mp_user" --yes || warn "Установка вернула ошибку"
       ;;
@@ -1239,7 +1316,7 @@ setup_swap() {
   echo -e "  ${WHITE}6)${NC} 📊 Показать free -h"
   echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  👉 " ch
+  ask_choice ch
 
   local size_gb=""
   case "$ch" in
@@ -1247,8 +1324,7 @@ setup_swap() {
     2) size_gb=2 ;;
     3) size_gb=4 ;;
     4)
-      read -rp "  Размер в ГБ [1]: " size_gb
-      size_gb=${size_gb:-1}
+      ask "📏 Размер в ГБ" size_gb "1"
       [[ "$size_gb" =~ ^[0-9]+$ ]] || { warn "Нужно число"; return 0; }
       ;;
     5)
@@ -1319,19 +1395,15 @@ setup_ufw() {
   echo -e "  ${WHITE}7)${NC} 🚨 Fail2Ban (базовый jail для SSH)"
   echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  👉 " ch
+  ask_choice ch
 
   case "$ch" in
     1)
-      read -rp "  IP панели [${panel_ip}]: " panel_ip_in
-      panel_ip=${panel_ip_in:-$panel_ip}
-      read -rp "  NODE_PORT [${node_port}]: " node_port_in
-      node_port=${node_port_in:-$node_port}
-      read -rp "  SSH порт [${ssh_port}]: " ssh_port_in
-      ssh_port=${ssh_port_in:-$ssh_port}
-      read -rp "  Открыть 443/tcp+udp (Reality/Hysteria)? [Y/n]: " p443
-      p443=${p443:-Y}
-      read -rp "  Открыть 80/tcp (ACME/Selfsteal)? [y/N]: " p80
+      ask "🌐 IP панели" panel_ip "$panel_ip"
+      ask "🔌 NODE_PORT" node_port "$node_port"
+      ask "🔑 SSH порт" ssh_port "$ssh_port"
+      ask_yes_no "Открыть 443/tcp+udp (Reality/Hysteria)?" p443 Y
+      ask_yes_no "Открыть 80/tcp (ACME/Selfsteal)?" p80 N
 
       ufw --force reset >/dev/null 2>&1 || true
       ufw default deny incoming
@@ -1353,26 +1425,24 @@ setup_ufw() {
       ;;
     2)
       echo
-      read -rp "  SSH порт [${ssh_port}]: " ssh_port_in
-      ssh_port=${ssh_port_in:-$ssh_port}
+      ask "🔑 SSH порт" ssh_port "$ssh_port"
       ufw allow "${ssh_port}/tcp" comment 'SSH'
       while true; do
-        read -rp "  Добавить порт (например 8443/tcp или 443/udp, пусто = готово): " pr
+        ask "➕ Порт (8443/tcp или 443/udp, пусто = готово)" pr
         [[ -z "$pr" ]] && break
         ufw allow "$pr" || warn "Не удалось: $pr"
       done
-      read -rp "  Включить UFW сейчас? [Y/n]: " en
-      en=${en:-Y}
+      ask_yes_no "Включить UFW сейчас?" en Y
       [[ "$en" =~ ^[Yy]$ ]] && ufw --force enable
       ufw status numbered
       ;;
     3)
-      read -rp "  Порт (напр. 8443/tcp): " pr
+      ask "🔓 Порт (напр. 8443/tcp)" pr
       [[ -n "$pr" ]] && ufw allow "$pr" && ok "Открыт $pr"
       ;;
     4)
       ufw status numbered
-      read -rp "  Номер правила для удаления: " num
+      ask "🗑️  Номер правила для удаления" num
       [[ -n "$num" ]] && ufw --force delete "$num"
       ;;
     5) ufw status verbose ;;
@@ -1631,7 +1701,7 @@ run_speedtest_menu() {
   echo -e "  ${WHITE}4)${NC} 📊 Комплекс: Ookla + ping + замер времени"
   echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
-  read -rp "  👉 " ch
+  ask_choice ch
 
   local t0 t1
   case "$ch" in
@@ -1710,7 +1780,7 @@ tests_menu() {
     echo
     echo -e "  ${GRAY}0)${NC} 🔙 Назад"
     echo
-    read -rp "  👉 " choice
+    ask_choice choice
 
     case "$choice" in
       1) run_speedtest_menu; pause ;;
@@ -1752,7 +1822,7 @@ system_menu() {
     echo -e "  ${WHITE}4)${NC} 📦 Только базовые пакеты"
     echo -e "  ${GRAY}0)${NC} 🔙 Назад"
     echo
-    read -rp "  👉 " ch
+    ask_choice ch
     case "$ch" in
       1) setup_swap; pause ;;
       2) setup_ufw; pause ;;
@@ -1845,7 +1915,7 @@ remnanode_menu() {
     hline 56
     echo -e "    ${GRAY}0)${NC} 🚪 Выход"
     echo
-    read -rp "  👉 Выберите пункт [0-18]: " choice
+    ask_choice choice "👉 Выберите пункт [0-18]:"
 
     case "$choice" in
       1) install_remnanode; pause ;;
@@ -1866,7 +1936,7 @@ remnanode_menu() {
         ;;
       5)
         if is_remnanode_installed; then
-          read -rp "  Точно удалить RemnaNode? [y/N]: " ans
+          ask_yes_no "🗑️  Точно удалить RemnaNode?" ans N
           if [[ "$ans" =~ ^[Yy]$ ]]; then
             cd "$DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true
             docker rm -f remnanode 2>/dev/null || true
@@ -1899,13 +1969,13 @@ remnanode_menu() {
       11) fix_hysteria2_online; pause ;;
       12)
         ${EDITOR:-nano} "$COMPOSE"
-        read -rp "  Перезапустить ноду? [y/N]: " ans
+        ask_yes_no "🔄 Перезапустить ноду?" ans N
         [[ "$ans" =~ ^[Yy]$ ]] && cd "$DIR" && docker compose up -d
         pause
         ;;
       13)
         ${EDITOR:-nano} "$ENV_FILE"
-        read -rp "  Перезапустить ноду? [y/N]: " ans
+        ask_yes_no "🔄 Перезапустить ноду?" ans N
         [[ "$ans" =~ ^[Yy]$ ]] && cd "$DIR" && docker compose up -d
         pause
         ;;
@@ -2016,7 +2086,7 @@ main_menu() {
     echo
     menu_item "🚪" "0"  "Выход"      ""
     echo
-    read -rp "  👉 " choice
+    ask_choice choice
 
     case "$choice" in
       1)  install_remnanode; pause ;;
