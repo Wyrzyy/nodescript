@@ -4,16 +4,17 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.13
+# Версия: 2026.7.14
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
 #
 # Скрипт сам перезапустится из tempfile (фикс Termius /dev/fd).
 # Установка ноды — пункт меню «1», не через аргумент @ install.
+# Selfsteal — русифицированная копия в этом же репозитории (selfsteal.sh).
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.13"
+SCRIPT_VERSION="2026.7.14"
 
 # Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
 # перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
@@ -36,8 +37,11 @@ WARP_PORT=9091
 LAUNCHER_PATH="/opt/remnanode/installer.sh"
 CLI_PATH="/usr/local/bin/remnanode"
 
-# Внешние скрипты
-SELFSTEAL_RAW="https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/selfsteal.sh"
+# Внешние / наши скрипты (UI — на русском)
+# Selfsteal: русифицированная копия DigneZzZ в этом репо
+SELFSTEAL_RAW="https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/selfsteal.sh"
+SELFSTEAL_LOCAL="/opt/remnanode/selfsteal.sh"
+# Hysteria2: upstream уже на русском
 H2_RAW="https://raw.githubusercontent.com/Origamidnd/h2-script/master/setup.sh"
 MTPROTO_BOOTSTRAP_RAW="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh"
 XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/download"
@@ -285,7 +289,25 @@ gh_download() {
   return 1
 }
 
+# Лёгкая русификация UI скачанного скрипта (безопасные замены фраз)
+russify_script_file() {
+  local f="$1" kind="${2:-generic}"
+  [[ -f "$f" ]] || return 0
+  case "$kind" in
+    mtproto)
+      sed -i \
+        -e 's/One more step — create your proxy and get a Telegram link:/Остался шаг — создайте прокси и получите ссылку Telegram:/g' \
+        -e 's/Prefer a guided setup?/Нужен мастер настройки?/g' \
+        -e 's/See all options:/Все опции:/g' \
+        "$f" 2>/dev/null || true
+      ;;
+  esac
+  return 0
+}
+
 # Выполнить remote bash-скрипт: скачать во временный файл и запустить
+# gh_run_bash URL [args...] 
+# Опционально: RN_RUSSIFY=mtproto gh_run_bash ...
 gh_run_bash() {
   local url="$1"
   shift
@@ -295,6 +317,9 @@ gh_run_bash() {
     rm -f "$tmp"
     warn "Не удалось скачать скрипт (прямая ссылка и зеркала): $url"
     return 1
+  fi
+  if [[ -n "${RN_RUSSIFY:-}" ]]; then
+    russify_script_file "$tmp" "$RN_RUSSIFY"
   fi
   chmod +x "$tmp"
   set +e
@@ -310,6 +335,28 @@ gh_pipe_bash() {
   local url="$1"
   shift
   gh_run_bash "$url" "$@"
+}
+
+# Selfsteal: локальная русифицированная копия → иначе скачать из нашего репо
+run_selfsteal() {
+  local src=""
+  local here_dir
+  here_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)
+  if [[ -n "$here_dir" && -f "$here_dir/selfsteal.sh" ]]; then
+    src="$here_dir/selfsteal.sh"
+  elif [[ -f "$SELFSTEAL_LOCAL" ]]; then
+    src="$SELFSTEAL_LOCAL"
+  fi
+  if [[ -n "$src" ]]; then
+    info "🎭 Selfsteal (RU): $src"
+    set +e
+    bash "$src" "$@"
+    local rc=$?
+    set -e
+    return $rc
+  fi
+  info "🎭 Selfsteal (RU): скачиваю из нашего репозитория…"
+  gh_pipe_bash "$SELFSTEAL_RAW" "$@"
 }
 
 ###############################################################################
@@ -987,10 +1034,20 @@ systemctl restart docker'"
 ###############################################################################
 install_self_cli() {
   local src="${BASH_SOURCE[0]:-$0}"
+  local src_dir=""
+  src_dir=$(cd "$(dirname "$src")" 2>/dev/null && pwd || true)
   mkdir -p "$DIR"
   if [[ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$(readlink -f "$LAUNCHER_PATH" 2>/dev/null || echo "$LAUNCHER_PATH")" ]]; then
     cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
     chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
+  fi
+  # Кладём русифицированный Selfsteal рядом с лаунчером
+  if [[ -n "$src_dir" && -f "$src_dir/selfsteal.sh" ]]; then
+    cp -f "$src_dir/selfsteal.sh" "$SELFSTEAL_LOCAL" 2>/dev/null || true
+    chmod +x "$SELFSTEAL_LOCAL" 2>/dev/null || true
+  elif [[ ! -f "$SELFSTEAL_LOCAL" ]]; then
+    gh_download "$SELFSTEAL_RAW" "$SELFSTEAL_LOCAL" 2>/dev/null || true
+    chmod +x "$SELFSTEAL_LOCAL" 2>/dev/null || true
   fi
   ln -sfn "$LAUNCHER_PATH" "$CLI_PATH"
   chmod +x "$CLI_PATH" 2>/dev/null || true
@@ -1180,8 +1237,8 @@ install_selfsteal() {
   echo -e "${WHITE}${BOLD}  🎭 Установка Selfsteal (Reality-маскировка)${NC}"
   hline 56
   echo
-  info "🎭 Официальный установщик DigneZzZ (Caddy / Nginx)."
-  echo -e "  ${GRAY}Источник: github.com/DigneZzZ/remnawave-scripts${NC}"
+  info "🎭 Русифицированный Selfsteal (логика DigneZzZ, UI на русском)."
+  echo -e "  ${GRAY}Источник: github.com/Wyrzyy/nodescript (selfsteal.sh)${NC}"
   echo
 
   if ! command -v docker >/dev/null 2>&1; then
@@ -1189,6 +1246,9 @@ install_selfsteal() {
     ensure_packages
     install_docker
   fi
+
+  # Обновим локальную RU-копию перед запуском
+  install_self_cli >/dev/null 2>&1 || true
 
   echo -e "  ${WHITE}🌐 Веб-сервер:${NC}"
   echo -e "    ${WHITE}1)${NC} 🟩 Caddy   ${GRAY}(проще, авто-SSL)${NC}"
@@ -1203,12 +1263,11 @@ install_selfsteal() {
   esac
 
   echo
-  info "Запуск: bash <(curl …/selfsteal.sh) @ install ${ws_flag}"
+  info "Запуск Selfsteal @ install ${ws_flag}"
   echo
 
-  # Аналог: bash <(curl -Ls …) @ install --caddy|--nginx
   set +e
-  gh_pipe_bash "$SELFSTEAL_RAW" @ install "$ws_flag"
+  run_selfsteal @ install "$ws_flag"
   local rc=$?
   set -e
   if [[ $rc -eq 0 ]]; then
@@ -1235,7 +1294,7 @@ install_hysteria2() {
   echo -e "${WHITE}${BOLD}  ⚡ Автонастройка Hysteria2${NC}"
   hline 56
   echo
-  info "Скрипт Origamidnd/h2-script: certbot, сертификаты, volume в remnanode, BBR."
+  info "Скрипт Origamidnd/h2-script (уже на русском): certbot, сертификаты, volume, BBR."
   echo -e "  ${GRAY}https://github.com/Origamidnd/h2-script${NC}"
   echo
   warn "⚠️  Нода Remnanode уже должна быть установлена."
@@ -1249,7 +1308,7 @@ install_hysteria2() {
   ensure_packages
 
   echo
-  info "Запуск setup.sh из h2-script (с зеркалами GitHub)…"
+  info "Запуск setup.sh (RU) из h2-script…"
   echo
 
   set +e
@@ -1524,8 +1583,8 @@ install_mtproto() {
 
   case "$ch" in
     1)
-      info "Скачивание bootstrap.sh (с зеркалами)…"
-      if gh_pipe_bash "$MTPROTO_BOOTSTRAP_RAW"; then
+      info "Скачивание bootstrap.sh (с зеркалами, UI на русском)…"
+      if RN_RUSSIFY=mtproto gh_pipe_bash "$MTPROTO_BOOTSTRAP_RAW"; then
         ok "mtbuddy установлен"
         echo
         info "Запуск интерактивного мастера…"
@@ -1541,7 +1600,7 @@ install_mtproto() {
     2)
       if ! command -v mtbuddy >/dev/null 2>&1; then
         info "Сначала ставим mtbuddy…"
-        gh_pipe_bash "$MTPROTO_BOOTSTRAP_RAW" || err "Bootstrap не удался"
+        RN_RUSSIFY=mtproto gh_pipe_bash "$MTPROTO_BOOTSTRAP_RAW" || err "Bootstrap не удался"
       fi
       ask "🔌 Порт" mp_port "443"
       ask "🌐 Домен-маскировка (например rutube.ru)" mp_domain
