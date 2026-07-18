@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.15
+# Версия: 2026.7.16
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -14,7 +14,9 @@ set -Eeuo pipefail
 # Selfsteal — русифицированная копия в этом же репозитории (selfsteal.sh).
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.15"
+# Версия лаунчера (дублируем в RN_VERSION — защита от . /etc/os-release и т.п.)
+RN_VERSION="2026.7.16"
+SCRIPT_VERSION="$RN_VERSION"
 
 # Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
 # перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
@@ -58,28 +60,35 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; BOLD='\033[1m'
 DIM='\033[2m'; NC='\033[0m'
 
-# UI-вывод всегда в /dev/tty (если есть) — один раз, без потери в pipe/<(curl)
+# Всегда общаемся с реальным терминалом (/dev/tty).
+# Нужно для bash <(curl …) / Termius: иначе prompt и текст «пропадают».
+_TTY="/dev/tty"
+if [[ ! -r $_TTY || ! -w $_TTY ]]; then
+  _TTY="/dev/stdout"
+fi
+
+_tty_printf() { printf "$@" >"$_TTY" 2>/dev/null || printf "$@"; }
+_tty_echo()   { echo -e "$@" >"$_TTY" 2>/dev/null || echo -e "$@"; }
+
+# Полная очистка экрана (Termius/SSH: убирает артефакты и alt-screen)
+ui_clear() {
+  stty sane <"$_TTY" 2>/dev/null || stty sane 2>/dev/null || true
+  # выйти из alternate screen, сбросить атрибуты, очистить экран + scrollback
+  _tty_printf '\033[?1049l\033[0m\033[2J\033[3J\033[H'
+}
+
+# UI-вывод всегда в /dev/tty
 _msg() {
   local color="$1" icon="$2" text="$3"
-  local line
-  printf -v line '%b%s %s%b' "$color" "$icon" "$text" "$NC"
-  if [[ -w /dev/tty ]]; then
-    echo -e "$line" > /dev/tty
-  else
-    echo -e "$line"
-  fi
+  _tty_printf '%b%s %s%b\n' "$color" "$icon" "$text" "$NC"
 }
-ok()   { _msg "$GREEN" "✅" "$1"; }
-info() { _msg "$BLUE" "ℹ️ " "$1"; }
-warn() { _msg "$YELLOW" "⚠️ " "$1"; }
+ok()   { _msg "$GREEN" "+" "$1"; }
+info() { _msg "$CYAN" ">" "$1"; }
+warn() { _msg "$YELLOW" "!" "$1"; }
 err()  {
-  _msg "$RED" "❌" "$1"
-  _msg "$GRAY" "📋" "последние строки лога → ${LOG}"
-  if [[ -w /dev/tty ]]; then
-    tail -n 30 "$LOG" 2>/dev/null > /dev/tty || true
-  else
-    tail -n 30 "$LOG" 2>/dev/null || true
-  fi
+  _msg "$RED" "x" "$1"
+  _msg "$GRAY" "#" "последние строки лога → ${LOG}"
+  tail -n 30 "$LOG" 2>/dev/null >"$_TTY" || tail -n 30 "$LOG" 2>/dev/null || true
   exit 1
 }
 
@@ -87,17 +96,10 @@ mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 : > "$LOG" 2>/dev/null || true
 exec 3>>"$LOG" 2>/dev/null || exec 3>/dev/null
 
-hline() { echo -e "${GRAY}$(printf '─%.0s' $(seq 1 "${1:-56}"))${NC}"; }
-
-# Всегда общаемся с реальным терминалом (/dev/tty).
-# Нужно для bash <(curl …) / Termius: иначе prompt и ввод «пропадают».
-_TTY="/dev/tty"
-if [[ ! -r $_TTY || ! -w $_TTY ]]; then
-  _TTY="/dev/stdin"
-fi
-
-_tty_printf() { printf "$@" >"$_TTY" 2>/dev/null || printf "$@"; }
-_tty_echo()   { echo -e "$@" >"$_TTY" 2>/dev/null || echo -e "$@"; }
+hline() {
+  local n="${1:-52}"
+  _tty_printf '  %b%s%b\n' "$GRAY" "$(printf '%.0s-' $(seq 1 "$n"))" "$NC"
+}
 
 # Прочитать строку с терминала (не из pipe скрипта)
 _tty_read() {
@@ -189,7 +191,7 @@ ask_secret() {
 
 # Короткий выбор пункта меню
 ask_choice() {
-  local varname="$1" prompt="${2:-👉}"
+  local varname="$1" prompt="${2:->}"
   local _ans
   _tty_printf "  %b%s%b " "$WHITE" "$prompt" "$NC"
   _ans=$(_tty_read)
@@ -208,20 +210,18 @@ ask_yes_no() {
 
 spin() {
   local pid=$1 msg=$2
-  local s='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0 out=/dev/tty
-  [[ -w $out ]] || out=/dev/stdout
-  # Сразу показываем строку шага
-  printf "  ${CYAN}⏳${NC} %s " "$msg" >"$out"
+  local frames=('|' '/' '-' '\\') i=0
+  _tty_printf "  %b*%b %s " "$CYAN" "$NC" "$msg"
   while kill -0 "$pid" 2>/dev/null; do
-    printf "\b%s" "${s:$((i++ % ${#s})):1}" >"$out"
+    _tty_printf '\b%s' "${frames[$((i++ % 4))]}"
     sleep 0.1
   done
   wait "$pid"
   local rc=$?
   if [[ $rc -eq 0 ]]; then
-    printf "\b ${GREEN}✅${NC}\n" >"$out"
+    _tty_printf '\b %bok%b\n' "$GREEN" "$NC"
   else
-    printf "\b ${RED}❌${NC}\n" >"$out"
+    _tty_printf '\b %bfail%b\n' "$RED" "$NC"
     return $rc
   fi
 }
@@ -371,7 +371,9 @@ run_selfsteal() {
 ###############################################################################
 require_root
 
+# os-release задаёт VERSION=... — не даём затереть версию лаунчера
 . /etc/os-release
+SCRIPT_VERSION="${RN_VERSION}"
 case "$ID" in
   ubuntu|debian) ;;
   *) err "Поддерживается только Ubuntu/Debian. Найдено: $ID" ;;
@@ -400,48 +402,48 @@ PUBLIC_IP=$(get_public_ip)
 LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 
 ###############################################################################
-# UI — ровные колонки через пробелы (без \033[nG — ломается в Termius и др.)
+# UI — без «рамки+эмодзи» (ломает Termius), всё в /dev/tty
 ###############################################################################
 
-# Ширина строки в символах UTF-8 (не байтах)
-str_width() {
-  # ${#s} при LC_ALL=C.UTF-8 считает символы
-  printf '%s' "${#1}"
-}
-
-# Обрезать/добить пробелами до ровно w символов
+# Обрезать/добить пробелами до ровно w символов (UTF-8, без эмодзи внутри)
 pad_right() {
   local s="$1" w="$2" n=${#1}
   if (( n > w )); then
-    # bash substring по символам в UTF-8 locale
     s="${s:0:w}"
     n=$w
   fi
   printf '%s%*s' "$s" "$((w - n))" ''
 }
 
-show_header() {
-  if [[ -w /dev/tty ]]; then clear > /dev/tty; else clear; fi
-  # Рамка без «центрирования по ${#}» — эмодзи ломают ширину в Termius
-  {
-    echo -e "${CYAN}${BOLD}"
-    echo "  ╔══════════════════════════════════════════════════════╗"
-    echo "  ║  🚀 REMNANODE LAUNCHER  v${SCRIPT_VERSION}                     ║"
-    echo "  ║  🛰️  Нода · 🎭 Selfsteal · ⚡ H2 · 🔒 Прокси · 🧪 Тесты ║"
-    echo "  ╚══════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-    printf "  %b%-12s%b %s\n" "$WHITE" "💻 OS:" "$NC" "$PRETTY_NAME"
-    printf "  %b%-12s%b %s\n" "$WHITE" "🧠 CPU/RAM:" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
-    printf "  %b%-12s%b %b%s%b\n" "$WHITE" "🌐 Public IP:" "$NC" "$CYAN" "$PUBLIC_IP" "$NC"
-    printf "  %b%-12s%b %s\n" "$WHITE" "🏠 Local IP:" "$NC" "${LOCAL_IP:-n/a}"
-    echo
-  } | { if [[ -w /dev/tty ]]; then cat > /dev/tty; else cat; fi; }
+# Актуальная версия лаунчера (никогда не пустая)
+launcher_version() {
+  printf '%s' "${SCRIPT_VERSION:-${RN_VERSION:-unknown}}"
 }
 
-# Статус без паддинга: [текст]
+show_header() {
+  ui_clear
+  local ver
+  ver=$(launcher_version)
+  # Простая шапка БЕЗ emoji внутри линий — иначе Termius съезжает и «теряет» текст
+  _tty_printf '%b' "${CYAN}${BOLD}"
+  _tty_echo "  =================================================="
+  _tty_echo "   REMNANODE LAUNCHER"
+  _tty_echo "   version ${ver}"
+  _tty_echo "   Node | Selfsteal | H2 | Proxy | Tests"
+  _tty_echo "  =================================================="
+  _tty_printf '%b' "${NC}"
+  _tty_echo ""
+  _tty_printf '  %b%-11s%b %s\n' "$WHITE" "OS:" "$NC" "${PRETTY_NAME:-$ID}"
+  _tty_printf '  %b%-11s%b %s\n' "$WHITE" "CPU/RAM:" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
+  _tty_printf '  %b%-11s%b %b%s%b\n' "$WHITE" "Public IP:" "$NC" "$CYAN" "${PUBLIC_IP:-n/a}" "$NC"
+  _tty_printf '  %b%-11s%b %s\n' "$WHITE" "Local IP:" "$NC" "${LOCAL_IP:-n/a}"
+  _tty_echo ""
+}
+
+# Статус без паддинга: [текст] → сразу в tty
 _badge() {
   local color="$1" text="$2"
-  printf '%b[%s]%b' "$color" "$text" "$NC"
+  _tty_printf '%b[%s]%b' "$color" "$text" "$NC"
 }
 
 service_status_text() {
@@ -571,27 +573,28 @@ service_badge_color() {
   esac
 }
 
-# Колонки:  😀 NN)  TITLE........  DESC................  [STATUS]
+# Колонки без emoji-width:  NN)  TITLE........  DESC................  [STATUS]
+# icon оставлен для совместимости вызовов, в строку не печатаем (ломает Termius)
 menu_item() {
-  local icon="$1" num="$2" title="$3" desc="$4" badge="${5:-}"
+  local _icon="$1" num="$2" title="$3" desc="$4" badge="${5:-}"
   local num_s title_s desc_s
 
   num_s=$(pad_right "${num})" 4)
-  title_s=$(pad_right "$title" 12)
-  desc_s=$(pad_right "$desc" 20)
+  title_s=$(pad_right "$title" 14)
+  desc_s=$(pad_right "$desc" 22)
 
-  printf '  %s %b%s%b %s  %b%s%b' "$icon" "$WHITE" "$num_s" "$NC" "$title_s" "$GRAY" "$desc_s" "$NC"
+  _tty_printf '  %b%s%b %s  %b%s%b' "$WHITE" "$num_s" "$NC" "$title_s" "$GRAY" "$desc_s" "$NC"
   if [[ -n "$badge" ]]; then
-    printf '  '
+    _tty_printf '  '
     service_badge_color "$badge"
   fi
-  printf '\n'
+  _tty_printf '\n'
 }
 
 section() {
-  echo
-  printf '  %b%s%b\n' "${WHITE}${BOLD}" "$1" "$NC"
-  printf '  %b%s%b\n' "$GRAY" "------------------------------------------------------------" "$NC"
+  _tty_echo ""
+  _tty_printf '  %b%s%b\n' "${WHITE}${BOLD}" "$1" "$NC"
+  hline 52
 }
 
 ###############################################################################
@@ -805,7 +808,7 @@ apt_update_safe() {
 
 ensure_packages() {
   sanitize_apt_repos
-  info "⏳ Обновление apt…"
+  info "Обновление apt…"
   if apt_update_safe; then
     ok "Обновление apt"
   else
@@ -1192,7 +1195,7 @@ EOF
   info "6️⃣  Запуск контейнера"
   run_step "Запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
 
-  echo -n "  ⏳ Жду готовности контейнера"
+  _tty_printf "  * Жду готовности контейнера"
   local i
   for i in 1 2 3 4 5 6; do
     sleep 1
@@ -1881,7 +1884,7 @@ run_curl_speed_test() {
 }
 
 run_latency_test() {
-  clear
+  ui_clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
   echo "  ║              📶 ЗАДЕРЖКА / PING                    ║"
@@ -1902,7 +1905,7 @@ run_latency_test() {
 }
 
 run_dns_test() {
-  clear
+  ui_clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
   echo "  ║                  🧭 DNS ТЕСТ                       ║"
@@ -1941,7 +1944,7 @@ run_dns_test() {
 }
 
 run_ip_info_test() {
-  clear
+  ui_clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
   echo "  ║                 🌐 ИНФО ОБ IP                      ║"
@@ -1979,7 +1982,7 @@ run_ip_info_test() {
 }
 
 run_system_bench() {
-  clear
+  ui_clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
   echo "  ║              🖥️  СИСТЕМА / CPU BENCH               ║"
@@ -2013,7 +2016,7 @@ run_system_bench() {
 }
 
 run_ports_check() {
-  clear
+  ui_clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
   echo "  ║            🔌 СЛУШАЮЩИЕ ПОРТЫ / СЕРВИСЫ            ║"
@@ -2029,7 +2032,7 @@ run_ports_check() {
 }
 
 run_speedtest_menu() {
-  clear
+  ui_clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
   echo "  ║                 🚀 SPEEDTEST                       ║"
@@ -2105,7 +2108,7 @@ run_speedtest_menu() {
 
 tests_menu() {
   while true; do
-    clear
+    ui_clear
     echo -e "${CYAN}${BOLD}"
     echo "  ╔════════════════════════════════════════════════════╗"
     echo "  ║                     🧪 ТЕСТЫ                       ║"
@@ -2179,45 +2182,45 @@ system_menu() {
 # Управление нодой — меню в стиле DigneZzZ remnanode.sh
 ###############################################################################
 node_status_screen() {
-  clear
-  echo -e "${WHITE}${BOLD}  📡 RemnaNode — управление${NC}  ${GRAY}v${SCRIPT_VERSION}${NC}"
-  hline 56
-  echo
+  ui_clear
+  _tty_printf '%b  RemnaNode — управление%b  %bv%s%b\n' "${WHITE}${BOLD}" "$NC" "$GRAY" "$(launcher_version)" "$NC"
+  hline 52
+  _tty_echo ""
 
   if is_remnanode_up; then
     local node_port node_ver xray_ver
     node_port=$(grep -E '^NODE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)
     node_port=${node_port:-3000}
-    echo -e "  ${GREEN}✅ Статус ноды: РАБОТАЕТ${NC}"
-    echo
-    echo -e "  ${WHITE}🌐 Подключение:${NC}"
-    printf "     %-14s ${CYAN}%s${NC}\n" "IP:" "$PUBLIC_IP"
-    printf "     %-14s ${CYAN}%s${NC}\n" "Порт:" "$node_port"
-    printf "     %-14s ${CYAN}%s:%s${NC}\n" "URL:" "$PUBLIC_IP" "$node_port"
-    echo
-    echo -e "  ${WHITE}🧩 Компоненты:${NC}"
+    _tty_printf '  %bСтатус ноды: РАБОТАЕТ%b\n' "$GREEN" "$NC"
+    _tty_echo ""
+    _tty_echo "  Подключение:"
+    _tty_printf '     %-10s %b%s%b\n' "IP:" "$CYAN" "$PUBLIC_IP" "$NC"
+    _tty_printf '     %-10s %b%s%b\n' "Порт:" "$CYAN" "$node_port" "$NC"
+    _tty_printf '     %-10s %b%s:%s%b\n' "URL:" "$CYAN" "$PUBLIC_IP" "$node_port" "$NC"
+    _tty_echo ""
+    _tty_echo "  Компоненты:"
     node_ver=$(docker inspect --format '{{.Config.Image}}' remnanode 2>/dev/null || echo "?")
-    printf "     %-14s %s\n" "Образ:" "$node_ver"
+    _tty_printf '     %-10s %s\n' "Образ:" "$node_ver"
     xray_ver=$(docker exec remnanode xray version 2>/dev/null | head -1 || echo "н/д")
-    printf "     %-14s %s\n" "Xray:" "$xray_ver"
+    _tty_printf '     %-10s %s\n' "Xray:" "$xray_ver"
     if grep -q 'custom-xray/xray' "$COMPOSE" 2>/dev/null; then
-      echo -e "     ${YELLOW}custom Xray смонтирован (фикс онлайна)${NC}"
+      _tty_printf '     %bcustom Xray смонтирован (фикс онлайна)%b\n' "$YELLOW" "$NC"
     fi
-    echo
-    echo -e "  ${WHITE}💾 Ресурсы:${NC}"
+    _tty_echo ""
+    _tty_echo "  Ресурсы:"
     local cstats
     cstats=$(docker stats --no-stream --format '{{.CPUPerc}} | {{.MemUsage}}' remnanode 2>/dev/null || echo "n/a")
-    printf "     %-14s %s\n" "Контейнер:" "$cstats"
-    printf "     %-14s %s\n" "RAM хоста:" "$(free -h | awk '/^Mem:/ {printf "%s / %s", $3, $2}')"
+    _tty_printf '     %-10s %s\n' "Контейнер:" "$cstats"
+    _tty_printf '     %-10s %s\n' "RAM хоста:" "$(free -h | awk '/^Mem:/ {printf "%s / %s", $3, $2}')"
   elif is_remnanode_installed; then
-    echo -e "  ${RED}❌ Статус ноды: ОСТАНОВЛЕНА${NC}"
-    echo -e "  ${GRAY}Используйте пункт 2 для запуска${NC}"
+    _tty_printf '  %bСтатус ноды: ОСТАНОВЛЕНА%b\n' "$RED" "$NC"
+    _tty_echo "  Используйте пункт 2 для запуска"
   else
-    echo -e "  ${GRAY}📦 Статус: НЕ УСТАНОВЛЕНА${NC}"
-    echo -e "  ${GRAY}Используйте пункт 1 для установки${NC}"
+    _tty_echo "  Статус: НЕ УСТАНОВЛЕНА"
+    _tty_echo "  Используйте пункт 1 для установки"
   fi
-  echo
-  hline 56
+  _tty_echo ""
+  hline 52
 }
 
 remnanode_menu() {
@@ -2227,36 +2230,36 @@ remnanode_menu() {
     PUBLIC_IP=$(get_public_ip)
     node_status_screen
 
-    echo -e "  ${WHITE}🛠️  Установка и управление:${NC}"
-    echo -e "    ${WHITE} 1)${NC} 🚀 Установить RemnaNode"
-    echo -e "    ${WHITE} 2)${NC} ▶️  Запустить"
-    echo -e "    ${WHITE} 3)${NC} ⏹️  Остановить"
-    echo -e "    ${WHITE} 4)${NC} 🔄 Перезапустить"
-    echo -e "    ${WHITE} 5)${NC} 🗑️  Удалить RemnaNode"
-    echo
-    echo -e "  ${WHITE}📊 Мониторинг и логи:${NC}"
-    echo -e "    ${WHITE} 6)${NC} 📌 Статус (docker ps / compose)"
-    echo -e "    ${WHITE} 7)${NC} 📋 Логи контейнера"
-    echo -e "    ${WHITE} 8)${NC} 📈 Docker stats"
-    echo -e "    ${WHITE} 9)${NC} 📺 LIVE-мониторинг"
-    echo
-    echo -e "  ${WHITE}⚙️  Обновления и конфигурация:${NC}"
-    echo -e "    ${WHITE}10)${NC} ⬆️  Обновить образ RemnaNode"
-    echo -e "    ${WHITE}11)${NC} 🔧 Фикс онлайна Hysteria2 / custom Xray"
-    echo -e "    ${WHITE}12)${NC} 📝 Редактировать docker-compose.yml"
-    echo -e "    ${WHITE}13)${NC} 🔐 Редактировать .env"
-    echo -e "    ${WHITE}14)${NC} 🔌 Показать порты"
-    echo -e "    ${WHITE}15)${NC} ⚙️  Тюнинг производительности"
-    echo
-    echo -e "  ${WHITE}✨ Дополнительно:${NC}"
-    echo -e "    ${WHITE}16)${NC} ⚡ Настройка Hysteria2"
-    echo -e "    ${WHITE}17)${NC} 🎭 Selfsteal"
-    echo -e "    ${WHITE}18)${NC} 🏠 Открыть главное меню лаунчера"
-    echo
-    hline 56
-    echo -e "    ${GRAY}0)${NC} 🚪 Выход"
-    echo
-    ask_choice choice "👉 Выберите пункт [0-18]:"
+    _tty_echo "  Установка и управление:"
+    _tty_echo "     1) Установить RemnaNode"
+    _tty_echo "     2) Запустить"
+    _tty_echo "     3) Остановить"
+    _tty_echo "     4) Перезапустить"
+    _tty_echo "     5) Удалить RemnaNode"
+    _tty_echo ""
+    _tty_echo "  Мониторинг и логи:"
+    _tty_echo "     6) Статус (docker ps / compose)"
+    _tty_echo "     7) Логи контейнера"
+    _tty_echo "     8) Docker stats"
+    _tty_echo "     9) LIVE-мониторинг"
+    _tty_echo ""
+    _tty_echo "  Обновления и конфигурация:"
+    _tty_echo "    10) Обновить образ RemnaNode"
+    _tty_echo "    11) Фикс онлайна Hysteria2 / custom Xray"
+    _tty_echo "    12) Редактировать docker-compose.yml"
+    _tty_echo "    13) Редактировать .env"
+    _tty_echo "    14) Показать порты"
+    _tty_echo "    15) Тюнинг производительности"
+    _tty_echo ""
+    _tty_echo "  Дополнительно:"
+    _tty_echo "    16) Настройка Hysteria2"
+    _tty_echo "    17) Selfsteal"
+    _tty_echo "    18) Открыть главное меню лаунчера"
+    _tty_echo ""
+    hline 52
+    _tty_echo "     0) Выход"
+    _tty_echo ""
+    ask_choice choice "Выберите пункт [0-18]:"
 
     case "$choice" in
       1) install_remnanode; pause ;;
@@ -2344,7 +2347,7 @@ remnanode_menu() {
 live_panel() {
   trap 'return 0' INT
   while true; do
-    clear
+    ui_clear
     echo -e "${BLUE}${BOLD}  📺 LIVE PANEL${NC}  ${GRAY}(Ctrl+C — в меню)${NC}"
     hline 56
     UPTIME=$(uptime -p 2>/dev/null | sed 's/^up //')
@@ -2408,25 +2411,25 @@ main_menu() {
     PUBLIC_IP=$(get_public_ip)
     show_header
 
-    section "📦 Установка"
-    menu_item "🚀" "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
-    menu_item "🎭" "2"  "Selfsteal"  "маскировка Reality" selfsteal
-    menu_item "⚡" "3"  "Hysteria2"  "автонастройка"      hysteria
-    menu_item "🔧" "4"  "Фикс H2"    "custom Xray"        xrayfix
-    menu_item "☁️ " "5"  "WARP"       "Cloudflare SOCKS5"  warp
-    menu_item "✈️ " "6"  "MTProto"    "прокси Telegram"    mtproto
+    section "Установка"
+    menu_item "-" "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
+    menu_item "-" "2"  "Selfsteal"  "маскировка Reality" selfsteal
+    menu_item "-" "3"  "Hysteria2"  "автонастройка"      hysteria
+    menu_item "-" "4"  "Фикс H2"    "custom Xray"        xrayfix
+    menu_item "-" "5"  "WARP"       "Cloudflare SOCKS5"  warp
+    menu_item "-" "6"  "MTProto"    "прокси Telegram"    mtproto
 
-    section "🛠️  Система"
-    menu_item "💾" "7"  "SWAP"       "файл подкачки"      swap
-    menu_item "🛡️ " "8"  "UFW"        "порты и защита"     ufw
-    menu_item "⚙️ " "9"  "Тюнинг"     "BBR / буферы / RPS" tune
+    section "Система"
+    menu_item "-" "7"  "SWAP"       "файл подкачки"      swap
+    menu_item "-" "8"  "UFW"        "порты и защита"     ufw
+    menu_item "-" "9"  "Тюнинг"     "BBR / буферы / RPS" tune
 
-    section "🎛️  Сервис"
-    menu_item "📡" "10" "Нода"       "меню управления"    node_cli
-    menu_item "🧪" "11" "Тесты"      "speed / ping / DNS"
-    echo
-    menu_item "🚪" "0"  "Выход"      ""
-    echo
+    section "Сервис"
+    menu_item "-" "10" "Нода"       "меню управления"    node_cli
+    menu_item "-" "11" "Тесты"      "speed / ping / DNS"
+    _tty_echo ""
+    menu_item "-" "0"  "Выход"      ""
+    _tty_echo ""
     ask_choice choice
 
     case "$choice" in

@@ -2,7 +2,7 @@
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  РУСИФИЦИРОВАННАЯ КОПИЯ для Wyrzyy/nodescript                 ║
 # ║  Оригинал: DigneZzZ/remnawave-scripts (MIT)                   ║
-# ║  UI полностью на русском. Логика upstream сохранена.          ║
+# ║  UI на русском + фикс Termius (v2026.7.16 launcher).           ║
 # ╚════════════════════════════════════════════════════════════════╝
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  Selfsteal — веб-сервер для маскировки Reality           ║
@@ -2675,7 +2675,8 @@ install_command() {
         return 1
     fi
     
-    clear
+    # Полная очистка (Termius)
+    printf '\033[?1049l\033[0m\033[2J\033[3J\033[H' > /dev/tty 2>/dev/null || clear
     local server_display_name
     if [ "$WEB_SERVER" = "nginx" ]; then
         server_display_name="Nginx"
@@ -2733,7 +2734,7 @@ install_command() {
                 echo
                 echo -e "${WHITE}Варианты:${NC}"
                 echo -e "   ${WHITE}1)${NC} ${GRAY}Переустановить $existing_name${NC}"
-                echo -e "   ${WHITE}2)${NC} ${GRAY}Cancel${NC}"
+                echo -e "   ${WHITE}2)${NC} ${GRAY}Отмена${NC}"
             fi
         else
             # Trying to install different server
@@ -2811,7 +2812,7 @@ install_command() {
                     esac
                 fi
                 
-                log_warning "Удаляю существующий $existing_name installation..."
+                log_warning "Удаляю существующий $existing_name…"
                 cd "$remove_dir" 2>/dev/null && docker compose down 2>/dev/null || true
                 rm -rf "$remove_dir"
                 log_success "Существующая установка удалена"
@@ -4315,7 +4316,7 @@ renew_ssl_command() {
     echo -e "${WHITE}Варианты:${NC}"
     echo -e "   ${WHITE}1)${NC} ${GRAY}Проверить и обновить при необходимости (авто)${NC}"
     echo -e "   ${WHITE}2)${NC} ${GRAY}Принудительное обновление${NC}"
-    echo -e "   ${WHITE}3)${NC} ${GRAY}Cancel${NC}"
+    echo -e "   ${WHITE}3)${NC} ${GRAY}Отмена${NC}"
     echo
     
     read -p "Выберите пункт [1-3]: " -r renew_choice
@@ -4830,7 +4831,7 @@ edit_command() {
         echo -e "   ${WHITE}2)${NC} ${GRAY}Caddyfile (конфиг Caddy)${NC}"
         echo -e "   ${WHITE}3)${NC} ${GRAY}docker-compose.yml (конфиг Docker)${NC}"
     fi
-    echo -e "   ${WHITE}0)${NC} ${GRAY}Cancel${NC}"
+    echo -e "   ${WHITE}0)${NC} ${GRAY}Отмена${NC}"
     echo
     
     if [ "$WEB_SERVER" = "nginx" ]; then
@@ -4862,7 +4863,7 @@ edit_command() {
                 log_warning "Restart $server_name to apply changes: $APP_NAME restart"
                 ;;
             0)
-                echo -e "${GRAY}Cancelled${NC}"
+                echo -e "${GRAY}Отменено${NC}"
                 ;;
             *)
                 log_error "Invalid option"
@@ -4889,7 +4890,7 @@ edit_command() {
                 log_warning "Restart $server_name to apply changes: $APP_NAME restart"
                 ;;
             0)
-                echo -e "${GRAY}Cancelled${NC}"
+                echo -e "${GRAY}Отменено${NC}"
                 ;;
             *)
                 log_error "Invalid option"
