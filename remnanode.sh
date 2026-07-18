@@ -4,10 +4,10 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.6
+# Версия: 2026.7.7
 ###############################################################################
 
-SCRIPT_VERSION="2026.7.6"
+SCRIPT_VERSION="2026.7.7"
 APP="remnanode"
 DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
@@ -233,75 +233,114 @@ show_header() {
   printf "  %b%-10s%b %s\n" "$WHITE" "🏠 Local:" "$NC" "${LOCAL_IP:-n/a}"
 }
 
-# Статус: всегда [xxxxxx] — 6 символов внутри
+# Статус без паддинга: [текст]
 _badge() {
-  local color="$1" text="$2" plain
-  plain=$(pad_right "$text" 6)
-  printf '%b[%s]%b' "$color" "$plain" "$NC"
+  local color="$1" text="$2"
+  printf '%b[%s]%b' "$color" "$text" "$NC"
 }
 
 service_status_text() {
-  # печатает только короткий текст статуса (без скобок) в stdout
   local name="$1"
   case "$name" in
     remnanode)
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then echo "онлайн"
-      elif [[ -f "$COMPOSE" ]] || [[ -d "$DIR" ]]; then echo "есть"
-      else echo "нет"; fi
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+        echo "работает"
+      elif [[ -f "$COMPOSE" ]] || [[ -d "$DIR" ]]; then
+        echo "установлен"
+      else
+        echo "не установлен"
+      fi
       ;;
     selfsteal)
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '(caddy|nginx).*selfsteal|selfsteal'; then echo "онлайн"
-      elif [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]] || command -v selfsteal >/dev/null 2>&1; then echo "есть"
-      else echo "нет"; fi
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '(caddy|nginx).*selfsteal|selfsteal'; then
+        echo "работает"
+      elif [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]] || command -v selfsteal >/dev/null 2>&1; then
+        echo "установлен"
+      else
+        echo "не установлен"
+      fi
       ;;
     warp)
       if command -v warp-cli >/dev/null 2>&1; then
-        if warp-cli --accept-tos status 2>/dev/null | grep -qi connected; then echo "онлайн"
-        else echo "есть"; fi
-      else echo "нет"; fi
+        if warp-cli --accept-tos status 2>/dev/null | grep -qi connected; then
+          echo "подключён"
+        else
+          echo "установлен"
+        fi
+      else
+        echo "не установлен"
+      fi
       ;;
     hysteria)
-      if [[ -d /opt/hysteria/certs ]] || { [[ -f "$COMPOSE" ]] && grep -qE 'hysteria|/opt/hysteria' "$COMPOSE" 2>/dev/null; }; then
-        echo "готово"
-      else echo "нет"; fi
+      if [[ -d /opt/hysteria/certs ]] \
+        || { [[ -f "$COMPOSE" ]] && grep -qE 'hysteria|/opt/hysteria' "$COMPOSE" 2>/dev/null; }; then
+        echo "настроено"
+      else
+        echo "не настроено"
+      fi
       ;;
     xrayfix)
-      if [[ -f "$COMPOSE" ]] && grep -q 'custom-xray/xray' "$COMPOSE" 2>/dev/null && [[ -x "$CUSTOM_XRAY_DIR/xray" ]]; then
-        echo "ок"
-      elif [[ -x "$CUSTOM_XRAY_DIR/xray" ]]; then echo "скачан"
-      else echo "нет"; fi
+      if [[ -f "$COMPOSE" ]] && grep -q 'custom-xray/xray' "$COMPOSE" 2>/dev/null \
+        && [[ -x "$CUSTOM_XRAY_DIR/xray" ]]; then
+        echo "патч активен"
+      elif [[ -x "$CUSTOM_XRAY_DIR/xray" ]]; then
+        echo "ядро скачано"
+      else
+        echo "не применён"
+      fi
       ;;
     mtproto)
-      if systemctl is-active --quiet mtproto-proxy 2>/dev/null; then echo "онлайн"
-      elif command -v mtbuddy >/dev/null 2>&1 || systemctl list-unit-files mtproto-proxy.service 2>/dev/null | grep -q mtproto; then echo "есть"
-      else echo "нет"; fi
+      if systemctl is-active --quiet mtproto-proxy 2>/dev/null; then
+        echo "работает"
+      elif command -v mtbuddy >/dev/null 2>&1 \
+        || systemctl list-unit-files mtproto-proxy.service 2>/dev/null | grep -q mtproto; then
+        echo "установлен"
+      else
+        echo "не установлен"
+      fi
       ;;
     swap)
-      local sw
+      local sw sw_h
       sw=$(free -m | awk '/^Swap:/ {print $2}')
-      if (( sw > 0 )); then free -h | awk '/^Swap:/ {print $2}'
-      else echo "нет"; fi
+      if (( sw > 0 )); then
+        sw_h=$(free -h | awk '/^Swap:/ {print $2}')
+        echo "активен ${sw_h}"
+      else
+        echo "не создан"
+      fi
       ;;
     ufw)
-      if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then echo "вкл"
-      elif command -v ufw >/dev/null 2>&1 && [[ -f /etc/ufw/ufw.conf ]]; then echo "выкл"
-      else echo "нет"; fi
+      if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+        echo "активен"
+      elif command -v ufw >/dev/null 2>&1 && [[ -f /etc/ufw/ufw.conf ]]; then
+        echo "выключен"
+      else
+        echo "не настроен"
+      fi
       ;;
     tune)
       local cc
       cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-      if [[ -f /etc/sysctl.d/99-remnanode.conf ]] && [[ "$cc" == "bbr" ]]; then echo "ок"
-      elif [[ -f /etc/sysctl.d/99-remnanode.conf ]]; then echo "часть"
-      else echo "нет"; fi
+      if [[ -f /etc/sysctl.d/99-remnanode.conf ]] && [[ "$cc" == "bbr" ]]; then
+        echo "BBR включён"
+      elif [[ -f /etc/sysctl.d/99-remnanode.conf ]]; then
+        echo "частично"
+      else
+        echo "не применён"
+      fi
       ;;
     node_cli)
-      if [[ -x "$CLI_PATH" ]] || command -v remnanode >/dev/null 2>&1; then
-        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then echo "онлайн"
-        elif [[ -f "$COMPOSE" ]]; then echo "готово"
-        else echo "cli"; fi
-      else echo "нет"; fi
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+        echo "нода online"
+      elif [[ -f "$COMPOSE" ]]; then
+        echo "нода offline"
+      elif [[ -x "$CLI_PATH" ]] || command -v remnanode >/dev/null 2>&1; then
+        echo "только CLI"
+      else
+        echo "нет CLI"
+      fi
       ;;
-    *) echo "нет" ;;
+    *) echo "неизвестно" ;;
   esac
 }
 
@@ -309,10 +348,21 @@ service_badge_color() {
   local name="$1" text
   text=$(service_status_text "$name")
   case "$text" in
-    онлайн|готово|ок|вкл) _badge "$GREEN" "$text" ;;
-    есть|скачан|часть|cli|выкл) _badge "$YELLOW" "$text" ;;
-    нет) _badge "$RED" "$text" ;;
-    *) _badge "$GREEN" "$text" ;;  # swap size и т.п.
+    "работает"|"подключён"|"настроено"|"патч активен"|"BBR включён"|"нода online")
+      _badge "$GREEN" "$text"
+      ;;
+    активен*)
+      _badge "$GREEN" "$text"
+      ;;
+    "установлен"|"ядро скачано"|"частично"|"выключен"|"только CLI"|"нода offline")
+      _badge "$YELLOW" "$text"
+      ;;
+    "не установлен"|"не настроено"|"не применён"|"не создан"|"не настроен"|"нет CLI"|"неизвестно")
+      _badge "$RED" "$text"
+      ;;
+    *)
+      _badge "$YELLOW" "$text"
+      ;;
   esac
 }
 
