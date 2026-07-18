@@ -629,23 +629,14 @@ menu_item() {
 }
 
 section() {
-  local title="$1"
+  local title="$1" lead rest
   _tty_echo ""
-  # Если заголовок начинается с emoji — гарантируем пробел после первого «слова»
-  # (на случай 📦Установка без пробела в вызове / съеденного пробела)
-  if [[ "$title" != [[":space:]]* ]] && [[ "$title" =~ ^[^[:alnum:][:space:][:punct:]] ]]; then
-    # вставить пробел после ведущего non-ascii токена, если его нет
-    if [[ ! "$title" =~ [[:space:]] ]]; then
-      :
-    fi
-  fi
-  # Нормализуем: emoji + два пробела + остальной текст
-  local lead rest
-  if [[ "$title" =~ ^(.[[:space:]️‍]*)[[:space:]]+(.*)$ ]]; then
-    # уже есть пробел после emoji-кластера — оставим два
+  # emoji + два ASCII-пробела + текст (Termius часто «съедает» один пробел)
+  if [[ "$title" == *" "* ]]; then
     lead="${title%% *}"
     rest="${title#* }"
-    rest="${rest# }"
+    # схлопнуть лишние пробелы в начале rest
+    rest="${rest#"${rest%%[![:space:]]*}"}"
     title="${lead}  ${rest}"
   fi
   _tty_printf '  %b%s%b\n' "${WHITE}${BOLD}" "$title" "$NC"
