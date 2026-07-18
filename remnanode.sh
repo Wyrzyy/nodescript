@@ -3,42 +3,61 @@ set -Eeuo pipefail
 
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
-# Установщик: Remnanode + Selfsteal + WARP + GeoAssets (Loyalsoldier)
-# Версия: 2026.3.0
+# Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
+# Версия: 2026.7.0
 ###############################################################################
 
+SCRIPT_VERSION="2026.7.0"
 APP="remnanode"
 DIR="/opt/$APP"
 COMPOSE="$DIR/docker-compose.yml"
-ASSETS_DIR="$DIR/assets"
+ENV_FILE="$DIR/.env"
 LOG="/var/log/${APP}-install.log"
+CUSTOM_XRAY_DIR="$DIR/custom-xray"
+XRAY_VERSION_DEFAULT="v26.6.1"
 PANEL_IP_DEFAULT="141.98.7.57"
 WARP_PORT=9091
+LAUNCHER_PATH="/opt/remnanode/installer.sh"
+CLI_PATH="/usr/local/bin/remnanode"
 
-# Источник geo-файлов
-GEOSITE_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-GEOIP_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+# Внешние скрипты
+SELFSTEAL_RAW="https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/selfsteal.sh"
+H2_RAW="https://raw.githubusercontent.com/Origamidnd/h2-script/master/setup.sh"
+MULTITEST_RAW="https://raw.githubusercontent.com/saveksme/multitest/master/multitest.sh"
+MTPROTO_BOOTSTRAP_RAW="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh"
+XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/download"
 
 export DEBIAN_FRONTEND=noninteractive
 export APT_LISTCHANGES_FRONTEND=none
 export NEEDRESTART_MODE=a
 
+# Цвета
 GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; NC='\033[0m'
+CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; BOLD='\033[1m'
+DIM='\033[2m'; NC='\033[0m'
 
-ok()   { echo -e "${GREEN}✔ $1${NC}"; }
-info() { echo -e "${BLUE}ℹ $1${NC}"; }
-warn() { echo -e "${YELLOW}⚠ $1${NC}"; }
-err()  { echo -e "${RED}✖ $1${NC}"; echo "--- last 30 log lines ---"; tail -n 30 "$LOG" 2>/dev/null || true; exit 1; }
+ok()   { echo -e "${GREEN}✔ ${1}${NC}"; }
+info() { echo -e "${BLUE}ℹ ${1}${NC}"; }
+warn() { echo -e "${YELLOW}⚠ ${1}${NC}"; }
+err()  {
+  echo -e "${RED}✖ ${1}${NC}"
+  echo -e "${GRAY}── последние строки лога ──${NC}"
+  tail -n 30 "$LOG" 2>/dev/null || true
+  exit 1
+}
 
-: > "$LOG"
-exec 3>>"$LOG"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+: > "$LOG" 2>/dev/null || true
+exec 3>>"$LOG" 2>/dev/null || exec 3>/dev/null
+
+hline() { echo -e "${GRAY}$(printf '─%.0s' $(seq 1 "${1:-56}"))${NC}"; }
+pause() { read -rp $'\nНажмите Enter для продолжения...' _; }
 
 spin() {
   local pid=$1 msg=$2
   local s='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
   while kill -0 "$pid" 2>/dev/null; do
-    printf "\r%s %s" "$msg" "${s:$((i++%${#s})):1}"
+    printf "\r%s %s" "$msg" "${s:$((i++ % ${#s})):1}"
     sleep 0.08
   done
   wait "$pid"
@@ -58,32 +77,99 @@ run_step() {
   spin $! "$msg" || err "Ошибка на шаге: $msg"
 }
 
-trap 'err "Скрипт прерван на строке $LINENO"' ERR
-[[ $EUID -ne 0 ]] && err "Запусти от root: sudo bash $0"
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || err "Запустите от root: sudo bash $0"
+}
 
 ###############################################################################
-# OS detection + server info
+# GitHub / загрузки — зеркала для РФ и зарубежья
 ###############################################################################
+# Порядок: прямой URL → прокси-зеркала (часто доступны из РФ)
+gh_candidates() {
+  local url="$1"
+  echo "$url"
+  case "$url" in
+    https://raw.githubusercontent.com/*)
+      local path="${url#https://raw.githubusercontent.com/}"
+      echo "https://ghproxy.net/https://raw.githubusercontent.com/${path}"
+      echo "https://ghfast.top/https://raw.githubusercontent.com/${path}"
+      echo "https://ghproxy.com/https://raw.githubusercontent.com/${path}"
+      # jsDelivr: user/repo/branch/path → user/repo@branch/path
+      if [[ "$path" =~ ^([^/]+)/([^/]+)/([^/]+)/(.*)$ ]]; then
+        echo "https://cdn.jsdelivr.net/gh/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}@${BASH_REMATCH[3]}/${BASH_REMATCH[4]}"
+      fi
+      ;;
+    https://github.com/*/releases/download/*)
+      echo "https://ghproxy.net/${url}"
+      echo "https://ghfast.top/${url}"
+      echo "https://ghproxy.com/${url}"
+      ;;
+    https://github.com/*)
+      echo "https://ghproxy.net/${url}"
+      echo "https://ghfast.top/${url}"
+      echo "https://ghproxy.com/${url}"
+      ;;
+  esac
+}
+
+# Скачать URL в файл (с зеркалами). Возврат 0 при успехе.
+gh_download() {
+  local url="$1" dest="$2"
+  local candidate
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    if curl -fsSL --connect-timeout 8 --max-time 120 --retry 2 -o "$dest" "$candidate" 2>/dev/null; then
+      if [[ -s "$dest" ]]; then
+        echo "$candidate" >&3
+        return 0
+      fi
+    fi
+  done < <(gh_candidates "$url")
+  return 1
+}
+
+# Выполнить remote bash-скрипт: скачать во временный файл и запустить
+gh_run_bash() {
+  local url="$1"
+  shift
+  local tmp
+  tmp=$(mktemp /tmp/rn-remote.XXXXXX.sh)
+  if ! gh_download "$url" "$tmp"; then
+    rm -f "$tmp"
+    warn "Не удалось скачать скрипт (прямая ссылка и зеркала): $url"
+    return 1
+  fi
+  chmod +x "$tmp"
+  set +e
+  bash "$tmp" "$@"
+  local rc=$?
+  set -e
+  rm -f "$tmp"
+  return $rc
+}
+
+# bash <(curl ...) эквивалент с зеркалами + поддержка "@ install"
+gh_pipe_bash() {
+  local url="$1"
+  shift
+  gh_run_bash "$url" "$@"
+}
+
+###############################################################################
+# OS / система
+###############################################################################
+require_root
+
 . /etc/os-release
 case "$ID" in
   ubuntu|debian) ;;
   *) err "Поддерживается только Ubuntu/Debian. Найдено: $ID" ;;
 esac
 
-ARCH=$(dpkg --print-architecture)
-CODENAME=$VERSION_CODENAME
+ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+CODENAME=${VERSION_CODENAME:-}
 CPU=$(nproc)
 RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
-
-get_public_ip() {
-  curl -fsS4 --max-time 3 https://api.ipify.org 2>/dev/null \
-    || curl -fsS4 --max-time 3 https://ifconfig.me 2>/dev/null \
-    || curl -fsS4 --max-time 3 https://icanhazip.com 2>/dev/null \
-    || echo "неизвестен"
-}
-
-PUBLIC_IP=$(get_public_ip)
-LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 
 if   (( CPU <= 1 )); then BACKLOG=4096
 elif (( CPU <= 2 )); then BACKLOG=16384
@@ -91,90 +177,122 @@ elif (( CPU <= 4 )); then BACKLOG=32768
 else                      BACKLOG=65535
 fi
 
+get_public_ip() {
+  curl -fsS4 --max-time 3 https://api.ipify.org 2>/dev/null \
+    || curl -fsS4 --max-time 3 https://ifconfig.me 2>/dev/null \
+    || curl -fsS4 --max-time 3 https://icanhazip.com 2>/dev/null \
+    || curl -fsS4 --max-time 3 https://ifconfig.io 2>/dev/null \
+    || echo "неизвестен"
+}
+
+PUBLIC_IP=$(get_public_ip)
+LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+
 ###############################################################################
-# Стартовый экран
+# UI
 ###############################################################################
 show_header() {
   clear
-  echo -e "${BLUE}╔══════════════════════════════════════════╗"
-  echo -e "║   🚀 REMNANODE LAUNCHER (2026)           ║"
-  echo -e "╚══════════════════════════════════════════╝${NC}"
-  echo
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║           REMNANODE LAUNCHER  ·  ${SCRIPT_VERSION}           ║"
+  echo "  ║     Нода · Selfsteal · Hysteria2 · Прокси · Тесты  ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
   echo -e "  ${WHITE}OS:${NC}        $PRETTY_NAME"
-  echo -e "  ${WHITE}CPU/RAM:${NC}   $CPU cores | ${RAM_MB}MB | $ARCH"
+  echo -e "  ${WHITE}CPU/RAM:${NC}   $CPU ядер | ${RAM_MB} МБ | $ARCH"
   echo -e "  ${WHITE}Public IP:${NC} ${CYAN}${PUBLIC_IP}${NC}"
   echo -e "  ${WHITE}Local IP:${NC}  ${LOCAL_IP:-неизвестен}"
   echo
 }
 
-###############################################################################
-# Проверка существующих установок
-###############################################################################
-check_existing_remnanode() {
-  if [[ -d "$DIR" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
-    return 0
-  fi
-  return 1
+service_badge() {
+  local name="$1"
+  case "$name" in
+    remnanode)
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+        echo -e "${GREEN}● работает${NC}"
+      elif [[ -d "$DIR" ]]; then
+        echo -e "${YELLOW}● остановлен${NC}"
+      else
+        echo -e "${RED}● не установлен${NC}"
+      fi
+      ;;
+    selfsteal)
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '(caddy|nginx).*selfsteal|selfsteal'; then
+        echo -e "${GREEN}● работает${NC}"
+      elif [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]]; then
+        echo -e "${YELLOW}● остановлен${NC}"
+      else
+        echo -e "${RED}● не установлен${NC}"
+      fi
+      ;;
+    warp)
+      if command -v warp-cli >/dev/null 2>&1; then
+        if warp-cli --accept-tos status 2>/dev/null | grep -qi connected; then
+          echo -e "${GREEN}● подключён${NC}"
+        else
+          echo -e "${YELLOW}● отключён${NC}"
+        fi
+      else
+        echo -e "${RED}● не установлен${NC}"
+      fi
+      ;;
+    hysteria)
+      if [[ -d /opt/hysteria/certs ]] || grep -q 'hysteria' "$COMPOSE" 2>/dev/null; then
+        echo -e "${GREEN}● настроено${NC}"
+      else
+        echo -e "${RED}● не настроено${NC}"
+      fi
+      ;;
+    mtproto)
+      if systemctl is-active --quiet mtproto-proxy 2>/dev/null || command -v mtbuddy >/dev/null 2>&1; then
+        if systemctl is-active --quiet mtproto-proxy 2>/dev/null; then
+          echo -e "${GREEN}● работает${NC}"
+        else
+          echo -e "${YELLOW}● установлен${NC}"
+        fi
+      else
+        echo -e "${RED}● не установлен${NC}"
+      fi
+      ;;
+    swap)
+      local sw
+      sw=$(free -m | awk '/^Swap:/ {print $2}')
+      if (( sw > 0 )); then
+        echo -e "${GREEN}● $(free -h | awk '/^Swap:/ {print $2}')${NC}"
+      else
+        echo -e "${RED}● нет${NC}"
+      fi
+      ;;
+    ufw)
+      if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+        echo -e "${GREEN}● активен${NC}"
+      elif command -v ufw >/dev/null 2>&1; then
+        echo -e "${YELLOW}● установлен, выключен${NC}"
+      else
+        echo -e "${RED}● не настроен${NC}"
+      fi
+      ;;
+  esac
 }
 
-remove_existing_remnanode() {
-  warn "Найдена существующая установка Remnanode."
-  echo
-  echo -e "  ${WHITE}Что есть:${NC}"
-  [[ -d "$DIR" ]] && echo -e "    • Директория: ${GRAY}$DIR${NC}"
-  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$' \
-    && echo -e "    • Контейнер: ${GRAY}remnanode${NC}"
-  echo
-  read -rp "  Удалить старую установку перед продолжением? [y/N]: " ans
-  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
-    echo
-    warn "Установка отменена."
-    exit 0
-  fi
-
-  echo
-  if [[ -d "$DIR" ]] && [[ -f "$COMPOSE" ]]; then
-    run_step "Остановка контейнера" "cd $DIR && docker compose down -v 2>/dev/null || true"
-  fi
-  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$' \
-    && run_step "Удаление контейнера" "docker rm -f remnanode 2>/dev/null || true"
-  [[ -d "$DIR" ]] && run_step "Удаление файлов" "rm -rf $DIR"
-  ok "Старая установка удалена"
-  echo
-}
-
 ###############################################################################
-# Базовая подготовка системы (общая для всех установщиков)
+# Базовые пакеты (без SWAP/UFW — они отдельными пунктами)
 ###############################################################################
-prepare_system() {
+ensure_packages() {
   run_step "Обновление apt" "apt-get update -qq"
-
   run_step "Установка пакетов" \
-"apt-get install -y -qq curl wget git jq ca-certificates gnupg lsb-release \
- nftables fail2ban irqbalance ethtool htop iftop \
- unattended-upgrades apt-listchanges \
- systemd-zram-generator dnsutils"
+"apt-get install -y -qq curl wget ca-certificates gnupg lsb-release \
+ jq htop iftop ethtool irqbalance dnsutils unzip \
+ ufw fail2ban || true"
+}
 
-  # SWAP + ZRAM
-  if (( RAM_MB <= 4096 )); then
-    if [[ ! -f /swapfile ]]; then
-      local SWAP_SIZE=$(( RAM_MB <= 2048 ? 2 : 1 ))
-      run_step "Swap ${SWAP_SIZE}G" \
-"fallocate -l ${SWAP_SIZE}G /swapfile && chmod 600 /swapfile && \
- mkswap /swapfile && swapon /swapfile && \
- echo '/swapfile none swap sw 0 0' >> /etc/fstab"
-    fi
-
-    if (( RAM_MB <= 2048 )); then
-      run_step "ZRAM (50% RAM)" \
-"bash -c 'cat > /etc/systemd/zram-generator.conf <<EOF
-[zram0]
-zram-size = ram / 2
-compression-algorithm = zstd
-EOF
-systemctl daemon-reload && systemctl restart systemd-zram-setup@zram0.service || true'"
-    fi
-  fi
+###############################################################################
+# Тюнинг производительности ноды (актуально на 2026)
+###############################################################################
+apply_performance_tuning() {
+  info "Применяем тюнинг производительности VPN-ноды (BBR / буферы / RPS)"
 
   run_step "Swappiness" \
 "bash -c 'cat > /etc/sysctl.d/98-swap.conf <<EOF
@@ -182,43 +300,55 @@ vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 EOF'"
 
-  # SYSCTL — тюнинг ядра
-  run_step "Тюнинг ядра (TCP/UDP/conntrack)" \
+  run_step "Тюнинг ядра (TCP BBR + UDP + conntrack)" \
 "bash -c 'cat > /etc/sysctl.d/99-remnanode.conf <<EOF
+# Congestion / qdisc — лучший дефолт для прокси/VPN в 2026
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 60
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_max_tw_buckets = 1440000
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+
+# Очереди и backlog
 net.core.somaxconn = $BACKLOG
 net.core.netdev_max_backlog = $BACKLOG
 net.ipv4.tcp_max_syn_backlog = $BACKLOG
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_syn_retries = 3
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+
+# Буферы (критично для Reality / Hysteria2 / высоких скоростей)
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
 net.core.optmem_max = 65536
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-net.ipv4.udp_mem = 262144 524288 16777216
+net.ipv4.tcp_rmem = 4096 131072 67108864
+net.ipv4.tcp_wmem = 4096 131072 67108864
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.udp_mem = 65536 131072 262144
 net.ipv4.ip_local_port_range = 1024 65535
-net.netfilter.nf_conntrack_max = 1048576
+
+# Conntrack
+net.netfilter.nf_conntrack_max = 2097152
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 net.netfilter.nf_conntrack_udp_timeout = 30
 net.netfilter.nf_conntrack_udp_timeout_stream = 180
+
+# Forwarding / базовая защита
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.all.rp_filter = 1
@@ -228,18 +358,23 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.all.log_martians = 0
+
 fs.file-max = 2097152
 fs.nr_open = 2097152
 vm.max_map_count = 262144
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
 EOF
 modprobe nf_conntrack 2>/dev/null || true
 echo nf_conntrack > /etc/modules-load.d/nf_conntrack.conf
-echo 262144 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
-sysctl --system >/dev/null'"
+echo 524288 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+# BBR модуль
+modprobe tcp_bbr 2>/dev/null || true
+echo tcp_bbr > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-remnanode.conf >/dev/null 2>&1 || true'"
 
-  # Limits
-  run_step "Системные лимиты" \
+  run_step "Системные лимиты (nofile)" \
 "bash -c 'cat > /etc/security/limits.d/99-remnanode.conf <<EOF
 * soft nofile 1048576
 * hard nofile 1048576
@@ -255,10 +390,9 @@ DefaultLimitNOFILE=1048576
 DefaultLimitNPROC=infinity
 EOF'"
 
-  # CPU governor
   run_step "CPU governor: performance" \
 "bash -c 'for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-  [ -w \$cpu ] && echo performance > \$cpu || true
+  [ -w \"\$cpu\" ] && echo performance > \"\$cpu\" || true
 done
 cat > /etc/systemd/system/cpu-performance.service <<EOF
 [Unit]
@@ -273,9 +407,8 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload && systemctl enable cpu-performance.service >/dev/null 2>&1 || true'"
 
-  # RPS
   if (( CPU > 1 )); then
-    run_step "RPS (Receive Packet Steering)" \
+    run_step "RPS / IRQ balance" \
 "bash -c 'IFACE=\$(ip route show default | awk \"/default/ {print \\\$5; exit}\")
 if [ -n \"\$IFACE\" ]; then
   MASK=\$(printf \"%x\" \$(( (1 << $CPU) - 1 )))
@@ -286,6 +419,8 @@ if [ -n \"\$IFACE\" ]; then
   for q in /sys/class/net/\$IFACE/queues/rx-*/rps_flow_cnt; do
     [ -w \$q ] && echo 4096 > \$q || true
   done
+  # ethool offloads где безопасно
+  ethtool -K \$IFACE gro on gso on tso on 2>/dev/null || true
 fi
 cat > /etc/systemd/system/rps-tune.service <<EOF
 [Unit]
@@ -302,30 +437,23 @@ systemctl daemon-reload && systemctl enable rps-tune.service >/dev/null 2>&1 || 
 systemctl enable irqbalance >/dev/null 2>&1 && systemctl restart irqbalance || true'"
   fi
 
-  # Auto security updates
-  run_step "Auto security updates" \
-"bash -c 'cat > /etc/apt/apt.conf.d/50unattended-upgrades <<EOF
-Unattended-Upgrade::Allowed-Origins {
-    \"\${distro_id}:\${distro_codename}-security\";
-    \"\${distro_id}ESMApps:\${distro_codename}-apps-security\";
-    \"\${distro_id}ESM:\${distro_codename}-infra-security\";
-};
-Unattended-Upgrade::Automatic-Reboot \"false\";
-Unattended-Upgrade::Remove-Unused-Dependencies \"true\";
-EOF
-cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
-APT::Periodic::Update-Package-Lists \"1\";
-APT::Periodic::Unattended-Upgrade \"1\";
-EOF
-systemctl enable unattended-upgrades >/dev/null 2>&1
-systemctl restart unattended-upgrades'"
+  # Предпочитать IPv4 (часто чинит docker pull на VPS с битым IPv6)
+  if ! grep -q '^precedence ::ffff:0:0/96' /etc/gai.conf 2>/dev/null; then
+    if grep -q '^#precedence ::ffff:0:0/96' /etc/gai.conf 2>/dev/null; then
+      sed -i 's/^#precedence ::ffff:0:0\/96.*/precedence ::ffff:0:0\/96  100/' /etc/gai.conf
+    else
+      echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
+    fi
+  fi
+
+  ok "Тюнинг производительности применён"
 }
 
 ###############################################################################
 # Docker
 ###############################################################################
 install_docker() {
-  if command -v docker >/dev/null; then
+  if command -v docker >/dev/null 2>&1; then
     info "Docker уже установлен"
   else
     run_step "Docker репозиторий" \
@@ -335,7 +463,7 @@ install_docker() {
  echo \"deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable\" > /etc/apt/sources.list.d/docker.list && \
  apt-get update -qq"
 
-    run_step "Docker установка" \
+    run_step "Установка Docker" \
 "apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
  systemctl enable docker && systemctl start docker"
   fi
@@ -363,194 +491,100 @@ systemctl restart docker'"
 }
 
 ###############################################################################
-# GEO ASSETS — Loyalsoldier geosite.dat + geoip.dat
+# Установка CLI-панели (команда remnanode)
 ###############################################################################
-install_geoassets() {
-  info "Установка расширенных geo-файлов (Loyalsoldier)"
-  info "Категории: yandex-ads, vk-ads, mail-ru-ads, category-ads-all и др."
-  echo
-
-  mkdir -p "$ASSETS_DIR"
-
-  run_step "Скачивание geosite.dat" \
-"curl -fsSL --retry 3 --max-time 60 -o $ASSETS_DIR/geosite.dat.new $GEOSITE_URL && \
- mv $ASSETS_DIR/geosite.dat.new $ASSETS_DIR/geosite.dat"
-
-  run_step "Скачивание geoip.dat" \
-"curl -fsSL --retry 3 --max-time 60 -o $ASSETS_DIR/geoip.dat.new $GEOIP_URL && \
- mv $ASSETS_DIR/geoip.dat.new $ASSETS_DIR/geoip.dat"
-
-  # Хелпер для ручного обновления
-  cat > /usr/local/bin/remnanode-geo-update <<EOF
-#!/usr/bin/env bash
-set -e
-ASSETS_DIR="$ASSETS_DIR"
-GEOSITE_URL="$GEOSITE_URL"
-GEOIP_URL="$GEOIP_URL"
-
-echo "[\$(date '+%F %T')] Обновление geo-файлов..."
-mkdir -p "\$ASSETS_DIR"
-
-curl -fsSL --retry 3 --max-time 60 -o "\$ASSETS_DIR/geosite.dat.new" "\$GEOSITE_URL" || { echo "geosite.dat: fail"; exit 1; }
-curl -fsSL --retry 3 --max-time 60 -o "\$ASSETS_DIR/geoip.dat.new" "\$GEOIP_URL" || { echo "geoip.dat: fail"; exit 1; }
-
-mv "\$ASSETS_DIR/geosite.dat.new" "\$ASSETS_DIR/geosite.dat"
-mv "\$ASSETS_DIR/geoip.dat.new" "\$ASSETS_DIR/geoip.dat"
-echo "Файлы обновлены. Перезапуск контейнера..."
-
-cd /opt/remnanode && docker compose restart remnanode
-echo "Готово."
-EOF
-  chmod +x /usr/local/bin/remnanode-geo-update
-
-  # Cron на еженедельное обновление (воскресенье 4:00)
-  run_step "Установка cron для автообновления" \
-"bash -c 'cat > /etc/cron.d/remnanode-geo-update <<EOF
-# Еженедельное обновление geo-файлов для Remnanode (Loyalsoldier)
-0 4 * * 0 root /usr/local/bin/remnanode-geo-update >> /var/log/remnanode-geo-update.log 2>&1
-EOF
-chmod 644 /etc/cron.d/remnanode-geo-update'"
-
-  local geosite_size geoip_size
-  geosite_size=$(du -h "$ASSETS_DIR/geosite.dat" 2>/dev/null | cut -f1)
-  geoip_size=$(du -h "$ASSETS_DIR/geoip.dat" 2>/dev/null | cut -f1)
-
-  ok "Geo-файлы установлены (geosite: ${geosite_size}, geoip: ${geoip_size})"
-  info "Ручное обновление: ${CYAN}remnanode-geo-update${NC}"
-  info "Автообновление:    каждое воскресенье в 04:00"
-}
-
-###############################################################################
-# nftables firewall — динамический, в зависимости от установленных сервисов
-###############################################################################
-setup_firewall() {
-  local panel_ip="$1"
-  local node_port="$2"
-  local ssh_port="$3"
-  local has_selfsteal="${4:-false}"
-
-  local extra_tcp=""
-  local extra_comment=""
-  if [[ "$has_selfsteal" == "true" ]]; then
-    extra_tcp=", 80, 9443"
-    extra_comment="# Selfsteal: 80 (HTTP redirect) + 9443 (HTTPS)"
+install_self_cli() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  mkdir -p "$DIR"
+  if [[ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$(readlink -f "$LAUNCHER_PATH" 2>/dev/null || echo "$LAUNCHER_PATH")" ]]; then
+    cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
+    chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
   fi
-
-  run_step "nftables firewall" \
-"bash -c 'cat > /etc/nftables.conf <<EOF
-#!/usr/sbin/nft -f
-flush ruleset
-
-table inet filter {
-  set panel_ips {
-    type ipv4_addr
-    elements = { ${panel_ip} }
-  }
-
-  chain input {
-    type filter hook input priority 0; policy drop;
-
-    iif lo accept
-    ct state established,related accept
-    ct state invalid drop
-
-    ip protocol icmp limit rate 10/second accept
-
-    tcp dport ${ssh_port} ct state new limit rate 10/minute accept
-    tcp dport ${ssh_port} accept
-
-    # NODE API — только панель
-    tcp dport ${node_port} ip saddr @panel_ips accept
-    tcp dport ${node_port} log prefix \"nft drop NODE_PORT: \" drop
-
-    # XRay Reality + Hysteria2 ${extra_comment}
-    tcp dport { 443, 8443${extra_tcp} } accept
-    udp dport { 443, 8443 } accept
-
-    # SYN flood защита
-    tcp flags & (fin|syn|rst|ack) == syn ct state new limit rate 200/second burst 50 packets accept
-    tcp flags & (fin|syn|rst|ack) == syn ct state new drop
-
-    limit rate 5/minute log prefix \"nft drop: \"
-  }
-
-  chain forward {
-    type filter hook forward priority 0; policy accept;
-    ct state invalid drop
-  }
-
-  chain output {
-    type filter hook output priority 0; policy accept;
-  }
-}
-EOF
-systemctl enable nftables >/dev/null 2>&1
-systemctl restart nftables
-nft list ruleset > /dev/null'"
-
-  run_step "Fail2Ban" \
-"bash -c 'cat > /etc/fail2ban/jail.local <<EOF
-[DEFAULT]
-banaction = nftables-multiport
-banaction_allports = nftables-allports
-bantime = 24h
-findtime = 10m
-maxretry = 3
-backend = systemd
-[sshd]
-enabled = true
-port = ${ssh_port}
-EOF
-systemctl enable fail2ban >/dev/null 2>&1
-systemctl restart fail2ban'"
+  ln -sfn "$LAUNCHER_PATH" "$CLI_PATH"
+  chmod +x "$CLI_PATH" 2>/dev/null || true
+  ok "Команда управления: ${CYAN}remnanode${NC}"
 }
 
 ###############################################################################
-# УСТАНОВКА REMNANODE
+# REMNANODE — установка (своя стабильная, не из DigneZzZ)
 ###############################################################################
+is_remnanode_installed() { [[ -f "$COMPOSE" ]] || [[ -d "$DIR" ]]; }
+is_remnanode_up() { docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; }
+
+remove_existing_remnanode() {
+  warn "Найдена существующая установка Remnanode."
+  echo
+  [[ -d "$DIR" ]] && echo -e "    • Директория: ${GRAY}$DIR${NC}"
+  is_remnanode_up && echo -e "    • Контейнер: ${GRAY}remnanode${NC}"
+  echo
+  read -rp "  Удалить старую установку перед продолжением? [y/N]: " ans
+  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+    warn "Установка отменена."
+    return 1
+  fi
+  if [[ -f "$COMPOSE" ]]; then
+    run_step "Остановка контейнера" "cd $DIR && docker compose down -v 2>/dev/null || true"
+  fi
+  docker rm -f remnanode 2>/dev/null || true
+  [[ -d "$DIR" ]] && run_step "Удаление файлов" "rm -rf $DIR"
+  ok "Старая установка удалена"
+  echo
+  return 0
+}
+
 install_remnanode() {
   show_header
-  echo -e "${WHITE}🚀 Установка Remnanode${NC}"
-  echo -e "${GRAY}────────────────────────────────${NC}"
+  echo -e "${WHITE}${BOLD}  Установка Remnanode${NC}"
+  hline 56
+  echo
+  info "Стабильная установка ноды Remnawave (без сторонних «тяжёлых» установщиков)."
+  info "UFW / SWAP — отдельные пункты меню и не ставятся вместе с нодой."
   echo
 
-  if check_existing_remnanode; then
-    remove_existing_remnanode
+  if is_remnanode_installed; then
+    remove_existing_remnanode || return 0
   fi
 
-  read -rp "🌐 IP панели Remnawave [${PANEL_IP_DEFAULT}]: " PANEL_IP
+  read -rp "  IP панели Remnawave [${PANEL_IP_DEFAULT}]: " PANEL_IP
   PANEL_IP=${PANEL_IP:-$PANEL_IP_DEFAULT}
-  [[ ! "$PANEL_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && err "Некорректный IP: $PANEL_IP"
+  [[ "$PANEL_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || err "Некорректный IP: $PANEL_IP"
 
-  read -rp "🔌 NODE_PORT [3000]: " NODE_PORT
+  read -rp "  NODE_PORT [3000]: " NODE_PORT
   NODE_PORT=${NODE_PORT:-3000}
-  [[ ! "$NODE_PORT" =~ ^[0-9]+$ ]] && err "NODE_PORT должен быть числом"
+  [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || err "NODE_PORT должен быть числом"
 
-  read -rp "🔑 SSH порт [22]: " SSH_PORT
-  SSH_PORT=${SSH_PORT:-22}
+  read -rp "  XTLS_API_PORT [61000]: " XTLS_API_PORT
+  XTLS_API_PORT=${XTLS_API_PORT:-61000}
 
   echo
-  info "SECRET_KEY скопируй из панели Remnawave → Nodes → Create"
+  info "SECRET_KEY скопируйте из панели Remnawave → Nodes → Create"
+  local K1 K2
   while true; do
-    read -rsp "🔑 SECRET_KEY: " K1; echo
-    read -rsp "🔑 Повтор:     " K2; echo
+    read -rsp "  SECRET_KEY: " K1; echo
+    read -rsp "  Повтор:     " K2; echo
     [[ -z "$K1" ]] && { warn "Пусто"; continue; }
     [[ "$K1" != "$K2" ]] && { warn "Не совпадает"; continue; }
     break
   done
   ok "Ключ принят (${#K1} символов)"
 
-  prepare_system
+  ensure_packages
+  apply_performance_tuning
   install_docker
-
-  local has_selfsteal=false
-  [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]] && has_selfsteal=true
-  setup_firewall "$PANEL_IP" "$NODE_PORT" "$SSH_PORT" "$has_selfsteal"
 
   mkdir -p "$DIR"
 
-  # Скачиваем geo-файлы ДО запуска контейнера, чтобы было что монтировать
-  install_geoassets
+  cat > "$ENV_FILE" <<EOF
+### NODE ###
+NODE_PORT=${NODE_PORT}
+
+### XRAY ###
+SECRET_KEY=${K1}
+
+### Internal ###
+XTLS_API_PORT=${XTLS_API_PORT}
+EOF
+  chmod 600 "$ENV_FILE"
 
   cat > "$COMPOSE" <<EOF
 services:
@@ -560,10 +594,8 @@ services:
     hostname: remnanode
     network_mode: host
     restart: always
-    environment:
-      - SECRET_KEY=${K1}
-      - NODE_PORT=${NODE_PORT}
-      - XRAY_LOCATION_ASSET=/usr/local/share/xray
+    env_file:
+      - .env
     cap_add:
       - NET_ADMIN
     ulimits:
@@ -572,210 +604,288 @@ services:
         hard: 1048576
     volumes:
       - /dev/shm:/dev/shm
-      - ${ASSETS_DIR}/geosite.dat:/usr/local/share/xray/geosite.dat:ro
-      - ${ASSETS_DIR}/geoip.dat:/usr/local/share/xray/geoip.dat:ro
 EOF
   chmod 600 "$COMPOSE"
-  ok "docker-compose.yml создан (с подменой geo-файлов)"
+  ok "docker-compose.yml создан"
+
+  # Сохраним IP панели для будущего UFW
+  echo "$PANEL_IP" > "$DIR/.panel_ip"
+  echo "$NODE_PORT" > "$DIR/.node_port"
 
   cd "$DIR"
-  run_step "Pull образа" "docker compose pull -q"
+  run_step "Pull образа" "docker compose pull"
   run_step "Запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
 
-  sleep 5
-  if ! docker ps --format '{{.Names}}' | grep -q '^remnanode$'; then
+  sleep 4
+  if ! is_remnanode_up; then
     err "Контейнер не запустился. Логи: docker logs remnanode"
   fi
 
   if ss -tlnp 2>/dev/null | grep -q ":${NODE_PORT} "; then
-    ok "Контейнер работает и слушает порт ${NODE_PORT}"
+    ok "Нода слушает порт ${NODE_PORT}"
   else
-    warn "Контейнер запущен, но порт ${NODE_PORT} ещё не слушается"
+    warn "Контейнер запущен, порт ${NODE_PORT} пока может подниматься"
   fi
 
-  install_cli_panel
+  install_self_cli
 
   echo
-  echo -e "${GREEN}╔══════════════════════════════════════════╗"
-  echo -e "║  ✔ REMNANODE УСТАНОВЛЕН                  ║"
-  echo -e "╚══════════════════════════════════════════╝${NC}"
+  echo -e "${GREEN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║           ✔  REMNANODE УСТАНОВЛЕН                  ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+  echo -e "  Public IP:     ${CYAN}${PUBLIC_IP}${NC}"
+  echo -e "  Панель IP:     ${PANEL_IP}"
+  echo -e "  NODE_PORT:     ${NODE_PORT}"
+  echo -e "  XTLS_API:      ${XTLS_API_PORT}"
+  echo -e "  Управление:    ${CYAN}remnanode${NC}"
   echo
-  echo -e "  Public IP:        ${CYAN}${PUBLIC_IP}${NC}"
-  echo -e "  Панель IP:        ${PANEL_IP}"
-  echo -e "  NODE_PORT:        ${NODE_PORT}"
-  echo -e "  SSH порт:         ${SSH_PORT}"
-  echo -e "  Geo-файлы:        ${CYAN}${ASSETS_DIR}/${NC}"
-  echo -e "  Обновление geo:   ${CYAN}remnanode-geo-update${NC}"
-  echo -e "  Управление:       ${CYAN}remnanode${NC}"
+  echo -e "  ${YELLOW}Рекомендуется отдельно:${NC}"
+  echo -e "    • пункт меню «Защита UFW» — ограничить NODE_PORT только IP панели"
+  echo -e "    • пункт «SWAP» — если мало RAM"
+  echo -e "    • «Hysteria2» — если нужен UDP-протокол"
   echo
 }
 
 ###############################################################################
-# Переустановка только geo-файлов (для уже установленной ноды)
-###############################################################################
-reinstall_geoassets() {
-  show_header
-  echo -e "${WHITE}🌍 Обновление/установка geo-файлов${NC}"
-  echo -e "${GRAY}────────────────────────────────${NC}"
-  echo
-
-  if ! [[ -f "$COMPOSE" ]]; then
-    err "Remnanode не установлен. Сначала установи ноду."
-  fi
-
-  install_geoassets
-
-  # Проверяем, есть ли уже volume-маунт в compose
-  if ! grep -q "geosite.dat" "$COMPOSE"; then
-    info "В docker-compose.yml нет volume-маунта для geo-файлов — добавляем"
-
-    # Бэкап
-    cp "$COMPOSE" "${COMPOSE}.bak.$(date +%Y%m%d-%H%M%S)"
-
-    # Добавляем env-переменную и volumes через python (если есть) или sed
-    python3 <<PYEOF
-import re
-with open("$COMPOSE") as f:
-    content = f.read()
-
-# Добавляем XRAY_LOCATION_ASSET в environment, если его нет
-if "XRAY_LOCATION_ASSET" not in content:
-    content = re.sub(
-        r'(environment:\s*\n(?:\s+-\s+\S+\s*\n)+)',
-        r'\1      - XRAY_LOCATION_ASSET=/usr/local/share/xray\n',
-        content, count=1
-    )
-
-# Добавляем volumes
-if "geosite.dat" not in content:
-    if "volumes:" in content:
-        content = re.sub(
-            r'(volumes:\s*\n(?:\s+-\s+\S+.*\n)+)',
-            r'\1      - $ASSETS_DIR/geosite.dat:/usr/local/share/xray/geosite.dat:ro\n      - $ASSETS_DIR/geoip.dat:/usr/local/share/xray/geoip.dat:ro\n',
-            content, count=1
-        )
-    else:
-        # Если секции volumes нет — добавим её
-        content = content.rstrip() + """
-    volumes:
-      - $ASSETS_DIR/geosite.dat:/usr/local/share/xray/geosite.dat:ro
-      - $ASSETS_DIR/geoip.dat:/usr/local/share/xray/geoip.dat:ro
-"""
-
-with open("$COMPOSE", "w") as f:
-    f.write(content)
-PYEOF
-    ok "docker-compose.yml обновлён"
-  fi
-
-  run_step "Перезапуск контейнера" "cd $DIR && docker compose down && docker compose up -d"
-  sleep 3
-  if docker ps --format '{{.Names}}' | grep -q '^remnanode$'; then
-    ok "Контейнер запущен с новыми geo-файлами"
-  else
-    err "Контейнер не запустился. Логи: docker logs remnanode"
-  fi
-}
-
-###############################################################################
-# УСТАНОВКА SELFSTEAL (через официальный скрипт DigneZzZ)
+# SELFSTEAL — флоу как у DigneZzZ: @ install
 ###############################################################################
 install_selfsteal() {
   show_header
-  echo -e "${WHITE}🎭 Установка Selfsteal (Reality маскировка)${NC}"
-  echo -e "${GRAY}────────────────────────────────${NC}"
+  echo -e "${WHITE}${BOLD}  Установка Selfsteal (Reality-маскировка)${NC}"
+  hline 56
   echo
-  info "Selfsteal — это веб-сервер (Caddy/Nginx) с фейковым сайтом для маскировки Reality-трафика."
+  info "Официальный установщик DigneZzZ (Caddy / Nginx)."
+  echo -e "  ${GRAY}Источник: github.com/DigneZzZ/remnawave-scripts${NC}"
   echo
 
-  if [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]]; then
-    warn "Найдена существующая установка Selfsteal."
-    read -rp "  Удалить и переустановить? [y/N]: " ans
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-      [[ -d /opt/caddy ]] && (cd /opt/caddy && docker compose down -v 2>/dev/null || true) && rm -rf /opt/caddy
-      [[ -d /opt/nginx-selfsteal ]] && (cd /opt/nginx-selfsteal && docker compose down -v 2>/dev/null || true) && rm -rf /opt/nginx-selfsteal
-      ok "Старая установка Selfsteal удалена"
-      echo
-    else
-      warn "Установка отменена"
-      return 0
-    fi
-  fi
-
-  if ! command -v docker >/dev/null; then
-    info "Docker не установлен — устанавливаем"
+  if ! command -v docker >/dev/null 2>&1; then
+    info "Docker не найден — устанавливаем"
+    ensure_packages
     install_docker
   fi
 
-  echo -e "${WHITE}Выбор веб-сервера:${NC}"
-  echo "  1) Caddy   (проще, авто-SSL)"
-  echo "  2) Nginx   (быстрее, Unix socket, ACME через acme.sh)"
+  echo -e "  ${WHITE}Веб-сервер:${NC}"
+  echo -e "    ${WHITE}1)${NC} Caddy   ${GRAY}(проще, авто-SSL)${NC}"
+  echo -e "    ${WHITE}2)${NC} Nginx   ${GRAY}(Unix socket + acme.sh)${NC}"
   echo
-  read -rp "  Выбор [1/2, по умолчанию 1]: " ws_choice
+  read -rp "  Выбор [1]: " ws_choice
   ws_choice=${ws_choice:-1}
 
   local ws_flag="--caddy"
   case "$ws_choice" in
-    1) ws_flag="--caddy" ;;
     2) ws_flag="--nginx" ;;
-    *) warn "Невалидный выбор, используем Caddy"; ws_flag="--caddy" ;;
+    *) ws_flag="--caddy" ;;
   esac
 
   echo
-  read -rp "🌐 Домен для маскировки (должен указывать на этот сервер): " STEAL_DOMAIN
-  [[ -z "$STEAL_DOMAIN" ]] && err "Домен не может быть пустым"
-
-  echo
-  info "Запускаем официальный установщик Selfsteal от DigneZzZ"
-  echo -e "${GRAY}  Источник: https://github.com/DigneZzZ/remnawave-scripts${NC}"
+  info "Запуск: bash <(curl …/selfsteal.sh) @ install ${ws_flag}"
   echo
 
-  bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install $ws_flag
-
+  # Аналог: bash <(curl -Ls …) @ install --caddy|--nginx
+  set +e
+  gh_pipe_bash "$SELFSTEAL_RAW" @ install "$ws_flag"
   local rc=$?
+  set -e
   if [[ $rc -eq 0 ]]; then
-    if [[ -f /etc/nftables.conf ]] && grep -q "panel_ips" /etc/nftables.conf; then
-      info "Обновляем firewall — добавляем порты Selfsteal"
-      local panel_ip ssh_port node_port
-      panel_ip=$(grep -oP 'elements = \{ \K[^ ]+' /etc/nftables.conf | head -1)
-      ssh_port=$(grep -oP 'tcp dport \K[0-9]+(?= ct state new limit)' /etc/nftables.conf | head -1)
-      node_port=$(grep -oP 'tcp dport \K[0-9]+(?= ip saddr @panel_ips)' /etc/nftables.conf | head -1)
-      setup_firewall "${panel_ip:-$PANEL_IP_DEFAULT}" "${node_port:-3000}" "${ssh_port:-22}" "true"
-    fi
-
     echo
-    echo -e "${GREEN}╔══════════════════════════════════════════╗"
-    echo -e "║  ✔ SELFSTEAL УСТАНОВЛЕН                  ║"
-    echo -e "╚══════════════════════════════════════════╝${NC}"
-    echo
-    echo -e "  Управление Selfsteal:  ${CYAN}selfsteal${NC}"
-    echo -e "  Сменить шаблон сайта:  ${CYAN}selfsteal template${NC}"
-    echo -e "  Логи Selfsteal:        ${CYAN}selfsteal logs${NC}"
+    echo -e "${GREEN}${BOLD}"
+    echo "  ╔════════════════════════════════════════════════════╗"
+    echo "  ║           ✔  SELFSTEAL УСТАНОВЛЕН                  ║"
+    echo "  ╚════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo -e "  Управление:  ${CYAN}selfsteal${NC}"
+    echo -e "  Шаблоны:     ${CYAN}selfsteal template${NC}"
+    echo -e "  Логи:        ${CYAN}selfsteal logs${NC}"
     echo
   else
-    err "Установка Selfsteal завершилась с ошибкой"
+    warn "Установка Selfsteal завершилась с кодом $rc"
   fi
 }
 
 ###############################################################################
-# УСТАНОВКА WARP (Cloudflare WARP в proxy-режиме)
+# HYSTERIA2 — через h2-script (без установки ноды из того скрипта)
+###############################################################################
+install_hysteria2() {
+  show_header
+  echo -e "${WHITE}${BOLD}  Автонастройка Hysteria2${NC}"
+  hline 56
+  echo
+  info "Скрипт Origamidnd/h2-script: certbot, сертификаты, volume в remnanode, BBR."
+  echo -e "  ${GRAY}https://github.com/Origamidnd/h2-script${NC}"
+  echo
+  warn "Нода Remnanode уже должна быть установлена."
+  echo
+
+  if ! is_remnanode_installed; then
+    warn "Сначала установите Remnanode (пункт меню «Remnanode»)."
+    return 1
+  fi
+
+  ensure_packages
+
+  echo
+  info "Запуск setup.sh из h2-script (с зеркалами GitHub)…"
+  echo
+
+  set +e
+  gh_pipe_bash "$H2_RAW"
+  local rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    ok "Hysteria2 настроен"
+    echo
+    echo -e "  ${WHITE}Дополнительно:${NC}"
+    echo -e "    • Привяжите Hysteria2 config profile в панели Remnawave"
+    echo -e "    • Порт 80/tcp нужен только для ACME — можно закрыть после выпуска"
+    echo
+    echo -e "  ${YELLOW}Если онлайн в ноде не отображается (ядро 26.3.x) —${NC}"
+    echo -e "  ${YELLOW}используйте пункт «Фикс онлайна Hysteria2» (благодарность @markrouting).${NC}"
+    echo
+  else
+    warn "Настройка Hysteria2 завершилась с кодом $rc"
+  fi
+}
+
+###############################################################################
+# Фикс онлайна Hysteria2 — custom Xray (@markrouting)
+###############################################################################
+fix_hysteria2_online() {
+  show_header
+  echo -e "${WHITE}${BOLD}  Фикс онлайна Hysteria2 (custom Xray)${NC}"
+  hline 56
+  echo
+  echo -e "  ${GRAY}Проблема:${NC} с ядром ~26.3.27 Remna не видит онлайн и не считает трафик."
+  echo -e "  ${GRAY}Решение:${NC}  прокинуть более новое ядро Xray в контейнер ноды."
+  echo
+  echo -e "  ${CYAN}Способ описал @markrouting — благодарите его.${NC}"
+  echo
+  echo -e "  ${WHITE}1)${NC} Применить патч (скачать Xray ${XRAY_VERSION_DEFAULT} и смонтировать)"
+  echo -e "  ${WHITE}2)${NC} Откатить патч (убрать volume, вернуть штатное ядро)"
+  echo -e "  ${WHITE}3)${NC} Проверить версию Xray в контейнере"
+  echo -e "  ${GRAY}0)${NC} Назад"
+  echo
+  read -rp "  → " ch
+
+  case "$ch" in
+    1) apply_custom_xray_patch ;;
+    2) rollback_custom_xray_patch ;;
+    3)
+      if is_remnanode_up; then
+        docker exec remnanode xray version 2>/dev/null || warn "Не удалось выполнить xray version"
+      else
+        warn "Контейнер remnanode не запущен"
+      fi
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+apply_custom_xray_patch() {
+  if ! [[ -f "$COMPOSE" ]]; then
+    err "Remnanode не установлен"
+  fi
+
+  read -rp "  Версия Xray [${XRAY_VERSION_DEFAULT}]: " XV
+  XV=${XV:-$XRAY_VERSION_DEFAULT}
+  [[ "$XV" == v* ]] || XV="v${XV}"
+
+  local arch_zip="Xray-linux-64.zip"
+  case "$(uname -m)" in
+    aarch64|arm64) arch_zip="Xray-linux-arm64-v8a.zip" ;;
+    x86_64|amd64)  arch_zip="Xray-linux-64.zip" ;;
+    *) warn "Архитектура $(uname -m) — пробуем Xray-linux-64.zip" ;;
+  esac
+
+  mkdir -p "$CUSTOM_XRAY_DIR"
+  cd "$CUSTOM_XRAY_DIR"
+
+  ensure_packages
+  command -v unzip >/dev/null || apt-get install -y -qq unzip
+
+  local zip_url="${XRAY_RELEASE_BASE}/${XV}/${arch_zip}"
+  info "Скачивание ${XV} / ${arch_zip} (с зеркалами)…"
+  if ! gh_download "$zip_url" "${CUSTOM_XRAY_DIR}/${arch_zip}"; then
+    err "Не удалось скачать Xray: $zip_url"
+  fi
+
+  run_step "Распаковка Xray" "cd $CUSTOM_XRAY_DIR && unzip -o ${arch_zip}"
+  [[ -x "$CUSTOM_XRAY_DIR/xray" ]] || chmod +x "$CUSTOM_XRAY_DIR/xray"
+  ok "Бинарник: $CUSTOM_XRAY_DIR/xray"
+
+  cp "$COMPOSE" "${COMPOSE}.bak.$(date +%Y%m%d-%H%M%S)"
+
+  local mount_line="      - '${CUSTOM_XRAY_DIR}/xray:/usr/local/bin/xray:ro'"
+  if grep -q 'custom-xray/xray:/usr/local/bin/xray' "$COMPOSE"; then
+    info "Volume уже есть в docker-compose.yml"
+  else
+    python3 - "$COMPOSE" "$CUSTOM_XRAY_DIR" <<'PY'
+import sys, re
+path, xdir = sys.argv[1], sys.argv[2]
+mount = f"      - '{xdir}/xray:/usr/local/bin/xray:ro'\n"
+with open(path) as f:
+    content = f.read()
+if "custom-xray/xray:/usr/local/bin/xray" in content:
+    sys.exit(0)
+# Если есть секция volumes — вставляем сразу после строки volumes:
+m = re.search(r'(^[ \t]*volumes:[ \t]*\n)', content, re.M)
+if m:
+    pos = m.end()
+    content = content[:pos] + mount + content[pos:]
+else:
+    # Добавляем секцию в конец сервиса remnanode
+    if not content.endswith("\n"):
+        content += "\n"
+    content += "    volumes:\n" + mount
+with open(path, "w") as f:
+    f.write(content)
+PY
+    ok "Volume добавлен в docker-compose.yml"
+  fi
+
+  run_step "Перезапуск ноды" "cd $DIR && docker compose down && docker compose up -d"
+  sleep 3
+  echo
+  info "Версия Xray в контейнере:"
+  docker exec remnanode xray version 2>/dev/null || warn "Проверьте вручную: docker exec -it remnanode xray version"
+  echo
+  ok "Патч применён. Если не помогло — откатите через пункт 2."
+}
+
+rollback_custom_xray_patch() {
+  if ! [[ -f "$COMPOSE" ]]; then
+    err "Remnanode не установлен"
+  fi
+  cp "$COMPOSE" "${COMPOSE}.bak.$(date +%Y%m%d-%H%M%S)"
+  # Удаляем строки с custom-xray mount
+  sed -i "\|custom-xray/xray:/usr/local/bin/xray|d" "$COMPOSE"
+  ok "Строка volume удалена"
+  run_step "Перезапуск ноды" "cd $DIR && docker compose down && docker compose up -d"
+  sleep 2
+  info "Текущая версия Xray:"
+  docker exec remnanode xray version 2>/dev/null || true
+  ok "Откат выполнен — используется ядро из образа контейнера"
+}
+
+###############################################################################
+# WARP
 ###############################################################################
 install_warp() {
   show_header
-  echo -e "${WHITE}🌍 Установка Cloudflare WARP (SOCKS5 прокси)${NC}"
-  echo -e "${GRAY}────────────────────────────────${NC}"
+  echo -e "${WHITE}${BOLD}  Cloudflare WARP (SOCKS5)${NC}"
+  hline 56
   echo
-  info "WARP даст исходящий IP Cloudflare. Используется как outbound в XRay для обхода блокировок ChatGPT, Spotify, Netflix и т.п."
+  info "Исходящий IP Cloudflare — outbound в XRay для ChatGPT / Spotify и т.п."
   echo
 
   if command -v warp-cli >/dev/null 2>&1; then
     warn "WARP уже установлен: $(warp-cli --version 2>/dev/null | head -1)"
     read -rp "  Переустановить? [y/N]: " ans
     if [[ ! "$ans" =~ ^[Yy]$ ]]; then
-      warn "Установка отменена"
       return 0
     fi
-    run_step "Удаление старой версии WARP" \
+    run_step "Удаление WARP" \
 "systemctl stop warp-svc warp-auto 2>/dev/null || true
 warp-cli --accept-tos disconnect 2>/dev/null || true
 apt-get remove -y --purge cloudflare-warp 2>/dev/null || true
@@ -784,17 +894,15 @@ rm -f /etc/systemd/system/warp-auto.service /usr/local/bin/warp-fix-network.sh
 systemctl daemon-reload"
   fi
 
-  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
-    sleep 2
-  done
+  ensure_packages
 
   local warp_codename="$CODENAME"
   case "$CODENAME" in
     bullseye|bookworm|jammy|noble) ;;
-    *) warn "Codename '$CODENAME' не поддерживается Cloudflare — используем 'noble'"; warp_codename="noble" ;;
+    *) warn "Codename '$CODENAME' — используем noble"; warp_codename="noble" ;;
   esac
 
-  run_step "Добавление репозитория Cloudflare" \
+  run_step "Репозиторий Cloudflare" \
 "curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
  gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && \
  echo \"deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${warp_codename} main\" > /etc/apt/sources.list.d/cloudflare-client.list && \
@@ -802,45 +910,26 @@ systemctl daemon-reload"
 
   run_step "Установка cloudflare-warp" "apt-get install -y -qq cloudflare-warp"
 
-  if ! command -v warp-cli >/dev/null 2>&1; then
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list
-    apt-get update -qq >/dev/null 2>&1
-    err "Не удалось установить cloudflare-warp"
+  # /32 VPS fix
+  local iface prefix
+  iface=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)
+  prefix=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[2]}' | head -1)
+  if [[ "$prefix" == "32" ]] || [[ -z "$prefix" ]]; then
+    info "VPS /32 fix на $iface"
+    ip addr add 172.30.255.1/24 dev "$iface" 2>/dev/null || true
+    systemctl restart warp-svc &>/dev/null || true
+    sleep 5
   fi
 
-  fix_warp_network_inline() {
-    local iface prefix
-    iface=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)
-    [[ -z "$iface" ]] && return 0
-    prefix=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[2]}' | head -1)
-    if [[ "$prefix" == "32" ]] || [[ -z "$prefix" ]]; then
-      info "VPS /32 fix: добавляем 172.30.255.1/24 на $iface"
-      ip addr add 172.30.255.1/24 dev "$iface" 2>/dev/null || true
-      systemctl restart warp-svc &>/dev/null || true
-      sleep 8
-    fi
-  }
-  fix_warp_network_inline
-
-  sleep 5
-
+  sleep 3
   run_step "Регистрация WARP" \
 "warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
 warp-cli --accept-tos registration new >/dev/null 2>&1 || (sleep 3 && warp-cli --accept-tos registration new >/dev/null 2>&1) || true"
 
-  run_step "Режим: SOCKS5 proxy на порту $WARP_PORT" \
+  run_step "Режим SOCKS5 :${WARP_PORT}" \
 "warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
 warp-cli --accept-tos proxy port $WARP_PORT >/dev/null 2>&1 || true
 warp-cli --accept-tos connect >/dev/null 2>&1 || true"
-
-  local connected=false
-  for i in {1..15}; do
-    if warp-cli --accept-tos status 2>/dev/null | grep -qi "connected"; then
-      connected=true
-      break
-    fi
-    sleep 2
-  done
 
   cat > /usr/local/bin/warp-fix-network.sh <<'FIXSCRIPT'
 #!/bin/bash
@@ -860,160 +949,708 @@ FIXSCRIPT
 Description=Cloudflare WARP auto-connect
 After=network.target warp-svc.service
 Requires=warp-svc.service
-
 [Service]
 Type=oneshot
 ExecStartPre=/usr/local/bin/warp-fix-network.sh
 ExecStart=/usr/bin/warp-cli --accept-tos connect
 RemainAfterExit=yes
 ExecStop=/usr/bin/warp-cli --accept-tos disconnect
-
 [Install]
 WantedBy=multi-user.target
 SYSTEMD
 
-  run_step "Автозапуск WARP" \
-"systemctl daemon-reload && systemctl enable warp-auto >/dev/null 2>&1"
+  systemctl daemon-reload
+  systemctl enable warp-auto >/dev/null 2>&1 || true
 
-  sleep 3
   local warp_ip
   warp_ip=$(curl -s --max-time 10 --socks5 "127.0.0.1:${WARP_PORT}" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
 
   echo
-  if [[ "$connected" == true ]] && [[ -n "$warp_ip" ]]; then
-    ok "WARP работает. Cloudflare IP: ${CYAN}${warp_ip}${NC}"
-  elif [[ -n "$warp_ip" ]]; then
-    ok "Прокси отвечает (IP: $warp_ip), но статус ещё не 'connected'"
-  else
-    warn "WARP установлен, но прокси пока не отвечает. Проверь: warp-cli status"
-  fi
-
-  echo
-  echo -e "${GREEN}╔══════════════════════════════════════════╗"
-  echo -e "║  ✔ WARP УСТАНОВЛЕН                       ║"
-  echo -e "╚══════════════════════════════════════════╝${NC}"
-  echo
-  echo -e "  SOCKS5 прокси:  ${CYAN}127.0.0.1:${WARP_PORT}${NC}"
-  echo -e "  Статус:         ${CYAN}warp-cli status${NC}"
-  echo -e "  Тест:           ${CYAN}curl --socks5 127.0.0.1:${WARP_PORT} https://cloudflare.com/cdn-cgi/trace${NC}"
-  echo
-  echo -e "${WHITE}XRay outbound config:${NC}"
-  cat <<EOF
-  {
-    "tag": "warp",
-    "protocol": "socks",
-    "settings": {
-      "servers": [{ "address": "127.0.0.1", "port": ${WARP_PORT} }]
-    }
-  }
-EOF
+  echo -e "${GREEN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║           ✔  WARP УСТАНОВЛЕН                       ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+  echo -e "  SOCKS5:  ${CYAN}127.0.0.1:${WARP_PORT}${NC}"
+  [[ -n "$warp_ip" ]] && echo -e "  CF IP:   ${CYAN}${warp_ip}${NC}"
+  echo -e "  Статус:  ${CYAN}warp-cli status${NC}"
   echo
 }
 
 ###############################################################################
-# CLI PANEL (устанавливается отдельно)
+# Telegram MTProto — mtproto.zig / mtbuddy
 ###############################################################################
-install_cli_panel() {
-cat > /usr/local/bin/remnanode <<'CLIEOF'
-#!/usr/bin/env bash
+install_mtproto() {
+  show_header
+  echo -e "${WHITE}${BOLD}  Прокси Telegram (mtproto.zig)${NC}"
+  hline 56
+  echo
+  info "Лёгкий MTProto-прокси со маскировкой под HTTPS (TLS 1.3)."
+  echo -e "  ${GRAY}https://github.com/sleep3r/mtproto.zig${NC}"
+  echo
+  echo -e "  ${WHITE}1)${NC} Установить mtbuddy (bootstrap) и запустить мастер"
+  echo -e "  ${WHITE}2)${NC} Быстрая установка (порт / домен)"
+  echo -e "  ${WHITE}3)${NC} Управление: mtbuddy --interactive"
+  echo -e "  ${WHITE}4)${NC} Статус сервиса"
+  echo -e "  ${GRAY}0)${NC} Назад"
+  echo
+  read -rp "  → " ch
 
-GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; NC='\033[0m'
+  case "$ch" in
+    1)
+      info "Скачивание bootstrap.sh (с зеркалами)…"
+      if gh_pipe_bash "$MTPROTO_BOOTSTRAP_RAW"; then
+        ok "mtbuddy установлен"
+        echo
+        info "Запуск интерактивного мастера…"
+        if command -v mtbuddy >/dev/null 2>&1; then
+          mtbuddy --interactive || true
+        else
+          warn "mtbuddy не найден в PATH — перелогиньтесь или проверьте /usr/local/bin"
+        fi
+      else
+        err "Bootstrap mtproto.zig не удался"
+      fi
+      ;;
+    2)
+      if ! command -v mtbuddy >/dev/null 2>&1; then
+        info "Сначала ставим mtbuddy…"
+        gh_pipe_bash "$MTPROTO_BOOTSTRAP_RAW" || err "Bootstrap не удался"
+      fi
+      read -rp "  Порт [443]: " mp_port
+      mp_port=${mp_port:-443}
+      read -rp "  Домен-маскировка (например rutube.ru): " mp_domain
+      [[ -z "$mp_domain" ]] && { warn "Домен обязателен"; return 0; }
+      read -rp "  Имя пользователя [user]: " mp_user
+      mp_user=${mp_user:-user}
+      echo
+      mtbuddy install --port "$mp_port" --domain "$mp_domain" --user "$mp_user" --yes || warn "Установка вернула ошибку"
+      ;;
+    3)
+      command -v mtbuddy >/dev/null 2>&1 || { warn "mtbuddy не установлен"; return 0; }
+      mtbuddy --interactive || true
+      ;;
+    4)
+      systemctl status mtproto-proxy --no-pager 2>/dev/null || warn "Сервис mtproto-proxy не найден"
+      command -v mtbuddy >/dev/null 2>&1 && mtbuddy status 2>/dev/null || true
+      ;;
+    *) return 0 ;;
+  esac
+}
 
-LAUNCHER_LOCAL="/opt/remnanode/installer.sh"
-
-pause(){ read -rp $'\nEnter для продолжения...' _; }
-
-get_public_ip_cached() {
-  local cache="/tmp/.remnanode_public_ip"
-  if [[ -f "$cache" ]] && [[ $(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) )) -lt 600 ]]; then
-    cat "$cache"
+###############################################################################
+# SWAP — отдельная кнопка с навигацией
+###############################################################################
+setup_swap() {
+  show_header
+  echo -e "${WHITE}${BOLD}  Управление SWAP${NC}"
+  hline 56
+  echo
+  echo -e "  ${WHITE}Текущее состояние:${NC}"
+  free -h | sed 's/^/    /'
+  echo
+  if [[ -f /swapfile ]]; then
+    local sz
+    sz=$(du -h /swapfile 2>/dev/null | awk '{print $1}')
+    echo -e "  Файл: ${CYAN}/swapfile${NC} (${sz})"
+    swapon --show 2>/dev/null | sed 's/^/    /' || true
   else
-    local ip
-    ip=$(curl -fsS4 --max-time 3 https://api.ipify.org 2>/dev/null || \
-         curl -fsS4 --max-time 3 https://ifconfig.me 2>/dev/null || \
-         echo "неизвестен")
-    echo "$ip" > "$cache"
-    echo "$ip"
+    echo -e "  Файл ${GRAY}/swapfile${NC}: не создан"
   fi
+  echo
+  echo -e "  ${WHITE}1)${NC} Создать / включить SWAP 1 ГБ  ${GRAY}(рекомендуется)${NC}"
+  echo -e "  ${WHITE}2)${NC} Создать / включить SWAP 2 ГБ"
+  echo -e "  ${WHITE}3)${NC} Создать / включить SWAP 4 ГБ"
+  echo -e "  ${WHITE}4)${NC} Свой размер (ГБ)"
+  echo -e "  ${WHITE}5)${NC} Отключить и удалить /swapfile"
+  echo -e "  ${WHITE}6)${NC} Показать free -h"
+  echo -e "  ${GRAY}0)${NC} Назад"
+  echo
+  read -rp "  → " ch
+
+  local size_gb=""
+  case "$ch" in
+    1) size_gb=1 ;;
+    2) size_gb=2 ;;
+    3) size_gb=4 ;;
+    4)
+      read -rp "  Размер в ГБ [1]: " size_gb
+      size_gb=${size_gb:-1}
+      [[ "$size_gb" =~ ^[0-9]+$ ]] || { warn "Нужно число"; return 0; }
+      ;;
+    5)
+      swapoff /swapfile 2>/dev/null || true
+      sed -i '\|^/swapfile\s|d' /etc/fstab 2>/dev/null || true
+      rm -f /swapfile
+      ok "SWAP удалён"
+      free -h
+      return 0
+      ;;
+    6) free -h; return 0 ;;
+    *) return 0 ;;
+  esac
+
+  info "Создаём SWAP ${size_gb}G…"
+  # Супер-команда v2.0 (адаптирована под размер)
+  swapoff /swapfile 2>/dev/null || true
+  rm -f /swapfile
+  if ! fallocate -l "${size_gb}G" /swapfile 2>/dev/null; then
+    dd if=/dev/zero of=/swapfile bs=1M count=$((size_gb * 1024)) status=progress
+  fi
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -qE '^/swapfile\s' /etc/fstab || echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab >/dev/null
+
+  # Мягкий swappiness
+  cat > /etc/sysctl.d/98-swap.conf <<EOF
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+EOF
+  sysctl -p /etc/sysctl.d/98-swap.conf >/dev/null 2>&1 || true
+
+  echo
+  ok "SWAP ${size_gb}G активен"
+  echo
+  free -h
+  echo
+  info "В строке Swap должно быть ~${size_gb}.0Gi — защита от OOM."
+}
+
+###############################################################################
+# UFW — отдельный пункт (не вместе с нодой)
+###############################################################################
+setup_ufw() {
+  show_header
+  echo -e "${WHITE}${BOLD}  Защита UFW и порты${NC}"
+  hline 56
+  echo
+  info "Настраивается отдельно от установки ноды — по желанию."
+  echo
+
+  ensure_packages
+  command -v ufw >/dev/null || apt-get install -y -qq ufw
+
+  local panel_ip node_port ssh_port
+  panel_ip=$(cat "$DIR/.panel_ip" 2>/dev/null || echo "$PANEL_IP_DEFAULT")
+  node_port=$(cat "$DIR/.node_port" 2>/dev/null || echo "3000")
+  ssh_port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -1)
+  ssh_port=${ssh_port:-22}
+
+  echo -e "  ${WHITE}1)${NC} Быстрая защита ноды (SSH + NODE_PORT только с панели + 443)"
+  echo -e "  ${WHITE}2)${NC} Мастер настройки портов"
+  echo -e "  ${WHITE}3)${NC} Открыть порт"
+  echo -e "  ${WHITE}4)${NC} Закрыть порт"
+  echo -e "  ${WHITE}5)${NC} Статус UFW"
+  echo -e "  ${WHITE}6)${NC} Отключить UFW"
+  echo -e "  ${WHITE}7)${NC} Fail2Ban (базовый jail для SSH)"
+  echo -e "  ${GRAY}0)${NC} Назад"
+  echo
+  read -rp "  → " ch
+
+  case "$ch" in
+    1)
+      read -rp "  IP панели [${panel_ip}]: " panel_ip_in
+      panel_ip=${panel_ip_in:-$panel_ip}
+      read -rp "  NODE_PORT [${node_port}]: " node_port_in
+      node_port=${node_port_in:-$node_port}
+      read -rp "  SSH порт [${ssh_port}]: " ssh_port_in
+      ssh_port=${ssh_port_in:-$ssh_port}
+      read -rp "  Открыть 443/tcp+udp (Reality/Hysteria)? [Y/n]: " p443
+      p443=${p443:-Y}
+      read -rp "  Открыть 80/tcp (ACME/Selfsteal)? [y/N]: " p80
+
+      ufw --force reset >/dev/null 2>&1 || true
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow "${ssh_port}/tcp" comment 'SSH'
+      ufw allow from "$panel_ip" to any port "$node_port" proto tcp comment 'Remnanode panel'
+      if [[ "$p443" =~ ^[Yy]$ ]]; then
+        ufw allow 443/tcp comment 'Reality'
+        ufw allow 443/udp comment 'Hysteria2'
+      fi
+      if [[ "$p80" =~ ^[Yy]$ ]]; then
+        ufw allow 80/tcp comment 'ACME/HTTP'
+      fi
+      ufw --force enable
+      ok "UFW включён"
+      ufw status numbered
+      echo "$panel_ip" > "$DIR/.panel_ip" 2>/dev/null || true
+      echo "$node_port" > "$DIR/.node_port" 2>/dev/null || true
+      ;;
+    2)
+      echo
+      read -rp "  SSH порт [${ssh_port}]: " ssh_port_in
+      ssh_port=${ssh_port_in:-$ssh_port}
+      ufw allow "${ssh_port}/tcp" comment 'SSH'
+      while true; do
+        read -rp "  Добавить порт (например 8443/tcp или 443/udp, пусто = готово): " pr
+        [[ -z "$pr" ]] && break
+        ufw allow "$pr" || warn "Не удалось: $pr"
+      done
+      read -rp "  Включить UFW сейчас? [Y/n]: " en
+      en=${en:-Y}
+      [[ "$en" =~ ^[Yy]$ ]] && ufw --force enable
+      ufw status numbered
+      ;;
+    3)
+      read -rp "  Порт (напр. 8443/tcp): " pr
+      [[ -n "$pr" ]] && ufw allow "$pr" && ok "Открыт $pr"
+      ;;
+    4)
+      ufw status numbered
+      read -rp "  Номер правила для удаления: " num
+      [[ -n "$num" ]] && ufw --force delete "$num"
+      ;;
+    5) ufw status verbose ;;
+    6) ufw disable; ok "UFW выключен" ;;
+    7)
+      apt-get install -y -qq fail2ban
+      cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+bantime = 24h
+findtime = 10m
+maxretry = 4
+[sshd]
+enabled = true
+port = ${ssh_port}
+EOF
+      systemctl enable fail2ban >/dev/null 2>&1
+      systemctl restart fail2ban
+      ok "Fail2Ban настроен для SSH"
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+###############################################################################
+# ТЕСТЫ — multitest + speedtest
+###############################################################################
+run_speedtest_menu() {
+  clear
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║                   SPEEDTEST                        ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+
+  if ! command -v speedtest >/dev/null 2>&1 && ! command -v speedtest-cli >/dev/null 2>&1; then
+    echo -e "  ${WHITE}1)${NC} Установить Ookla speedtest ${GRAY}(точнее)${NC}"
+    echo -e "  ${WHITE}2)${NC} Установить speedtest-cli"
+    echo -e "  ${GRAY}0)${NC} Назад"
+    read -rp "  → " ch
+    case "$ch" in
+      1)
+        curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash >/dev/null 2>&1 || true
+        apt-get install -y -qq speedtest 2>/dev/null || apt-get install -y speedtest || { warn "Ошибка установки"; return; }
+        speedtest --accept-license --accept-gdpr >/dev/null 2>&1 || true
+        ;;
+      2) apt-get install -y -qq speedtest-cli || { warn "Ошибка"; return; } ;;
+      *) return ;;
+    esac
+  fi
+
+  echo
+  echo -e "  ${WHITE}1)${NC} Полный тест скорости"
+  echo -e "  ${WHITE}2)${NC} Только ping / jitter"
+  echo -e "  ${WHITE}3)${NC} Тест + замер времени выполнения"
+  echo -e "  ${GRAY}0)${NC} Назад"
+  read -rp "  → " ch
+
+  local t0 t1
+  case "$ch" in
+    1)
+      t0=$(date +%s.%N)
+      if command -v speedtest >/dev/null 2>&1; then
+        speedtest --accept-license --accept-gdpr
+      else
+        speedtest-cli
+      fi
+      t1=$(date +%s.%N)
+      echo
+      awk -v a="$t0" -v b="$t1" 'BEGIN{printf "  ⏱ Время теста: %.1f сек\n", b-a}'
+      ;;
+    2)
+      if command -v speedtest >/dev/null 2>&1; then
+        speedtest --accept-license --accept-gdpr -f json 2>/dev/null | jq -r '
+          "  Ping:    \(.ping.latency) ms",
+          "  Jitter:  \(.ping.jitter) ms",
+          "  Server:  \(.server.name) (\(.server.location))"
+        ' 2>/dev/null || speedtest --accept-license --accept-gdpr
+      else
+        speedtest-cli --simple
+      fi
+      ;;
+    3)
+      t0=$(date +%s.%N)
+      echo -e "  ${GRAY}Старт: $(date '+%F %T')${NC}"
+      if command -v speedtest >/dev/null 2>&1; then
+        speedtest --accept-license --accept-gdpr
+      else
+        speedtest-cli
+      fi
+      t1=$(date +%s.%N)
+      echo -e "  ${GRAY}Финиш: $(date '+%F %T')${NC}"
+      awk -v a="$t0" -v b="$t1" 'BEGIN{printf "  ⏱ Длительность: %.2f сек\n", b-a}'
+      # Доп. замеры задержки
+      echo
+      info "Доп. замер RTT до 1.1.1.1 и 8.8.8.8"
+      ping -c 5 -W 2 1.1.1.1 2>/dev/null | tail -2 | sed 's/^/  /'
+      ping -c 5 -W 2 8.8.8.8 2>/dev/null | tail -2 | sed 's/^/  /'
+      ;;
+    *) return ;;
+  esac
+}
+
+tests_menu() {
+  while true; do
+    clear
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔════════════════════════════════════════════════════╗"
+    echo "  ║                      ТЕСТЫ                         ║"
+    echo "  ╚════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo -e "  ${WHITE}Диагностика (multitest):${NC}"
+    echo -e "    ${WHITE} 1)${NC} IP Region"
+    echo -e "    ${WHITE} 2)${NC} Censorcheck — геоблок"
+    echo -e "    ${WHITE} 3)${NC} Censorcheck — DPI (РФ)"
+    echo -e "    ${WHITE} 4)${NC} iPerf3 — российские серверы"
+    echo -e "    ${WHITE} 5)${NC} iPerf3 — bench.tlab.pw"
+    echo -e "    ${WHITE} 6)${NC} YABS — бенчмарк"
+    echo -e "    ${WHITE} 7)${NC} IP Check Place"
+    echo -e "    ${WHITE} 8)${NC} bench.sh"
+    echo -e "    ${WHITE} 9)${NC} IPQuality"
+    echo -e "    ${WHITE}10)${NC} sysbench CPU"
+    echo -e "    ${YELLOW}11)${NC} ${BOLD}Мультитест — все тесты подряд${NC}"
+    echo
+    echo -e "  ${WHITE}Скорость:${NC}"
+    echo -e "    ${WHITE}12)${NC} Speedtest (с замерами)"
+    echo
+    echo -e "  ${WHITE}Прочее:${NC}"
+    echo -e "    ${WHITE}13)${NC} Запустить оригинальный multitest.sh"
+    echo -e "    ${GRAY} 0)${NC} Назад"
+    echo
+    read -rp "  → " choice
+
+    case "$choice" in
+      1)
+        apt-get install -y -qq wget >/dev/null 2>&1 || true
+        bash <(wget -qO- https://ipregion.vrnt.xyz) || warn "Тест завершился с ошибкой"
+        pause
+        ;;
+      2)
+        apt-get install -y -qq wget >/dev/null 2>&1 || true
+        local cc
+        cc=$(mktemp)
+        if gh_download "https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh" "$cc"; then
+          bash "$cc" --mode geoblock || true
+        else
+          bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock || true
+        fi
+        rm -f "$cc"
+        pause
+        ;;
+      3)
+        apt-get install -y -qq wget >/dev/null 2>&1 || true
+        local cc
+        cc=$(mktemp)
+        if gh_download "https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh" "$cc"; then
+          bash "$cc" --mode dpi || true
+        else
+          bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true
+        fi
+        rm -f "$cc"
+        pause
+        ;;
+      4)
+        apt-get install -y -qq wget iperf3 >/dev/null 2>&1 || true
+        local ipf
+        ipf=$(mktemp)
+        if gh_download "https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/speedtest.sh" "$ipf"; then
+          bash "$ipf" || true
+        else
+          bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) || true
+        fi
+        rm -f "$ipf"
+        pause
+        ;;
+      5)
+        apt-get install -y -qq wget iperf3 >/dev/null 2>&1 || true
+        wget -qO- bench.tlab.pw | bash || true
+        pause
+        ;;
+      6)
+        curl -sL yabs.sh | bash -s -- -4 || true
+        pause
+        ;;
+      7)
+        bash <(curl -Ls IP.Check.Place) -l en || true
+        pause
+        ;;
+      8)
+        wget -qO- bench.sh | bash || true
+        pause
+        ;;
+      9)
+        bash <(curl -Ls https://Check.Place) -EI || true
+        pause
+        ;;
+      10)
+        apt-get install -y -qq sysbench >/dev/null 2>&1 || true
+        sysbench cpu run --threads=1 || true
+        pause
+        ;;
+      11)
+        info "Запуск полного multitest…"
+        gh_pipe_bash "$MULTITEST_RAW" || bash <(curl -Ls "$MULTITEST_RAW") || warn "multitest завершился с ошибкой"
+        pause
+        ;;
+      12) run_speedtest_menu; pause ;;
+      13)
+        gh_pipe_bash "$MULTITEST_RAW" || true
+        pause
+        ;;
+      0) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+###############################################################################
+# Системное меню (SWAP / UFW / тюнинг)
+###############################################################################
+system_menu() {
+  while true; do
+    show_header
+    echo -e "${WHITE}${BOLD}  Система и защита${NC}"
+    hline 56
+    echo -e "  SWAP:  $(service_badge swap)"
+    echo -e "  UFW:   $(service_badge ufw)"
+    echo
+    echo -e "  ${WHITE}1)${NC} SWAP — создать / удалить"
+    echo -e "  ${WHITE}2)${NC} UFW и порты"
+    echo -e "  ${WHITE}3)${NC} Тюнинг производительности (BBR, буферы, RPS)"
+    echo -e "  ${WHITE}4)${NC} Только базовые пакеты"
+    echo -e "  ${GRAY}0)${NC} Назад"
+    echo
+    read -rp "  → " ch
+    case "$ch" in
+      1) setup_swap; pause ;;
+      2) setup_ufw; pause ;;
+      3) apply_performance_tuning; pause ;;
+      4) ensure_packages; pause ;;
+      0) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+###############################################################################
+# Управление нодой — меню в стиле DigneZzZ remnanode.sh
+###############################################################################
+node_status_screen() {
+  clear
+  echo -e "${WHITE}${BOLD}  RemnaNode — управление${NC}  ${GRAY}v${SCRIPT_VERSION}${NC}"
+  hline 56
+  echo
+
+  if is_remnanode_up; then
+    local node_port node_ver xray_ver
+    node_port=$(grep -E '^NODE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)
+    node_port=${node_port:-3000}
+    echo -e "  ${GREEN}✔ Статус ноды: РАБОТАЕТ${NC}"
+    echo
+    echo -e "  ${WHITE}Подключение:${NC}"
+    printf "     %-14s ${CYAN}%s${NC}\n" "IP:" "$PUBLIC_IP"
+    printf "     %-14s ${CYAN}%s${NC}\n" "Порт:" "$node_port"
+    printf "     %-14s ${CYAN}%s:%s${NC}\n" "URL:" "$PUBLIC_IP" "$node_port"
+    echo
+    echo -e "  ${WHITE}Компоненты:${NC}"
+    node_ver=$(docker inspect --format '{{.Config.Image}}' remnanode 2>/dev/null || echo "?")
+    printf "     %-14s %s\n" "Образ:" "$node_ver"
+    xray_ver=$(docker exec remnanode xray version 2>/dev/null | head -1 || echo "н/д")
+    printf "     %-14s %s\n" "Xray:" "$xray_ver"
+    if grep -q 'custom-xray/xray' "$COMPOSE" 2>/dev/null; then
+      echo -e "     ${YELLOW}custom Xray смонтирован (фикс онлайна)${NC}"
+    fi
+    echo
+    echo -e "  ${WHITE}Ресурсы:${NC}"
+    local cstats
+    cstats=$(docker stats --no-stream --format '{{.CPUPerc}} | {{.MemUsage}}' remnanode 2>/dev/null || echo "n/a")
+    printf "     %-14s %s\n" "Контейнер:" "$cstats"
+    printf "     %-14s %s\n" "RAM хоста:" "$(free -h | awk '/^Mem:/ {printf "%s / %s", $3, $2}')"
+  elif is_remnanode_installed; then
+    echo -e "  ${RED}✖ Статус ноды: ОСТАНОВЛЕНА${NC}"
+    echo -e "  ${GRAY}Используйте пункт 2 для запуска${NC}"
+  else
+    echo -e "  ${GRAY}📦 Статус: НЕ УСТАНОВЛЕНА${NC}"
+    echo -e "  ${GRAY}Используйте пункт 1 для установки${NC}"
+  fi
+  echo
+  hline 56
+}
+
+remnanode_menu() {
+  install_self_cli >/dev/null 2>&1 || true
+
+  while true; do
+    PUBLIC_IP=$(get_public_ip)
+    node_status_screen
+
+    echo -e "  ${WHITE}Установка и управление:${NC}"
+    echo -e "    ${WHITE} 1)${NC} Установить RemnaNode"
+    echo -e "    ${WHITE} 2)${NC} Запустить"
+    echo -e "    ${WHITE} 3)${NC} Остановить"
+    echo -e "    ${WHITE} 4)${NC} Перезапустить"
+    echo -e "    ${WHITE} 5)${NC} Удалить RemnaNode"
+    echo
+    echo -e "  ${WHITE}Мониторинг и логи:${NC}"
+    echo -e "    ${WHITE} 6)${NC} Статус (docker ps / compose)"
+    echo -e "    ${WHITE} 7)${NC} Логи контейнера"
+    echo -e "    ${WHITE} 8)${NC} Docker stats"
+    echo -e "    ${WHITE} 9)${NC} LIVE-мониторинг"
+    echo
+    echo -e "  ${WHITE}Обновления и конфигурация:${NC}"
+    echo -e "    ${WHITE}10)${NC} Обновить образ RemnaNode"
+    echo -e "    ${WHITE}11)${NC} Фикс онлайна Hysteria2 / custom Xray"
+    echo -e "    ${WHITE}12)${NC} Редактировать docker-compose.yml"
+    echo -e "    ${WHITE}13)${NC} Редактировать .env"
+    echo -e "    ${WHITE}14)${NC} Показать порты"
+    echo -e "    ${WHITE}15)${NC} Тюнинг производительности"
+    echo
+    echo -e "  ${WHITE}Дополнительно:${NC}"
+    echo -e "    ${WHITE}16)${NC} Настройка Hysteria2"
+    echo -e "    ${WHITE}17)${NC} Selfsteal"
+    echo -e "    ${WHITE}18)${NC} Открыть главное меню лаунчера"
+    echo
+    hline 56
+    echo -e "    ${GRAY}0)${NC} Выход"
+    echo
+    read -rp "  Выберите пункт [0-18]: " choice
+
+    case "$choice" in
+      1) install_remnanode; pause ;;
+      2)
+        [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
+        cd "$DIR" && docker compose up -d
+        ok "Запущено"; pause
+        ;;
+      3)
+        [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
+        cd "$DIR" && docker compose down
+        ok "Остановлено"; pause
+        ;;
+      4)
+        [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
+        cd "$DIR" && docker compose down && docker compose up -d
+        ok "Перезапущено"; pause
+        ;;
+      5)
+        if is_remnanode_installed; then
+          read -rp "  Точно удалить RemnaNode? [y/N]: " ans
+          if [[ "$ans" =~ ^[Yy]$ ]]; then
+            cd "$DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true
+            docker rm -f remnanode 2>/dev/null || true
+            rm -rf "$DIR"
+            ok "Удалено"
+          fi
+        else
+          warn "Не установлено"
+        fi
+        pause
+        ;;
+      6)
+        docker ps -a --filter name=remnanode
+        echo
+        [[ -f "$COMPOSE" ]] && (cd "$DIR" && docker compose ps) || true
+        pause
+        ;;
+      7)
+        docker logs -f --tail 100 remnanode || true
+        ;;
+      8)
+        docker stats remnanode || true
+        ;;
+      9) live_panel ;;
+      10)
+        [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
+        cd "$DIR" && docker compose pull && docker compose up -d
+        ok "Обновлено"; pause
+        ;;
+      11) fix_hysteria2_online; pause ;;
+      12)
+        ${EDITOR:-nano} "$COMPOSE"
+        read -rp "  Перезапустить ноду? [y/N]: " ans
+        [[ "$ans" =~ ^[Yy]$ ]] && cd "$DIR" && docker compose up -d
+        pause
+        ;;
+      13)
+        ${EDITOR:-nano} "$ENV_FILE"
+        read -rp "  Перезапустить ноду? [y/N]: " ans
+        [[ "$ans" =~ ^[Yy]$ ]] && cd "$DIR" && docker compose up -d
+        pause
+        ;;
+      14)
+        echo
+        info "Слушающие порты:"
+        ss -tulnp 2>/dev/null | head -40 | sed 's/^/  /'
+        echo
+        if [[ -f "$ENV_FILE" ]]; then
+          echo -e "  ${WHITE}.env:${NC}"
+          grep -E 'PORT|SECRET' "$ENV_FILE" | sed 's/SECRET_KEY=.*/SECRET_KEY=***/' | sed 's/^/    /'
+        fi
+        pause
+        ;;
+      15) apply_performance_tuning; pause ;;
+      16) install_hysteria2; pause ;;
+      17) install_selfsteal; pause ;;
+      18) main_menu; return 0 ;;
+      0) exit 0 ;;
+      *) ;;
+    esac
+  done
 }
 
 live_panel() {
   trap 'return 0' INT
   while true; do
     clear
-    echo -e "${BLUE}====================================="
-    echo -e "        📡 LIVE PANEL"
-    echo -e "  (Ctrl+C — выход в меню)"
-    echo -e "=====================================${NC}"
-
-    echo -e "${YELLOW}── SYSTEM STATS ──${NC}"
+    echo -e "${BLUE}${BOLD}  LIVE PANEL${NC}  ${GRAY}(Ctrl+C — в меню)${NC}"
+    hline 56
     UPTIME=$(uptime -p 2>/dev/null | sed 's/^up //')
     LOAD=$(awk '{print $1", "$2", "$3}' /proc/loadavg)
-    CPU_CORES=$(nproc)
     CPU_USAGE=$(top -bn1 | awk '/Cpu\(s\)/ {printf "%.1f", 100 - $8}')
     MEM=$(free -m | awk '/^Mem:/ {printf "%s / %s MB (%.0f%%)", $3, $2, $3*100/$2}')
     SWAP=$(free -m | awk '/^Swap:/ {if($2>0) printf "%s / %s MB", $3, $2; else print "—"}')
     DISK=$(df -h / | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}')
 
-    printf "  Uptime:   %s\n" "$UPTIME"
-    printf "  Load:     %s  (cores: %s)\n" "$LOAD" "$CPU_CORES"
-    printf "  CPU:      %s%%\n" "$CPU_USAGE"
-    printf "  RAM:      %s\n" "$MEM"
-    printf "  Swap:     %s\n" "$SWAP"
-    printf "  Disk /:   %s\n" "$DISK"
+    printf "  Uptime:  %s\n" "$UPTIME"
+    printf "  Load:    %s\n" "$LOAD"
+    printf "  CPU:     %s%%\n" "$CPU_USAGE"
+    printf "  RAM:     %s\n" "$MEM"
+    printf "  Swap:    %s\n" "$SWAP"
+    printf "  Disk:    %s\n" "$DISK"
 
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+    if is_remnanode_up; then
       CSTATS=$(docker stats --no-stream --format '{{.CPUPerc}} | {{.MemUsage}}' remnanode 2>/dev/null)
-      printf "  Node:     ${GREEN}● running${NC}  (%s)\n" "$CSTATS"
+      printf "  Node:    ${GREEN}● running${NC}  (%s)\n" "$CSTATS"
     else
-      printf "  Node:     ${RED}● stopped${NC}\n"
-    fi
-
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '(caddy|nginx)-selfsteal'; then
-      printf "  Selfsteal: ${GREEN}● running${NC}\n"
-    fi
-
-    if command -v warp-cli >/dev/null 2>&1; then
-      if warp-cli --accept-tos status 2>/dev/null | grep -qi connected; then
-        printf "  WARP:     ${GREEN}● connected${NC}\n"
-      else
-        printf "  WARP:     ${YELLOW}● not connected${NC}\n"
-      fi
-    fi
-
-    # Geo-файлы
-    if [[ -f /opt/remnanode/assets/geosite.dat ]]; then
-      GEOSITE_AGE=$(( ( $(date +%s) - $(stat -c %Y /opt/remnanode/assets/geosite.dat) ) / 86400 ))
-      printf "  GeoData:  ${GREEN}● установлено${NC} (обновлено %s дн. назад)\n" "$GEOSITE_AGE"
-    else
-      printf "  GeoData:  ${YELLOW}● не установлено${NC}\n"
+      printf "  Node:    ${RED}● stopped${NC}\n"
     fi
 
     echo
-    echo -e "${YELLOW}── CONNECTIONS ──${NC}"
+    echo -e "${YELLOW}── Соединения ──${NC}"
     TOTAL=$(ss -ntu 2>/dev/null | tail -n +2 | wc -l)
     EST=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)
-    TW=$(ss -tn state time-wait 2>/dev/null | tail -n +2 | wc -l)
-    UDP=$(ss -un 2>/dev/null | tail -n +2 | wc -l)
-    CT_USED=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "?")
-    CT_MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "?")
-
-    printf "  Total:        %s\n" "$TOTAL"
-    printf "  Established:  %s\n" "$EST"
-    printf "  TIME-WAIT:    %s\n" "$TW"
-    printf "  UDP:          %s\n" "$UDP"
-    printf "  Conntrack:    %s / %s\n" "$CT_USED" "$CT_MAX"
+    printf "  Total: %s | Established: %s\n" "$TOTAL" "$EST"
 
     echo
-    echo -e "${YELLOW}── TOP 10 IP (established) ──${NC}"
+    echo -e "${YELLOW}── TOP IP ──${NC}"
     ss -tn state established 2>/dev/null \
       | awk 'NR>1 {split($5,a,":"); print a[1]}' \
-      | sort | uniq -c | sort -nr | head -10 \
+      | sort | uniq -c | sort -nr | head -8 \
       | awk '{printf "  %5s  %s\n", $1, $2}'
 
-    echo
-    echo -e "${YELLOW}── NETWORK I/O (1s) ──${NC}"
     IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
     if [[ -n "$IFACE" ]]; then
       RX1=$(cat /sys/class/net/$IFACE/statistics/rx_bytes)
@@ -1021,294 +1658,72 @@ live_panel() {
       sleep 1
       RX2=$(cat /sys/class/net/$IFACE/statistics/rx_bytes)
       TX2=$(cat /sys/class/net/$IFACE/statistics/tx_bytes)
-      RX_KBS=$(( (RX2 - RX1) / 1024 ))
-      TX_KBS=$(( (TX2 - TX1) / 1024 ))
-      printf "  %-6s  RX: %6s KB/s   TX: %6s KB/s\n" "$IFACE" "$RX_KBS" "$TX_KBS"
+      printf "\n  %-6s  RX: %6s KB/s   TX: %6s KB/s\n" "$IFACE" "$(( (RX2-RX1)/1024 ))" "$(( (TX2-TX1)/1024 ))"
     else
       sleep 1
     fi
-
     sleep 1
   done
   trap - INT
-}
-
-manage_geo() {
-  clear
-  echo -e "${BLUE}====================================="
-  echo -e "       🌍 GEO ASSETS"
-  echo -e "=====================================${NC}"
-  echo
-
-  if [[ -f /opt/remnanode/assets/geosite.dat ]]; then
-    GEOSITE_SIZE=$(du -h /opt/remnanode/assets/geosite.dat | cut -f1)
-    GEOSITE_DATE=$(stat -c '%y' /opt/remnanode/assets/geosite.dat | cut -d. -f1)
-    echo -e "  geosite.dat:  ${GREEN}${GEOSITE_SIZE}${NC}  (${GRAY}${GEOSITE_DATE}${NC})"
-  else
-    echo -e "  geosite.dat:  ${RED}не установлен${NC}"
-  fi
-
-  if [[ -f /opt/remnanode/assets/geoip.dat ]]; then
-    GEOIP_SIZE=$(du -h /opt/remnanode/assets/geoip.dat | cut -f1)
-    GEOIP_DATE=$(stat -c '%y' /opt/remnanode/assets/geoip.dat | cut -d. -f1)
-    echo -e "  geoip.dat:    ${GREEN}${GEOIP_SIZE}${NC}  (${GRAY}${GEOIP_DATE}${NC})"
-  else
-    echo -e "  geoip.dat:    ${RED}не установлен${NC}"
-  fi
-
-  echo
-  if [[ -f /etc/cron.d/remnanode-geo-update ]]; then
-    echo -e "  Автообновление: ${GREEN}включено${NC} (вс. 04:00)"
-  else
-    echo -e "  Автообновление: ${YELLOW}не настроено${NC}"
-  fi
-
-  echo
-  echo "  1) Обновить сейчас"
-  echo "  2) Показать лог автообновлений"
-  echo "  3) Откатить на v2fly (стандартный)"
-  echo "  0) Назад"
-  echo
-  read -rp "  → " ch
-
-  case "$ch" in
-    1)
-      if [[ -x /usr/local/bin/remnanode-geo-update ]]; then
-        /usr/local/bin/remnanode-geo-update
-      else
-        echo -e "${RED}Скрипт обновления не найден. Переустанови ноду.${NC}"
-      fi
-      pause
-      ;;
-    2)
-      if [[ -f /var/log/remnanode-geo-update.log ]]; then
-        tail -50 /var/log/remnanode-geo-update.log
-      else
-        echo "Лог пуст (автообновление ещё не запускалось)"
-      fi
-      pause
-      ;;
-    3)
-      echo
-      warn "Откат удалит расширенные geo-файлы и убёрет volume-mount."
-      warn "Все правила geosite:yandex-ads, vk-ads, mail-ru-ads перестанут работать!"
-      read -rp "Продолжить? [y/N]: " ans
-      if [[ "$ans" =~ ^[Yy]$ ]]; then
-        rm -f /opt/remnanode/assets/geosite.dat /opt/remnanode/assets/geoip.dat
-        rm -f /etc/cron.d/remnanode-geo-update
-        rm -f /usr/local/bin/remnanode-geo-update
-        echo "Файлы удалены. Не забудь убрать volume-mount из docker-compose.yml вручную."
-      fi
-      pause
-      ;;
-  esac
-}
-
-run_speedtest() {
-  clear
-  echo -e "${BLUE}====================================="
-  echo -e "        🚀 SPEEDTEST"
-  echo -e "=====================================${NC}"
-  echo
-
-  if ! command -v speedtest >/dev/null 2>&1 && ! command -v speedtest-cli >/dev/null 2>&1; then
-    echo "Speedtest не установлен. Установить?"
-    echo "  1) Ookla speedtest (рекомендуется, точнее)"
-    echo "  2) speedtest-cli (Python, без регистрации)"
-    echo "  0) Отмена"
-    read -rp "→ " ch
-    case "$ch" in
-      1)
-        echo
-        echo "Устанавливаем Ookla speedtest..."
-        curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash >/dev/null 2>&1
-        apt-get install -y speedtest >/dev/null 2>&1 || { echo "Ошибка установки"; pause; return; }
-        speedtest --accept-license --accept-gdpr >/dev/null 2>&1 || true
-        ;;
-      2)
-        echo
-        apt-get install -y speedtest-cli >/dev/null 2>&1 || { echo "Ошибка установки"; pause; return; }
-        ;;
-      *) return ;;
-    esac
-    echo
-  fi
-
-  echo "Выбери тест:"
-  echo "  1) Быстрый тест (ближайший сервер)"
-  echo "  2) Только ping и jitter"
-  echo "  3) С подробным выводом"
-  echo "  0) Назад"
-  read -rp "→ " ch
-
-  case "$ch" in
-    1|3)
-      echo
-      if command -v speedtest >/dev/null 2>&1; then
-        speedtest --accept-license --accept-gdpr
-      else
-        speedtest-cli ${ch:+--simple}
-      fi
-      ;;
-    2)
-      echo
-      if command -v speedtest >/dev/null 2>&1; then
-        speedtest --accept-license --accept-gdpr -f json 2>/dev/null | jq -r '
-          "Ping:    \(.ping.latency) ms",
-          "Jitter:  \(.ping.jitter) ms",
-          "Server:  \(.server.name) (\(.server.location))"
-        ' 2>/dev/null || speedtest --accept-license --accept-gdpr
-      else
-        speedtest-cli --simple
-      fi
-      ;;
-    *) return ;;
-  esac
-
-  echo
-  pause
-}
-
-run_installer() {
-  echo
-  echo -e "${WHITE}🔧 Установщики${NC}"
-  echo "  1) Установить Remnanode (переустановка)"
-  echo "  2) Установить Selfsteal"
-  echo "  3) Установить WARP"
-  echo "  4) 🌍 Установить/обновить Geo-файлы"
-  echo "  0) Назад"
-  echo
-  read -rp "→ " c
-
-  if [[ -f "$LAUNCHER_LOCAL" ]]; then
-    case "$c" in
-      1) bash "$LAUNCHER_LOCAL" install-remnanode ;;
-      2) bash "$LAUNCHER_LOCAL" install-selfsteal ;;
-      3) bash "$LAUNCHER_LOCAL" install-warp ;;
-      4) bash "$LAUNCHER_LOCAL" install-geoassets ;;
-      *) return ;;
-    esac
-  else
-    echo -e "${YELLOW}Локальный установщик не найден.${NC}"
-    pause
-  fi
-}
-
-menu(){
-while true; do
-  clear
-  PUBLIC_IP=$(get_public_ip_cached)
-  echo -e "${BLUE}╔══════════════════════════════════════════╗"
-  echo -e "║      🚀 REMNANODE PANEL                  ║"
-  echo -e "╚══════════════════════════════════════════╝${NC}"
-  echo -e "  Public IP: ${CYAN}${PUBLIC_IP}${NC}"
-  echo
-  echo " 1) Статус"
-  echo " 2) Логи"
-  echo " 3) Перезапуск"
-  echo " 4) Стоп"
-  echo " 5) Старт"
-  echo " 6) Docker stats"
-  echo " 7) LIVE мониторинг"
-  echo " 8) 🚀 Speedtest"
-  echo " 9) 🌍 Geo-файлы (обновить/откатить)"
-  echo "10) 🔧 Установщики (Remnanode/Selfsteal/WARP/Geo)"
-  echo " 0) Выход"
-  echo "------------------------------------"
-  read -rp " → " c
-  case $c in
-    1) docker ps --filter "name=remnanode"; pause ;;
-    2) docker logs -f --tail 50 remnanode ;;
-    3) docker restart remnanode; pause ;;
-    4) docker stop remnanode; pause ;;
-    5) docker start remnanode; pause ;;
-    6) docker stats remnanode ;;
-    7) live_panel ;;
-    8) run_speedtest ;;
-    9) manage_geo ;;
-    10) run_installer ;;
-    0) exit 0 ;;
-    *) ;;
-  esac
-done
-}
-
-menu
-CLIEOF
-  chmod +x /usr/local/bin/remnanode
-
-  if [[ "${BASH_SOURCE[0]:-$0}" != "/opt/remnanode/installer.sh" ]]; then
-    mkdir -p /opt/remnanode
-    cp -f "${BASH_SOURCE[0]:-$0}" /opt/remnanode/installer.sh 2>/dev/null || true
-    chmod +x /opt/remnanode/installer.sh 2>/dev/null || true
-  fi
 }
 
 ###############################################################################
 # Главное меню лаунчера
 ###############################################################################
 main_menu() {
+  # Чтобы команда remnanode была доступна сразу
+  install_self_cli >/dev/null 2>&1 || true
+
   while true; do
+    PUBLIC_IP=$(get_public_ip)
     show_header
 
-    local rn_status="${RED}не установлен${NC}"
-    local ss_status="${RED}не установлен${NC}"
-    local wp_status="${RED}не установлен${NC}"
-    local geo_status="${RED}не установлено${NC}"
-
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$' \
-      && rn_status="${GREEN}● running${NC}" \
-      || { [[ -d "$DIR" ]] && rn_status="${YELLOW}● stopped${NC}"; }
-
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '(caddy|nginx)-selfsteal'; then
-      ss_status="${GREEN}● running${NC}"
-    elif [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]]; then
-      ss_status="${YELLOW}● stopped${NC}"
-    fi
-
-    if command -v warp-cli >/dev/null 2>&1; then
-      if warp-cli --accept-tos status 2>/dev/null | grep -qi connected; then
-        wp_status="${GREEN}● connected${NC}"
-      else
-        wp_status="${YELLOW}● disconnected${NC}"
-      fi
-    fi
-
-    if [[ -f "$ASSETS_DIR/geosite.dat" ]]; then
-      geo_status="${GREEN}● установлено${NC}"
-    fi
-
-    echo -e "  ${WHITE}Статус сервисов:${NC}"
-    echo -e "    • Remnanode:  $rn_status"
-    echo -e "    • Selfsteal:  $ss_status"
-    echo -e "    • WARP:       $wp_status"
-    echo -e "    • GeoAssets:  $geo_status"
+    echo -e "  ${WHITE}Статус:${NC}"
+    echo -e "    Remnanode   $(service_badge remnanode)"
+    echo -e "    Selfsteal   $(service_badge selfsteal)"
+    echo -e "    Hysteria2   $(service_badge hysteria)"
+    echo -e "    WARP        $(service_badge warp)"
+    echo -e "    MTProto     $(service_badge mtproto)"
+    echo -e "    SWAP        $(service_badge swap)"
+    echo -e "    UFW         $(service_badge ufw)"
     echo
-    echo -e "${WHITE}Что устанавливаем?${NC}"
+    hline 56
     echo
-    echo -e "  ${WHITE}1)${NC} 🚀 Remnanode   ${GRAY}— нода Remnawave VPN (включает geo)${NC}"
-    echo -e "  ${WHITE}2)${NC} 🎭 Selfsteal   ${GRAY}— фейковый сайт для маскировки Reality${NC}"
-    echo -e "  ${WHITE}3)${NC} 🌍 WARP        ${GRAY}— Cloudflare SOCKS5 outbound${NC}"
-    echo -e "  ${WHITE}4)${NC} 🗺  GeoAssets   ${GRAY}— расширенный geosite/geoip (Loyalsoldier)${NC}"
-    echo -e "  ${WHITE}5)${NC} 📦 Всё сразу   ${GRAY}— Remnanode → Selfsteal → WARP${NC}"
+    echo -e "  ${WHITE}${BOLD}Установка:${NC}"
+    echo -e "    ${WHITE}1)${NC} Remnanode          ${GRAY}— VPN-нода Remnawave${NC}"
+    echo -e "    ${WHITE}2)${NC} Selfsteal          ${GRAY}— маскировка Reality (DigneZzZ)${NC}"
+    echo -e "    ${WHITE}3)${NC} Hysteria2          ${GRAY}— автонастройка (h2-script)${NC}"
+    echo -e "    ${WHITE}4)${NC} Фикс онлайна H2    ${GRAY}— custom Xray (@markrouting)${NC}"
+    echo -e "    ${WHITE}5)${NC} WARP               ${GRAY}— Cloudflare SOCKS5${NC}"
+    echo -e "    ${WHITE}6)${NC} Telegram MTProto   ${GRAY}— mtproto.zig${NC}"
     echo
-    echo -e "  ${GRAY}0)${NC} Выход"
+    echo -e "  ${WHITE}${BOLD}Система:${NC}"
+    echo -e "    ${WHITE}7)${NC} SWAP               ${GRAY}— файл подкачки${NC}"
+    echo -e "    ${WHITE}8)${NC} UFW и порты        ${GRAY}— защита по желанию${NC}"
+    echo -e "    ${WHITE}9)${NC} Тюнинг скорости    ${GRAY}— BBR / буферы / RPS${NC}"
+    echo
+    echo -e "  ${WHITE}${BOLD}Сервис:${NC}"
+    echo -e "    ${WHITE}10)${NC} Управление нодой  ${GRAY}— меню remnanode${NC}"
+    echo -e "    ${WHITE}11)${NC} Тесты             ${GRAY}— multitest + speedtest${NC}"
+    echo
+    echo -e "    ${GRAY}0)${NC} Выход"
     echo
     read -rp "  → " choice
 
     case "$choice" in
-      1) install_remnanode; echo; read -rp "Enter..." ;;
-      2) install_selfsteal; echo; read -rp "Enter..." ;;
-      3) install_warp; echo; read -rp "Enter..." ;;
-      4) reinstall_geoassets; echo; read -rp "Enter..." ;;
-      5)
-        install_remnanode
-        install_selfsteal
-        install_warp
-        echo; read -rp "Enter..."
-        ;;
-      0) exit 0 ;;
-      *) ;;
+      1)  install_remnanode; pause ;;
+      2)  install_selfsteal; pause ;;
+      3)  install_hysteria2; pause ;;
+      4)  fix_hysteria2_online; pause ;;
+      5)  install_warp; pause ;;
+      6)  install_mtproto; pause ;;
+      7)  setup_swap; pause ;;
+      8)  setup_ufw; pause ;;
+      9)  apply_performance_tuning; pause ;;
+      10) remnanode_menu ;;
+      11) tests_menu ;;
+      0)  exit 0 ;;
+      *)  ;;
     esac
   done
 }
@@ -1316,10 +1731,50 @@ main_menu() {
 ###############################################################################
 # Точка входа
 ###############################################################################
+# Снимаем ERR-trap для интерактивных меню (иначе Ctrl+C / cancel ломают UI)
+entry_name="$(basename "${BASH_SOURCE[0]:-$0}")"
+
 case "${1:-}" in
-  install-remnanode) install_remnanode ;;
-  install-selfsteal) install_selfsteal ;;
-  install-warp)      install_warp ;;
-  install-geoassets) reinstall_geoassets ;;
-  *)                 main_menu ;;
+  install-remnanode|install)   install_remnanode ;;
+  install-selfsteal)           install_selfsteal ;;
+  install-hysteria2|hysteria2) install_hysteria2 ;;
+  fix-hysteria|fix-online)    fix_hysteria2_online ;;
+  install-warp)                install_warp ;;
+  install-mtproto|mtproto)     install_mtproto ;;
+  swap)                        setup_swap ;;
+  ufw|firewall)                setup_ufw ;;
+  tune|performance)            apply_performance_tuning ;;
+  tests|test)                  tests_menu ;;
+  up)
+    cd "$DIR" && docker compose up -d
+    ;;
+  down)
+    cd "$DIR" && docker compose down
+    ;;
+  restart)
+    cd "$DIR" && docker compose down && docker compose up -d
+    ;;
+  status)
+    docker ps -a --filter name=remnanode
+    [[ -f "$COMPOSE" ]] && (cd "$DIR" && docker compose ps) || true
+    ;;
+  logs)
+    docker logs -f --tail 100 remnanode
+    ;;
+  update)
+    cd "$DIR" && docker compose pull && docker compose up -d
+    ;;
+  manage|node|panel)
+    remnanode_menu
+    ;;
+  menu|launcher)
+    main_menu
+    ;;
+  *)
+    if [[ "$entry_name" == "remnanode" ]]; then
+      remnanode_menu
+    else
+      main_menu
+    fi
+    ;;
 esac
