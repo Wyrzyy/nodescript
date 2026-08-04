@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.20
+# Версия: 2026.8.21
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -14,10 +14,11 @@ set -Eeuo pipefail
 # Selfsteal — русифицированная копия в этом же репозитории (selfsteal.sh).
 ###############################################################################
 
-# Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.20"
-RN_VERSION="$_REMNANODE_VER"
-SCRIPT_VERSION="$_REMNANODE_VER"
+# Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
+_REMNANODE_VER_PIN="2026.8.21"
+_REMNANODE_VER="$_REMNANODE_VER_PIN"
+RN_VERSION="$_REMNANODE_VER_PIN"
+SCRIPT_VERSION="$_REMNANODE_VER_PIN"
 
 # Если запущены через bash <(curl …) (/dev/fd/…) — копируем себя в файл и
 # перезапускаемся. Иначе в Termius/SSH часто «пропадают» prompt и шаги.
@@ -522,11 +523,11 @@ run_selfsteal() {
 ###############################################################################
 require_root
 
-# os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
+# os-release задаёт VERSION=... — жёстко восстанавливаем pin версии лаунчера
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.8.12}"
-RN_VERSION="$_REMNANODE_VER"
-SCRIPT_VERSION="$_REMNANODE_VER"
+_REMNANODE_VER="$_REMNANODE_VER_PIN"
+RN_VERSION="$_REMNANODE_VER_PIN"
+SCRIPT_VERSION="$_REMNANODE_VER_PIN"
 case "$ID" in
   ubuntu|debian) ;;
   *) err "Поддерживается только Ubuntu/Debian. Найдено: $ID" ;;
@@ -582,21 +583,22 @@ pad_right() {
   printf '%s%*s' "$s" "$((w - n))" ''
 }
 
-# Актуальная версия лаунчера (никогда не пустая)
+# Актуальная версия лаунчера (никогда не пустая, никогда не из os-release)
 launcher_version() {
   local v=""
-  v="${_REMNANODE_VER:-}"
+  v="${_REMNANODE_VER_PIN:-}"
+  [[ -n "$v" ]] || v="${_REMNANODE_VER:-}"
   [[ -n "$v" ]] || v="${RN_VERSION:-}"
   [[ -n "$v" ]] || v="${SCRIPT_VERSION:-}"
-  # Запасной путь: прочитать из самого файла скрипта
+  # Запасной путь: первая строка вида _REMNANODE_VER="YYYY...."
   if [[ -z "$v" || "$v" == "unknown" ]]; then
     local src="${BASH_SOURCE[0]:-$0}"
     if [[ -f "$src" ]]; then
-      v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
+      v=$(grep -E '^_REMNANODE_VER(_PIN)?="[0-9]{4}\.' "$src" 2>/dev/null | head -1 \
+        | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.8.12"
-  # Синхронизируем все имена
+  [[ -n "$v" ]] || v="0.0.0"
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
   SCRIPT_VERSION="$v"
@@ -2448,7 +2450,7 @@ EOF
 ###############################################################################
 install_self_cli() {
   local src="${BASH_SOURCE[0]:-$0}"
-  local src_dir="" quiet="${RN_QUIET:-0}"
+  local src_dir="" quiet="${RN_QUIET:-0}" force="${1:-}"
   src_dir=$(cd "$(dirname "$src")" 2>/dev/null && pwd || true)
   mkdir -p "$DIR"
 
@@ -2456,25 +2458,30 @@ install_self_cli() {
   if [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]]; then
     cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
   fi
-  # Если копии нет / версия устарела — скачать свежий с GitHub
+
+  # Версия установленной копии (только литерал YYYY.…, не ${…:-})
   local inst_ver=""
   if [[ -f "$LAUNCHER_PATH" ]]; then
-    inst_ver=$(grep -E '^_REMNANODE_VER=' "$LAUNCHER_PATH" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"' || true)
+    inst_ver=$(grep -E '^_REMNANODE_VER(_PIN)?="[0-9]{4}\.' "$LAUNCHER_PATH" 2>/dev/null | head -1 \
+      | sed -E 's/^[^=]+=//; s/["'\'']//g' || true)
   fi
-  if [[ ! -f "$LAUNCHER_PATH" ]] \
+
+  # Устарело / нет файла / force — качаем свежий с GitHub (anti-cache)
+  if [[ "$force" == "force" ]] \
+     || [[ ! -f "$LAUNCHER_PATH" ]] \
      || [[ -z "$inst_ver" ]] \
-     || [[ "$inst_ver" != "$_REMNANODE_VER" ]]; then
-    # если текущий файл уже новой версии — копируем его; иначе GitHub
+     || [[ "$inst_ver" != "$_REMNANODE_VER_PIN" ]]; then
     if [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]] \
-       && grep -qE "^_REMNANODE_VER=\"?${_REMNANODE_VER}\"?$" "$src" 2>/dev/null; then
+       && grep -qE "^_REMNANODE_VER_PIN=\"${_REMNANODE_VER_PIN}\"" "$src" 2>/dev/null; then
       cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
     else
+      info "Обновляю лаунчер с GitHub → ${_REMNANODE_VER_PIN}…"
       gh_download "$LAUNCHER_RAW" "$LAUNCHER_PATH" 2>/dev/null || true
     fi
   fi
   chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
 
-  # Кладём/обновляем русифицированный Selfsteal рядом с лаунчером
+  # Selfsteal рядом с лаунчером
   if [[ -n "$src_dir" && -f "$src_dir/selfsteal.sh" ]]; then
     cp -f "$src_dir/selfsteal.sh" "$SELFSTEAL_LOCAL" 2>/dev/null || true
     chmod +x "$SELFSTEAL_LOCAL" 2>/dev/null || true
@@ -2485,8 +2492,36 @@ install_self_cli() {
   ln -sfn "$LAUNCHER_PATH" "$CLI_PATH"
   chmod +x "$CLI_PATH" 2>/dev/null || true
   if [[ "$quiet" != "1" ]]; then
-    ok "Команда управления: remnanode"
+    ok "Команда управления: remnanode  (v$(launcher_version))"
   fi
+}
+
+# Если запущена старая копия из /opt — подтянуть свежую и перезапуститься
+_self_update_if_stale() {
+  [[ -f "$LAUNCHER_PATH" ]] || return 0
+  # уже свежий процесс (запущен не из старого installer)
+  local running="${BASH_SOURCE[0]:-$0}"
+  local run_ver pin
+  pin="${_REMNANODE_VER_PIN:-}"
+  [[ -n "$pin" ]] || return 0
+  run_ver=$(grep -E '^_REMNANODE_VER_PIN="[0-9]{4}\.' "$running" 2>/dev/null | head -1 \
+    | sed -E 's/^[^=]+=//; s/["'\'']//g' || true)
+  # если в этом файле уже есть актуальный pin — ок
+  [[ "$run_ver" == "$pin" ]] && return 0
+
+  # скачать свежий и exec
+  local tmp
+  tmp=$(mktemp /tmp/remnanode-upd.XXXXXX.sh)
+  if gh_download "$LAUNCHER_RAW" "$tmp"; then
+    if grep -qE "^_REMNANODE_VER_PIN=\"[0-9]{4}\." "$tmp" 2>/dev/null; then
+      cp -f "$tmp" "$LAUNCHER_PATH" 2>/dev/null || true
+      chmod +x "$tmp" "$LAUNCHER_PATH" 2>/dev/null || true
+      info "Найдена новая версия лаунчера — перезапуск…"
+      exec bash "$tmp" "$@"
+    fi
+  fi
+  rm -f "$tmp"
+  return 0
 }
 
 ###############################################################################
@@ -4217,8 +4252,14 @@ case "${1:-}" in
   # @ install / install — поставить CLI и открыть главное меню
   install|launcher|menu)
     _menu_soft_mode
-    RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
+    RN_QUIET=0 install_self_cli force || true
     main_menu
+    ;;
+  self-update|update-self|update-launcher)
+    _menu_soft_mode
+    install_self_cli force
+    ok "Лаунчер обновлён до v$(launcher_version)"
+    info "Запуск: remnanode   или   bash $LAUNCHER_PATH"
     ;;
   install-remnanode)           install_remnanode ;;
   install-selfsteal)           install_selfsteal ;;
@@ -4261,6 +4302,23 @@ case "${1:-}" in
     ;;
   *)
     _menu_soft_mode
+    # при обычном запуске remnanode — если копия в /opt устарела, обновим
+    if [[ "${BASH_SOURCE[0]:-$0}" == "$LAUNCHER_PATH" || "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null)" == "$LAUNCHER_PATH" ]]; then
+      _iv=""
+      _iv=$(grep -E '^_REMNANODE_VER_PIN="[0-9]{4}\.' "$LAUNCHER_PATH" 2>/dev/null | head -1 \
+        | sed -E 's/^[^=]+=//; s/["'\'']//g' || true)
+      if [[ -z "$_iv" || "$_iv" != "${_REMNANODE_VER_PIN:-}" ]]; then
+        _tmp=$(mktemp /tmp/remnanode-upd.XXXXXX.sh)
+        if gh_download "$LAUNCHER_RAW" "$_tmp" && grep -qE '^_REMNANODE_VER_PIN=' "$_tmp"; then
+          cp -f "$_tmp" "$LAUNCHER_PATH" 2>/dev/null || true
+          chmod +x "$LAUNCHER_PATH" "$_tmp" 2>/dev/null || true
+          ln -sfn "$LAUNCHER_PATH" "$CLI_PATH" 2>/dev/null || true
+          info "Лаунчер обновлён — перезапуск…"
+          exec bash "$_tmp" "$@"
+        fi
+        rm -f "$_tmp"
+      fi
+    fi
     if [[ "$entry_name" == "remnanode" ]]; then
       remnanode_menu
     else
