@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.16
+# Версия: 2026.8.17
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.16"
+_REMNANODE_VER="2026.8.17"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -1993,12 +1993,25 @@ ports_open_panel() {
     ok "Порт ${port}: firewall OPEN и процесс слушает — панель может подключаться"
   else
     warn "Firewall OPEN для TCP/${port}, но процесс пока НЕ слушает этот порт."
-    if is_remnanode_up; then
-      warn "Контейнер remnanode запущен, но нода не приняла порт — смотрите логи / перезапуск."
-      ask_yes_no "Перезапустить контейнер remnanode?" ans N
-      if [[ "$ans" =~ ^[Yy]$ ]]; then
-        if [[ -f "$COMPOSE" ]]; then
-          (cd "$DIR" && docker compose down && docker compose up -d) || warn "Перезапуск не удался"
+    if is_remnanode_up || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+      if remnanode_compose_has_bad_init || remnanode_logs_show_s6_pid1; then
+        warn "Причина: конфликт Docker init:true с s6-overlay (can only run as pid 1)."
+        ask_yes_no "Исправить compose и перезапустить ноду?" ans Y
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          restart_remnanode_safe || true
+          sleep 4
+          if is_node_port_listening "$port"; then
+            ok "После фикса порт ${port} слушает"
+          else
+            warn "Всё ещё не слушает. Логи: docker logs --tail 50 remnanode"
+            docker logs --tail 30 remnanode 2>&1 | sed 's/^/    /' || true
+          fi
+        fi
+      elif is_remnanode_up; then
+        warn "Контейнер remnanode запущен, но нода не приняла порт — смотрите логи / перезапуск."
+        ask_yes_no "Перезапустить контейнер remnanode?" ans N
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          restart_remnanode_safe || true
           sleep 3
           if is_node_port_listening "$port"; then
             ok "После перезапуска порт ${port} слушает"
@@ -2307,6 +2320,38 @@ is_remnanode_installed() {
 }
 is_remnanode_up() { docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; }
 
+# remnawave/node использует s6-overlay → ему нужен PID 1.
+# Docker Compose «init: true» подставляет tini и ломает контейнер:
+#   s6-overlay-suexec: fatal: can only run as pid 1
+remnanode_compose_has_bad_init() {
+  [[ -f "$COMPOSE" ]] || return 1
+  grep -qE '^[[:space:]]*init:[[:space:]]*true[[:space:]]*$' "$COMPOSE" 2>/dev/null
+}
+
+remnanode_logs_show_s6_pid1() {
+  docker logs --tail 40 remnanode 2>&1 | grep -qi 'can only run as pid 1'
+}
+
+# Убрать init: true из compose. Возвращает 0 если правили файл.
+fix_remnanode_s6_init() {
+  remnanode_compose_has_bad_init || return 1
+  info "Исправляю конфликт s6-overlay: убираю init: true из docker-compose.yml…"
+  sed -i -E '/^[[:space:]]*init:[[:space:]]*true[[:space:]]*$/d' "$COMPOSE"
+  ok "compose без init: true (s6-overlay сможет стать PID 1)"
+  return 0
+}
+
+# Перезапуск ноды с авто-фиксом s6/init при необходимости
+restart_remnanode_safe() {
+  [[ -f "$COMPOSE" ]] || { warn "docker-compose.yml не найден"; return 1; }
+  fix_remnanode_s6_init || true
+  (cd "$DIR" && docker compose down && docker compose up -d) || {
+    warn "Перезапуск remnanode не удался"
+    return 1
+  }
+  return 0
+}
+
 # Удалить только файлы ноды; лаунчер (installer.sh / selfsteal.sh) оставляем
 _remove_remnanode_files() {
   if [[ -f "$COMPOSE" ]]; then
@@ -2416,7 +2461,6 @@ services:
     hostname: remnanode
     network_mode: host
     restart: always
-    init: true
     stop_grace_period: 30s
     env_file:
       - .env
@@ -2487,7 +2531,19 @@ EOF
   if ss -tlnp 2>/dev/null | grep -qE ":${NODE_PORT}\\b"; then
     ok "Нода слушает порт ${NODE_PORT}"
   else
-    warn "Порт ${NODE_PORT} пока может подниматься — проверьте: ss -tlnp | grep ${NODE_PORT}"
+    warn "Порт ${NODE_PORT} пока не слушает — проверяю типичный конфликт s6/init…"
+    if remnanode_compose_has_bad_init || remnanode_logs_show_s6_pid1; then
+      fix_remnanode_s6_init || true
+      (cd "$DIR" && docker compose up -d --force-recreate) || true
+      sleep 5
+      if ss -tlnp 2>/dev/null | grep -qE ":${NODE_PORT}\\b"; then
+        ok "После фикса s6/init нода слушает порт ${NODE_PORT}"
+      else
+        warn "Порт ${NODE_PORT} всё ещё не слушает — docker logs remnanode"
+      fi
+    else
+      warn "Порт ${NODE_PORT} пока может подниматься — проверьте: ss -tlnp | grep ${NODE_PORT}"
+    fi
   fi
 
   # По стандарту: открыть указанный при установке NODE_PORT для панели
@@ -3738,6 +3794,7 @@ remnanode_menu() {
       1) install_remnanode; pause ;;
       2)
         [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
+        fix_remnanode_s6_init || true
         cd "$DIR" && docker compose up -d
         ok "Запущено"; pause
         ;;
@@ -3748,7 +3805,7 @@ remnanode_menu() {
         ;;
       4)
         [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
-        cd "$DIR" && docker compose down && docker compose up -d
+        restart_remnanode_safe
         ok "Перезапущено"; pause
         ;;
       5)
@@ -3976,7 +4033,7 @@ case "${1:-}" in
     cd "$DIR" && docker compose down
     ;;
   restart)
-    cd "$DIR" && docker compose down && docker compose up -d
+    restart_remnanode_safe || exit 1
     ;;
   status)
     docker ps -a --filter name=remnanode
