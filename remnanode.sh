@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.8
+# Версия: 2026.8.9
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.8"
+_REMNANODE_VER="2026.8.9"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -241,29 +241,85 @@ ask_yes_no() {
   printf -v "$varname" '%s' "$_ans"
 }
 
+# Полоса загрузки (неопределённая) — без |/-\ , Termius-friendly
+# Рисует фиксированную ширину с пробелами справа, чтобы не копились символы
+# даже если \r в терминале ведёт себя странно.
+_PROGRESS_W=18
+
+_progress_bar_frame() {
+  # скользящий «бегунок» по пустой полосе: ░░▓▓▓▒░░░░…
+  local pos=$1
+  local w="${_PROGRESS_W}"
+  local i bar="" head=3
+  local p=$((pos % (w + head)))
+  for ((i = 0; i < w; i++)); do
+    local d=$((i - p))
+    if (( d >= 0 && d < head )); then
+      case $d in
+        0) bar+="▓" ;;
+        1) bar+="█" ;;
+        2) bar+="▓" ;;
+      esac
+    else
+      bar+="░"
+    fi
+  done
+  printf '%s' "$bar"
+}
+
+_progress_bar_done() {
+  local w="${_PROGRESS_W}" i bar=""
+  for ((i = 0; i < w; i++)); do bar+="█"; done
+  printf '%s' "$bar"
+}
+
+_progress_bar_fail() {
+  local w="${_PROGRESS_W}" i bar=""
+  for ((i = 0; i < w; i++)); do bar+="▒"; done
+  printf '%s' "$bar"
+}
+
+# Печать строки прогресса. Добивка пробелами затирает хвост без \033[K (Termius).
+_progress_draw() {
+  local bar="$1" msg="$2" suffix="$3" color="${4:-$CYAN}"
+  local m="$msg"
+  (( ${#m} > 34 )) && m="${m:0:31}..."
+  _tty_printf '\r  %b%s%b  %-34s  %-12s                    ' \
+    "$color" "$bar" "$NC" "$m" "$suffix"
+}
+
 spin() {
   local pid=$1 msg=$2
-  local frames=('|' '/' '-' '\\') i=0
-  local start=$SECONDS el=0
-  # одна строка со спиннером и таймером — видно, что процесс жив
-  _tty_printf '  %b*%b %s %s %b(0s)%b' "$CYAN" "$NC" "$msg" "${frames[0]}" "$GRAY" "$NC"
+  local i=0 start=$SECONDS el=0 bar
+  # восстановить курсор при прерывании
+  trap '_tty_printf "\033[?25h"' RETURN
+  _tty_printf '\033[?25l'
+  bar=$(_progress_bar_frame 0)
+  _progress_draw "$bar" "$msg" "0s" "$CYAN"
   while kill -0 "$pid" 2>/dev/null; do
     el=$((SECONDS - start))
-    _tty_printf '\r\033[K  %b*%b %s %s %b(%ss)%b' \
-      "$CYAN" "$NC" "$msg" "${frames[$((i++ % 4))]}" "$GRAY" "$el" "$NC"
-    sleep 0.15
+    bar=$(_progress_bar_frame "$i")
+    _progress_draw "$bar" "$msg" "${el}s" "$CYAN"
+    i=$((i + 1))
+    sleep 0.12
   done
   wait "$pid"
   local rc=$?
   el=$((SECONDS - start))
   if [[ $rc -eq 0 ]]; then
-    _tty_printf '\r\033[K  %b*%b %s %bok%b %b(%ss)%b\n' \
-      "$CYAN" "$NC" "$msg" "$GREEN" "$NC" "$GRAY" "$el" "$NC"
+    bar=$(_progress_bar_done)
+    _tty_printf '\r'
+    _tty_printf '  %b✅%b %b%s%b  %-34s  %b%ss%b                    \n' \
+      "$GREEN" "$NC" "$GREEN" "$bar" "$NC" "$msg" "$GRAY" "$el" "$NC"
   else
-    _tty_printf '\r\033[K  %b*%b %s %bfail%b %b(%ss)%b\n' \
-      "$CYAN" "$NC" "$msg" "$RED" "$NC" "$GRAY" "$el" "$NC"
-    return $rc
+    bar=$(_progress_bar_fail)
+    _tty_printf '\r'
+    _tty_printf '  %b❌%b %b%s%b  %-34s  %b%ss%b                    \n' \
+      "$RED" "$NC" "$RED" "$bar" "$NC" "$msg" "$GRAY" "$el" "$NC"
   fi
+  _tty_printf '\033[?25h'
+  trap - RETURN
+  return "$rc"
 }
 
 # Шаг с видимым статусом; подробности — в лог, итог — на экран
@@ -441,7 +497,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.8.8}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.8.9}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -512,7 +568,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.8.8"
+  [[ -n "$v" ]] || v="2026.8.9"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -1063,7 +1119,7 @@ ensure_packages() {
   apt_pause_background
   info "Обновление apt (может занять 1–2 мин)…"
   if spin_fn "apt-get update" apt_update_safe; then
-    ok "Обновление apt"
+    :
   else
     warn "apt update не идеален — пробую установить пакеты из кэша/основных зеркал"
   fi
@@ -1085,7 +1141,7 @@ ensure_packages() {
   jq unzip ca-certificates"
   fi
   command -v curl >/dev/null 2>&1 || err "Не удалось установить базовые пакеты (curl/ca-certificates)"
-  ok "Базовые пакеты"
+  ok "Базовые пакеты готовы"
 }
 
 ###############################################################################
@@ -1576,7 +1632,7 @@ install_docker() {
         err "apt update после добавления Docker-репозитория не удался"
       fi
     fi
-    ok "Репозиторий Docker"
+    # статус уже показал spin_fn (✅)
 
     apt_wait_locks 120 || true
     run_step "Установка Docker" \
@@ -1854,22 +1910,33 @@ EOF
   run_step "Запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
 
   info "7️⃣/7  Ожидание готовности ноды…"
-  _tty_printf "  %b*%b Жду контейнер/порт %s " "$CYAN" "$NC" "$NODE_PORT"
-  local i ready=0
+  _tty_printf '\033[?25l'
+  local i ready=0 bar
   for i in $(seq 1 30); do
-    _tty_printf '\r\033[K  %b*%b Жду контейнер/порт %s %b(%s/30с)%b' \
-      "$CYAN" "$NC" "$NODE_PORT" "$GRAY" "$i" "$NC"
+    bar=$(_progress_bar_frame "$i")
+    # детерминированная заполненность по секундам + бегунок
+    local filled=$(( i * _PROGRESS_W / 30 ))
+    local j mix=""
+    for ((j = 0; j < _PROGRESS_W; j++)); do
+      if (( j < filled )); then mix+="█"; else mix+="░"; fi
+    done
+    _progress_draw "$mix" "порт ${NODE_PORT} / контейнер" "${i}/30с" "$CYAN"
     sleep 1
     if is_remnanode_up; then
       if ss -tlnp 2>/dev/null | grep -qE ":${NODE_PORT}\\b"; then
         ready=1
         break
       fi
-      # контейнер up, порт ещё может подниматься
       (( i >= 10 )) && ready=1 && break
     fi
   done
-  _tty_echo ""
+  if is_remnanode_up; then
+    bar=$(_progress_bar_done)
+    _tty_printf '\r'
+    _tty_printf '  %b✅%b %b%s%b  %-34s  %bготово%b                    \n' \
+      "$GREEN" "$NC" "$GREEN" "$bar" "$NC" "контейнер remnanode" "$GRAY" "$NC"
+  fi
+  _tty_printf '\033[?25h'
 
   if ! is_remnanode_up; then
     echo -e "  ${RED}Логи контейнера:${NC}"
