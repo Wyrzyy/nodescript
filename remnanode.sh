@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.15
+# Версия: 2026.8.16
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.15"
+_REMNANODE_VER="2026.8.16"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -1784,10 +1784,12 @@ _ports_ensure_nft() {
     else
       apt_update_safe || true
     fi
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables || {
-      err "Не удалось установить nftables"
-    }
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables; then
+      warn "Не удалось установить nftables"
+      return 1
+    fi
   fi
+  return 0
 }
 
 _ports_conf_init() {
@@ -1821,7 +1823,7 @@ _ports_del_line() {
 }
 
 _ports_rebuild_nft() {
-  _ports_ensure_nft
+  _ports_ensure_nft || return 1
   _ports_conf_init
   local opens blocks line kind proto port
   opens=""
@@ -1956,7 +1958,11 @@ ports_open() {
     _ports_add_line OPEN "$p" "$port"
     ok "Firewall: открыт ${p^^}/${port}"
   done
-  _ports_rebuild_nft || warn "Правила сохранены, но nft не применил — см. лог"
+  if ! _ports_rebuild_nft; then
+    warn "Правила сохранены, но nft не применил — см. лог"
+    return 1
+  fi
+  return 0
 }
 
 # Открыть NODE_PORT для связи панели Remnawave с нодой (только TCP)
@@ -2375,17 +2381,17 @@ install_remnanode() {
   ok "Ключ принят (${#K1} символов)"
   echo
 
-  echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги 0–7, со статусом)${NC}"
+  echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги 0–8, со статусом)${NC}"
   hline 40
-  info "0️⃣/7  Проверка apt-репозиториев"
+  info "0️⃣/8  Проверка apt-репозиториев"
   run_step_soft "проверка репозиториев" "apt_pause_background; sanitize_apt_repos"
-  info "1️⃣/7  Базовые пакеты"
+  info "1️⃣/8  Базовые пакеты"
   ensure_packages
-  info "2️⃣/7  Тюнинг производительности"
+  info "2️⃣/8  Тюнинг производительности"
   apply_performance_tuning
-  info "3️⃣/7  Docker"
+  info "3️⃣/8  Docker"
   install_docker
-  info "4️⃣/7  Конфиг ноды (.env + compose)"
+  info "4️⃣/8  Конфиг ноды (.env + compose)"
 
   mkdir -p "$DIR"
 
@@ -2442,12 +2448,12 @@ EOF
   echo "$NODE_PORT" > "$DIR/.node_port"
 
   cd "$DIR"
-  info "5️⃣/7  Скачивание образа (может занять несколько минут)…"
+  info "5️⃣/8  Скачивание образа (может занять несколько минут)…"
   run_step "скачивание образа ноды" "docker compose pull"
-  info "6️⃣/7  Запуск контейнера"
+  info "6️⃣/8  Запуск контейнера"
   run_step "запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
 
-  info "7️⃣/7  Ожидание готовности ноды…"
+  info "7️⃣/8  Ожидание готовности ноды…"
   _tty_printf '\033[?25l'
   local i ready=0
   for i in $(seq 1 30); do
@@ -2484,9 +2490,13 @@ EOF
     warn "Порт ${NODE_PORT} пока может подниматься — проверьте: ss -tlnp | grep ${NODE_PORT}"
   fi
 
-  # Firewall для связи с панелью (отдельно от UFW)
-  info "Открываю TCP/${NODE_PORT} для Remnawave Panel (nftables)…"
-  ports_open "$NODE_PORT" tcp 2>/dev/null || warn "Не удалось открыть порт в nftables — пункт меню «Порты»"
+  # По стандарту: открыть указанный при установке NODE_PORT для панели
+  info "8️⃣/8  Открытие TCP/${NODE_PORT} для Remnawave Panel (firewall, не UFW)…"
+  if ports_open "$NODE_PORT" tcp; then
+    ok "Порт ${NODE_PORT}/tcp открыт для взаимодействия с панелью"
+  else
+    warn "Не удалось открыть TCP/${NODE_PORT} — позже: меню «Порты» → пункт 1"
+  fi
 
   info "Установка команды управления…"
   install_self_cli
@@ -2499,13 +2509,12 @@ EOF
   echo -e "${NC}"
   echo -e "  🌐 Public IP:   ${CYAN}${PUBLIC_IP}${NC}"
   echo -e "  🖥️  Панель IP:   ${PANEL_IP}"
-  echo -e "  🔌 NODE_PORT:   ${NODE_PORT}"
+  echo -e "  🔌 NODE_PORT:   ${NODE_PORT}  ${GRAY}(firewall OPEN)${NC}"
   echo -e "  🔗 XTLS_API:    ${XTLS_API_PORT}"
   echo -e "  📡 Управление:  ${CYAN}remnanode${NC}"
   echo -e "  📋 Лог:         ${GRAY}${LOG}${NC}"
   echo
   echo -e "  ${YELLOW}💡 Рекомендуется отдельно:${NC}"
-  echo -e "    • 🔓 Порты — пункт «Открыть порт ноды для Remnawave Panel»"
   echo -e "    • 🛡️  UFW — ограничить NODE_PORT только IP панели"
   echo -e "    • 💾 SWAP — если мало RAM"
   echo -e "    • ⚡ Hysteria2 — если нужен UDP-протокол"
