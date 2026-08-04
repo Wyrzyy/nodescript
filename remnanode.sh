@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.17
+# Версия: 2026.8.18
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.17"
+_REMNANODE_VER="2026.8.18"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -1188,7 +1188,7 @@ apt_update_safe() {
     apt_wait_locks 90 || true
     echo "=== $(date '+%F %T') | apt-get update (попытка ${attempt}/${max}) ===" >&3
     # Не используем -qq на ошибках: нужен полный текст для парсинга URL
-    if apt-get update -o Acquire::Retries=3 >"$errfile" 2>&1; then
+    if apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none >"$errfile" 2>&1; then
       _apt_mark_updated
       return 0
     fi
@@ -1276,13 +1276,56 @@ apt_update_safe() {
   return 1
 }
 
+# Быстрый update ТОЛЬКО одного нового репозитория (docker/warp):
+# не перечитывает все зеркала (экономит 1–3 минуты на медленных VPS).
+apt_update_one_repo() {
+  local listfile="$1"
+  [[ -f "$listfile" ]] || return 1
+  local errfile="/tmp/rn-apt-one.err"
+  apt_wait_locks 120 || true
+  if apt-get update \
+      -o Dir::Etc::sourcelist="$listfile" \
+      -o Dir::Etc::sourceparts=/dev/null \
+      -o APT::Get::List-Cleanup=0 \
+      -o Acquire::Retries=3 \
+      -o Acquire::Languages=none >"$errfile" 2>&1; then
+    return 0
+  fi
+  cat "$errfile" >&3 2>/dev/null || true
+  return 1
+}
+
+# Каких пакетов из списка нет в системе
+_pkgs_missing() {
+  local p out=""
+  for p in "$@"; do
+    dpkg -s "$p" >/dev/null 2>&1 || out+="$p "
+  done
+  printf '%s' "${out% }"
+}
+
 ensure_packages() {
   sanitize_apt_repos
   apt_pause_background
+
+  local want_essential="curl wget ca-certificates gnupg lsb-release jq unzip"
+  local want_extra="python3 htop iftop ethtool irqbalance dnsutils ufw fail2ban"
+  local missing_essential missing_extra missing
+  # shellcheck disable=SC2086
+  missing_essential=$(_pkgs_missing $want_essential)
+  # shellcheck disable=SC2086
+  missing_extra=$(_pkgs_missing $want_extra)
+  missing="${missing_essential}${missing_essential:+ }${missing_extra}"
+
+  if [[ -z "$missing" ]]; then
+    ok "Базовые пакеты уже установлены — пропускаю apt"
+    return 0
+  fi
+
   if _apt_lists_fresh; then
     info "Списки apt свежие — update не нужен"
   else
-    info "Обновление списков пакетов (1–2 мин)…"
+    info "Обновление списков пакетов (может занять 1–2 мин)…"
     if spin_fn "обновление apt" apt_update_safe; then
       :
     else
@@ -1290,21 +1333,17 @@ ensure_packages() {
     fi
   fi
   apt_wait_locks 120 || true
-  info "Установка базовых пакетов…"
+  info "Установка недостающих пакетов: ${missing}"
   run_step_soft "базовые пакеты" \
-"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  curl wget ca-certificates gnupg lsb-release python3 \
-  jq htop iftop ethtool irqbalance dnsutils unzip \
-  ufw fail2ban"
+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ${missing}"
   if ! command -v curl >/dev/null 2>&1; then
     warn "Повтор apt update + install…"
     apt_wait_locks 180 || true
     spin_fn "обновление apt (повтор)" apt_update_safe force || true
     apt_wait_locks 120 || true
     run_step "базовые пакеты (повтор)" \
-"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  curl wget ca-certificates gnupg lsb-release python3 \
-  jq unzip ca-certificates"
+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+  curl wget ca-certificates gnupg lsb-release jq unzip"
   fi
   command -v curl >/dev/null 2>&1 || err "Не удалось установить базовые пакеты (curl/ca-certificates)"
   ok "Базовые пакеты готовы"
@@ -2162,17 +2201,17 @@ install_docker() {
     echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
     apt_wait_locks 180 || true
-    # новое репо → нужен принудительный update (иначе пакетов docker не видно)
+    # новое репо: обновляем только docker.list (быстро), не все зеркала
     info "Обновление apt под Docker-репозиторий…"
-    if ! spin_fn "apt (docker-репо)" apt_update_safe force; then
-      warn "apt update после Docker-репо не удался — повтор после ожидания lock…"
+    if ! spin_fn "apt (docker-репо)" apt_update_one_repo /etc/apt/sources.list.d/docker.list; then
+      warn "Точечный update Docker-репо не удался — полный update…"
       apt_wait_locks 180 || true
-      if ! spin_fn "apt (docker-репо, повтор)" apt_update_safe force; then
+      if ! spin_fn "apt (docker-репо, полный)" apt_update_safe force; then
         err "apt update после добавления Docker-репозитория не удался"
       fi
     fi
     run_step "установка Docker Engine" \
-"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
  systemctl enable docker && systemctl start docker"
   fi
 
@@ -2851,11 +2890,11 @@ systemctl daemon-reload"
   echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${warp_codename} main" \
     > /etc/apt/sources.list.d/cloudflare-client.list
   apt_wait_locks 180 || true
-  # новое репо Cloudflare → принудительный update
-  if ! spin_fn "apt (WARP-репо)" apt_update_safe force; then
-    warn "apt update после Cloudflare-репо не удался — повтор…"
+  # новое репо Cloudflare: обновляем только его список (быстро)
+  if ! spin_fn "apt (WARP-репо)" apt_update_one_repo /etc/apt/sources.list.d/cloudflare-client.list; then
+    warn "Точечный update WARP-репо не удался — полный update…"
     apt_wait_locks 180 || true
-    if ! spin_fn "apt (WARP-репо, повтор)" apt_update_safe force; then
+    if ! spin_fn "apt (WARP-репо, полный)" apt_update_safe force; then
       err "apt update после добавления Cloudflare-репозитория не удался"
     fi
   fi
