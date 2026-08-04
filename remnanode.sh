@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.18
+# Версия: 2026.8.19
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.18"
+_REMNANODE_VER="2026.8.19"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -1100,12 +1100,21 @@ apt_disable_from_errors() {
   return 0
 }
 
-# Надёжный apt-get update: ждёт lock, чистит битые third-party репо и повторяет.
-# Кэш: в одной сессии и если списки свежие (< TTL) — не гоняем update повторно.
+# Надёжный + быстрый apt-get update.
+# Кэш TTL; таймауты зеркал; жёсткий лимит на одну попытку (не висеть 8 минут).
 # Принудительно: apt_update_safe force  (после добавления docker/cloudflare репо).
 _APT_UPDATE_TTL="${_APT_UPDATE_TTL:-1800}"   # 30 минут
 _APT_UPDATED_AT=0
 _APT_STAMP_FILE="/var/cache/remnanode/apt-updated.stamp"
+# Одна попытка apt-get update не дольше N секунд (иначе timeout)
+_APT_UPDATE_TIMEOUT="${_APT_UPDATE_TIMEOUT:-90}"
+_APT_ACQUIRE=(
+  -o Acquire::Retries=1
+  -o Acquire::http::Timeout=15
+  -o Acquire::https::Timeout=15
+  -o Acquire::ftp::Timeout=15
+  -o Acquire::Languages=none
+)
 
 _apt_lists_fresh() {
   local now stamp age newest
@@ -1151,6 +1160,23 @@ _apt_mark_updated() {
   printf '%s\n' "$_APT_UPDATED_AT" >"$_APT_STAMP_FILE" 2>/dev/null || true
 }
 
+# Запуск apt-get update с жёстким таймаутом (не висеть на мёртвых зеркалах)
+_apt_get_update() {
+  local errfile="$1"; shift
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_APT_UPDATE_TIMEOUT" apt-get update "${_APT_ACQUIRE[@]}" "$@" >"$errfile" 2>&1
+    rc=$?
+    # 124 = timeout
+    if (( rc == 124 )); then
+      echo "=== apt-get update TIMEOUT after ${_APT_UPDATE_TIMEOUT}s ===" >>"$errfile"
+      return 124
+    fi
+    return "$rc"
+  fi
+  apt-get update "${_APT_ACQUIRE[@]}" "$@" >"$errfile" 2>&1
+}
+
 # usage: apt_update_safe [force]
 apt_update_safe() {
   local force="${1:-0}"
@@ -1165,7 +1191,6 @@ apt_update_safe() {
     if (( _APT_UPDATED_AT > 0 )); then
       age=$(( now - _APT_UPDATED_AT ))
     fi
-    # зафиксируем для этой сессии, чтобы не дергать find повторно
     (( _APT_UPDATED_AT == 0 )) && _APT_UPDATED_AT=$now
     if (( age >= 60 )); then
       info "apt уже актуален (~$((age / 60)) мин) — пропускаю update"
@@ -1178,117 +1203,92 @@ apt_update_safe() {
 
   local errfile="/tmp/rn-apt-update.err"
   local attempt=1
-  local max=8
+  local max=3
   local lock_rounds=0
 
   sanitize_apt_repos
-  apt_wait_locks 180 || true
+  apt_wait_locks 60 || true
 
   while (( attempt <= max )); do
-    apt_wait_locks 90 || true
-    echo "=== $(date '+%F %T') | apt-get update (попытка ${attempt}/${max}) ===" >&3
-    # Не используем -qq на ошибках: нужен полный текст для парсинга URL
-    if apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none >"$errfile" 2>&1; then
+    apt_wait_locks 45 || true
+    echo "=== $(date '+%F %T') | apt-get update (попытка ${attempt}/${max}, timeout=${_APT_UPDATE_TIMEOUT}s) ===" >&3
+    if _apt_get_update "$errfile"; then
       _apt_mark_updated
       return 0
     fi
     cat "$errfile" >&3 2>/dev/null || true
 
-    # Lock: не сжигать попытки — ждать и повторять
     if _apt_err_is_lock "$errfile"; then
       lock_rounds=$((lock_rounds + 1))
-      if (( lock_rounds > 12 )); then
-        warn "apt-блокировка не отпускает после ${lock_rounds} ожиданий"
+      if (( lock_rounds > 4 )); then
+        warn "apt-блокировка не отпускает — пропускаю update"
         break
       fi
-      warn "apt занят другим процессом — жду (${lock_rounds}/12)…"
-      apt_wait_locks 120 || sleep 5
+      warn "apt занят — жду (${lock_rounds}/4)…"
+      apt_wait_locks 60 || sleep 3
       continue
     fi
 
-    # Битый third-party / Release / ключ — отключаем и пробуем снова
+    # Битый third-party — отключаем и пробуем снова
     if grep -qiE 'does not have a Release file|NO_PUBKEY|not signed|Release file|404[[:space:]]+Not Found|packagecloud|ookla|speedtest' "$errfile" 2>/dev/null; then
-      warn "apt: битый репозиторий — отключаю и повторяю (${attempt}/${max})…"
+      warn "apt: битый репозиторий — отключаю (${attempt}/${max})…"
       apt_disable_from_errors "$errfile"
       sanitize_apt_repos
       attempt=$((attempt + 1))
-      sleep 1
       continue
     fi
 
-    # Иное: пробуем allow-releaseinfo-change
-    apt_wait_locks 60 || true
-    if apt-get update --allow-releaseinfo-change -o Acquire::Retries=3 >"$errfile" 2>&1; then
+    # timeout / медленные зеркала — сразу пробуем только системные источники
+    if grep -qiE 'TIMEOUT|Temporary failure|Connection timed out|Failed to fetch' "$errfile" 2>/dev/null \
+       || [[ "$(tail -1 "$errfile" 2>/dev/null)" == *TIMEOUT* ]]; then
+      warn "apt update медленный/таймаут — переключаюсь на системные репо"
+      break
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  # Быстрый резерв: только ubuntu.sources / debian.sources (+ docker/warp если есть)
+  local tmpparts
+  tmpparts=$(mktemp -d /tmp/rn-apt-parts.XXXXXX)
+  [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] && cp -a /etc/apt/sources.list.d/ubuntu.sources "$tmpparts/" || true
+  [[ -f /etc/apt/sources.list.d/debian.sources ]] && cp -a /etc/apt/sources.list.d/debian.sources "$tmpparts/" || true
+  [[ -f /etc/apt/sources.list ]] && cp -a /etc/apt/sources.list "$tmpparts/sources.list.bak" || true
+  [[ -f /etc/apt/sources.list.d/docker.list ]] && cp -a /etc/apt/sources.list.d/docker.list "$tmpparts/" || true
+  [[ -f /etc/apt/sources.list.d/cloudflare-client.list ]] && cp -a /etc/apt/sources.list.d/cloudflare-client.list "$tmpparts/" || true
+
+  if compgen -G "$tmpparts/*" >/dev/null 2>&1; then
+    warn "apt: быстрый update только системных репозиториев…"
+    apt_wait_locks 45 || true
+    local src_list="/dev/null"
+    [[ -f "$tmpparts/sources.list.bak" ]] && src_list="$tmpparts/sources.list.bak"
+    if _apt_get_update "$errfile" \
+        -o Dir::Etc::sourcelist="$src_list" \
+        -o Dir::Etc::sourceparts="$tmpparts" \
+        -o APT::Get::List-Cleanup=0; then
+      rm -rf "$tmpparts"
+      ok "apt update (системные репо)"
       _apt_mark_updated
       return 0
     fi
     cat "$errfile" >&3 2>/dev/null || true
-    if _apt_err_is_lock "$errfile"; then
-      warn "apt занят — жду…"
-      apt_wait_locks 120 || sleep 5
-      continue
-    fi
-    apt_disable_from_errors "$errfile"
-    sanitize_apt_repos
-    attempt=$((attempt + 1))
-    sleep 1
-  done
-
-  # Последний резерв: только основной sources.list (без sources.list.d)
-  warn "apt: обновляю только основной sources.list (без сторонних)"
-  apt_wait_locks 120 || true
-  if apt-get update \
-      -o Dir::Etc::sourcelist=/etc/apt/sources.list \
-      -o Dir::Etc::sourceparts=/dev/null \
-      -o APT::Get::List-Cleanup=0 \
-      -o Acquire::Retries=3 >"$errfile" 2>&1; then
-    ok "apt update (основные репозитории)"
-    _apt_mark_updated
-    return 0
   fi
-  cat "$errfile" >&3 2>/dev/null || true
+  rm -rf "$tmpparts"
 
-  # Ubuntu 24.04+ часто держит источники в /etc/apt/sources.list.d/ubuntu.sources
-  if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] || [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
-    local tmpparts
-    tmpparts=$(mktemp -d /tmp/rn-apt-parts.XXXXXX)
-    [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] && cp -a /etc/apt/sources.list.d/ubuntu.sources "$tmpparts/" || true
-    [[ -f /etc/apt/sources.list.d/debian.sources ]] && cp -a /etc/apt/sources.list.d/debian.sources "$tmpparts/" || true
-    # плюс docker/cloudflare если уже добавлены нами — чтобы install не сломался
-    [[ -f /etc/apt/sources.list.d/docker.list ]] && cp -a /etc/apt/sources.list.d/docker.list "$tmpparts/" || true
-    [[ -f /etc/apt/sources.list.d/cloudflare-client.list ]] && cp -a /etc/apt/sources.list.d/cloudflare-client.list "$tmpparts/" || true
-    apt_wait_locks 120 || true
-    if apt-get update \
-        -o Dir::Etc::sourcelist=/dev/null \
-        -o Dir::Etc::sourceparts="$tmpparts" \
-        -o APT::Get::List-Cleanup=0 \
-        -o Acquire::Retries=3 >"$errfile" 2>&1; then
-      rm -rf "$tmpparts"
-      ok "apt update (системные .sources)"
-      _apt_mark_updated
-      return 0
-    fi
-      cat "$errfile" >&3 2>/dev/null || true
-      rm -rf "$tmpparts"
-  fi
-
-  warn "apt update с ошибками — см. ${errfile} и ${LOG}"
+  warn "apt update не идеален — продолжаю с текущим кэшем пакетов"
   return 1
 }
 
-# Быстрый update ТОЛЬКО одного нового репозитория (docker/warp):
-# не перечитывает все зеркала (экономит 1–3 минуты на медленных VPS).
+# Быстрый update ТОЛЬКО одного нового репозитория (docker/warp)
 apt_update_one_repo() {
   local listfile="$1"
   [[ -f "$listfile" ]] || return 1
   local errfile="/tmp/rn-apt-one.err"
-  apt_wait_locks 120 || true
-  if apt-get update \
+  apt_wait_locks 45 || true
+  if _apt_get_update "$errfile" \
       -o Dir::Etc::sourcelist="$listfile" \
       -o Dir::Etc::sourceparts=/dev/null \
-      -o APT::Get::List-Cleanup=0 \
-      -o Acquire::Retries=3 \
-      -o Acquire::Languages=none >"$errfile" 2>&1; then
+      -o APT::Get::List-Cleanup=0; then
     return 0
   fi
   cat "$errfile" >&3 2>/dev/null || true
@@ -1304,49 +1304,46 @@ _pkgs_missing() {
   printf '%s' "${out% }"
 }
 
+# Минимальный набор для Docker / Remnanode / лаунчера.
+# Тяжёлые утилиты (htop, fail2ban, ufw…) — не блокируют установку ноды.
 ensure_packages() {
   sanitize_apt_repos
   apt_pause_background
 
-  local want_essential="curl wget ca-certificates gnupg lsb-release jq unzip"
-  local want_extra="python3 htop iftop ethtool irqbalance dnsutils ufw fail2ban"
-  local missing_essential missing_extra missing
+  local want="curl ca-certificates gnupg jq"
+  local missing
   # shellcheck disable=SC2086
-  missing_essential=$(_pkgs_missing $want_essential)
-  # shellcheck disable=SC2086
-  missing_extra=$(_pkgs_missing $want_extra)
-  missing="${missing_essential}${missing_essential:+ }${missing_extra}"
+  missing=$(_pkgs_missing $want)
 
   if [[ -z "$missing" ]]; then
     ok "Базовые пакеты уже установлены — пропускаю apt"
     return 0
   fi
 
-  if _apt_lists_fresh; then
-    info "Списки apt свежие — update не нужен"
-  else
-    info "Обновление списков пакетов (может занять 1–2 мин)…"
-    if spin_fn "обновление apt" apt_update_safe; then
-      :
-    else
-      warn "apt update не идеален — пробую установить пакеты из кэша/основных зеркал"
-    fi
+  apt_wait_locks 30 || true
+  info "Ставлю недостающее: ${missing}"
+  # Сначала без update — часто хватает текущего кэша (секунды вместо минут)
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      -o APT::Get::AllowUnauthenticated=false $missing >/tmp/rn-apt-inst.err 2>&1; then
+    ok "Базовые пакеты готовы (без apt update)"
+    return 0
   fi
-  apt_wait_locks 120 || true
-  info "Установка недостающих пакетов: ${missing}"
-  run_step_soft "базовые пакеты" \
-"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ${missing}"
-  if ! command -v curl >/dev/null 2>&1; then
-    warn "Повтор apt update + install…"
-    apt_wait_locks 180 || true
-    spin_fn "обновление apt (повтор)" apt_update_safe force || true
-    apt_wait_locks 120 || true
-    run_step "базовые пакеты (повтор)" \
-"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-  curl wget ca-certificates gnupg lsb-release jq unzip"
+  cat /tmp/rn-apt-inst.err >&3 2>/dev/null || true
+
+  info "Нужен apt update (лимит ~${_APT_UPDATE_TIMEOUT}с на попытку)…"
+  spin_fn "обновление apt" apt_update_safe || warn "update с ошибками — пробую install из кэша"
+  apt_wait_locks 45 || true
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $missing; then
+    ok "Базовые пакеты готовы"
+    return 0
   fi
-  command -v curl >/dev/null 2>&1 || err "Не удалось установить базовые пакеты (curl/ca-certificates)"
-  ok "Базовые пакеты готовы"
+
+  # Минимум для продолжения: curl + ca-certificates
+  warn "Полный набор не встал — ставлю минимум (curl/ca-certificates/gnupg)"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    curl ca-certificates gnupg || true
+  command -v curl >/dev/null 2>&1 || err "Не удалось установить curl — без него дальше нельзя"
+  ok "Минимальные пакеты готовы"
 }
 
 ###############################################################################
@@ -2200,12 +2197,12 @@ install_docker() {
     chmod a+r /etc/apt/keyrings/docker.gpg
     echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
-    apt_wait_locks 180 || true
+    apt_wait_locks 60 || true
     # новое репо: обновляем только docker.list (быстро), не все зеркала
     info "Обновление apt под Docker-репозиторий…"
     if ! spin_fn "apt (docker-репо)" apt_update_one_repo /etc/apt/sources.list.d/docker.list; then
       warn "Точечный update Docker-репо не удался — полный update…"
-      apt_wait_locks 180 || true
+      apt_wait_locks 60 || true
       if ! spin_fn "apt (docker-репо, полный)" apt_update_safe force; then
         err "apt update после добавления Docker-репозитория не удался"
       fi
@@ -2292,14 +2289,25 @@ install_self_cli() {
   src_dir=$(cd "$(dirname "$src")" 2>/dev/null && pwd || true)
   mkdir -p "$DIR"
 
-  # Всегда обновляем установленный лаунчер из текущего файла (или с GitHub)
+  # Всегда обновляем установленный лаунчер из текущего файла
   if [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]]; then
     cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
   fi
-  # Если в установленной копии нет версии — скачать свежий с GitHub
+  # Если копии нет / версия устарела — скачать свежий с GitHub
+  local inst_ver=""
+  if [[ -f "$LAUNCHER_PATH" ]]; then
+    inst_ver=$(grep -E '^_REMNANODE_VER=' "$LAUNCHER_PATH" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"' || true)
+  fi
   if [[ ! -f "$LAUNCHER_PATH" ]] \
-     || ! grep -qE '^_REMNANODE_VER="?[0-9]{4}\.' "$LAUNCHER_PATH" 2>/dev/null; then
-    gh_download "$LAUNCHER_RAW" "$LAUNCHER_PATH" 2>/dev/null || true
+     || [[ -z "$inst_ver" ]] \
+     || [[ "$inst_ver" != "$_REMNANODE_VER" ]]; then
+    # если текущий файл уже новой версии — копируем его; иначе GitHub
+    if [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]] \
+       && grep -qE "^_REMNANODE_VER=\"?${_REMNANODE_VER}\"?$" "$src" 2>/dev/null; then
+      cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
+    else
+      gh_download "$LAUNCHER_RAW" "$LAUNCHER_PATH" 2>/dev/null || true
+    fi
   fi
   chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
 
