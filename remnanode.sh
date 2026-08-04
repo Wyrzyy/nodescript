@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.4
+# Версия: 2026.8.5
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.4"
+_REMNANODE_VER="2026.8.5"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -383,7 +383,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.8.4}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.8.5}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -440,7 +440,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.8.4"
+  [[ -n "$v" ]] || v="2026.8.5"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -451,7 +451,7 @@ launcher_version() {
 show_header() {
   ui_clear
   # Жёстко фиксируем версию на каждом показе шапки (защита от пустого env)
-  _REMNANODE_VER="2026.8.4"
+  _REMNANODE_VER="2026.8.5"
   RN_VERSION="$_REMNANODE_VER"
   SCRIPT_VERSION="$_REMNANODE_VER"
   local ver="$_REMNANODE_VER"
@@ -651,6 +651,86 @@ section() {
 # Паттерны битых/ненужных сторонних репозиториев (ломают apt update на noble+)
 _APT_BAD_RE_='packagecloud\.io/ookla|ookla/speedtest|speedtest-cli|packagecloud\.io/.*/speedtest'
 
+# Занят ли apt/dpkg (лок или живой процесс)?
+_apt_is_busy() {
+  local l
+  for l in \
+    /var/lib/dpkg/lock-frontend \
+    /var/lib/dpkg/lock \
+    /var/lib/apt/lists/lock \
+    /var/cache/apt/archives/lock
+  do
+    [[ -e "$l" ]] || continue
+    if command -v fuser >/dev/null 2>&1; then
+      fuser "$l" >/dev/null 2>&1 && return 0
+    elif command -v lsof >/dev/null 2>&1; then
+      lsof "$l" >/dev/null 2>&1 && return 0
+    elif command -v flock >/dev/null 2>&1; then
+      # не смогли взять — значит занят
+      flock -n "$l" -c true 2>/dev/null || return 0
+    fi
+  done
+  # процессы (исключаем себя и детей текущего шелла ненадёжно — смотрим по имени)
+  if pgrep -x apt-get >/dev/null 2>&1 \
+    || pgrep -x apt >/dev/null 2>&1 \
+    || pgrep -x dpkg >/dev/null 2>&1 \
+    || pgrep -x unattended-upgr >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# Приглушить фоновые авто-обновления на время нашей установки
+apt_pause_background() {
+  systemctl stop unattended-upgrades.service 2>/dev/null || true
+  systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+  systemctl kill --kill-who=all apt-daily.service 2>/dev/null || true
+  systemctl kill --kill-who=all apt-daily-upgrade.service 2>/dev/null || true
+  # не возвращаем ошибку
+  return 0
+}
+
+# Ждать освобождения apt-lock (иначе ретраи сгорают за 1–2 сек)
+# usage: apt_wait_locks [timeout_sec]
+apt_wait_locks() {
+  local timeout="${1:-180}"
+  local waited=0 shown=0
+  local pidinfo=""
+
+  apt_pause_background
+
+  while _apt_is_busy; do
+    if (( waited >= timeout )); then
+      warn "apt-блокировка не снялась за ${timeout}с"
+      # кто держит
+      if command -v fuser >/dev/null 2>&1; then
+        fuser -v /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend 2>&1 | sed 's/^/    /' >&3 || true
+      fi
+      return 1
+    fi
+    if (( shown == 0 )); then
+      pidinfo=$(pgrep -a -x apt-get 2>/dev/null | head -3 || true)
+      [[ -z "$pidinfo" ]] && pidinfo=$(pgrep -a -x apt 2>/dev/null | head -3 || true)
+      if [[ -n "$pidinfo" ]]; then
+        info "⏳ Жду освобождения apt (занято: ${pidinfo})…"
+      else
+        info "⏳ Жду освобождения apt-блокировки…"
+      fi
+      shown=1
+    fi
+    sleep 3
+    waited=$((waited + 3))
+    # периодически снова гасим daily-сервисы — они могут перезапуститься
+    (( waited % 30 == 0 )) && apt_pause_background
+  done
+  return 0
+}
+
+_apt_err_is_lock() {
+  local f="$1"
+  grep -qiE 'Could not get lock|Unable to lock directory|Unable to acquire the dpkg frontend lock|is another process using it' "$f" 2>/dev/null
+}
+
 # Отключить файл источника apt (не удаляем навсегда — .disabled-by-remnanode)
 _apt_disable_file() {
   local f="$1"
@@ -781,16 +861,19 @@ apt_disable_from_errors() {
   return 0
 }
 
-# Надёжный apt-get update: чистит битые third-party репо и повторяет.
+# Надёжный apt-get update: ждёт lock, чистит битые third-party репо и повторяет.
 # Возвращает 0 если индекс обновлён (хотя бы основными зеркалами).
 apt_update_safe() {
   local errfile="/tmp/rn-apt-update.err"
   local attempt=1
-  local max=6
+  local max=8
+  local lock_rounds=0
 
   sanitize_apt_repos
+  apt_wait_locks 180 || true
 
   while (( attempt <= max )); do
+    apt_wait_locks 90 || true
     echo "=== $(date '+%F %T') | apt-get update (попытка ${attempt}/${max}) ===" >&3
     # Не используем -qq на ошибках: нужен полный текст для парсинга URL
     if apt-get update -o Acquire::Retries=3 >"$errfile" 2>&1; then
@@ -798,27 +881,48 @@ apt_update_safe() {
     fi
     cat "$errfile" >&3 2>/dev/null || true
 
+    # Lock: не сжигать попытки — ждать и повторять
+    if _apt_err_is_lock "$errfile"; then
+      lock_rounds=$((lock_rounds + 1))
+      if (( lock_rounds > 12 )); then
+        warn "apt-блокировка не отпускает после ${lock_rounds} ожиданий"
+        break
+      fi
+      warn "apt занят другим процессом — жду (${lock_rounds}/12)…"
+      apt_wait_locks 120 || sleep 5
+      continue
+    fi
+
     # Битый third-party / Release / ключ — отключаем и пробуем снова
     if grep -qiE 'does not have a Release file|NO_PUBKEY|not signed|Release file|404[[:space:]]+Not Found|packagecloud|ookla|speedtest' "$errfile" 2>/dev/null; then
       warn "apt: битый репозиторий — отключаю и повторяю (${attempt}/${max})…"
       apt_disable_from_errors "$errfile"
       sanitize_apt_repos
       attempt=$((attempt + 1))
+      sleep 1
       continue
     fi
 
     # Иное: пробуем allow-releaseinfo-change
+    apt_wait_locks 60 || true
     if apt-get update --allow-releaseinfo-change -o Acquire::Retries=3 >"$errfile" 2>&1; then
       return 0
     fi
     cat "$errfile" >&3 2>/dev/null || true
+    if _apt_err_is_lock "$errfile"; then
+      warn "apt занят — жду…"
+      apt_wait_locks 120 || sleep 5
+      continue
+    fi
     apt_disable_from_errors "$errfile"
     sanitize_apt_repos
     attempt=$((attempt + 1))
+    sleep 1
   done
 
   # Последний резерв: только основной sources.list (без sources.list.d)
   warn "apt: обновляю только основной sources.list (без сторонних)"
+  apt_wait_locks 120 || true
   if apt-get update \
       -o Dir::Etc::sourcelist=/etc/apt/sources.list \
       -o Dir::Etc::sourceparts=/dev/null \
@@ -827,6 +931,7 @@ apt_update_safe() {
     ok "apt update (основные репозитории)"
     return 0
   fi
+  cat "$errfile" >&3 2>/dev/null || true
 
   # Ubuntu 24.04+ часто держит источники в /etc/apt/sources.list.d/ubuntu.sources
   if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] || [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
@@ -837,6 +942,7 @@ apt_update_safe() {
     # плюс docker/cloudflare если уже добавлены нами — чтобы install не сломался
     [[ -f /etc/apt/sources.list.d/docker.list ]] && cp -a /etc/apt/sources.list.d/docker.list "$tmpparts/" || true
     [[ -f /etc/apt/sources.list.d/cloudflare-client.list ]] && cp -a /etc/apt/sources.list.d/cloudflare-client.list "$tmpparts/" || true
+    apt_wait_locks 120 || true
     if apt-get update \
         -o Dir::Etc::sourcelist=/dev/null \
         -o Dir::Etc::sourceparts="$tmpparts" \
@@ -846,6 +952,7 @@ apt_update_safe() {
       ok "apt update (системные .sources)"
       return 0
     fi
+    cat "$errfile" >&3 2>/dev/null || true
     rm -rf "$tmpparts"
   fi
 
@@ -855,20 +962,24 @@ apt_update_safe() {
 
 ensure_packages() {
   sanitize_apt_repos
+  apt_pause_background
   info "Обновление apt…"
   if apt_update_safe; then
     ok "Обновление apt"
   else
     warn "apt update не идеален — пробую установить пакеты из кэша/основных зеркал"
   fi
+  apt_wait_locks 120 || true
   # Установка не должна валить весь сценарий из‑за одного optional пакета
-  if ! apt-get install -y -qq \
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
       curl wget ca-certificates gnupg lsb-release \
       jq htop iftop ethtool irqbalance dnsutils unzip \
       ufw fail2ban; then
     warn "Повтор apt update + install…"
+    apt_wait_locks 180 || true
     apt_update_safe || true
-    apt-get install -y -qq \
+    apt_wait_locks 120 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
       curl wget ca-certificates gnupg lsb-release \
       jq unzip ca-certificates || \
       err "Не удалось установить базовые пакеты (curl/ca-certificates)"
@@ -1060,11 +1171,17 @@ install_docker() {
     chmod a+r /etc/apt/keyrings/docker.gpg
     echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
+    apt_wait_locks 180 || true
     if ! apt_update_safe; then
-      err "apt update после добавления Docker-репозитория не удался"
+      warn "apt update после Docker-репо не удался — повтор после ожидания lock…"
+      apt_wait_locks 180 || true
+      if ! apt_update_safe; then
+        err "apt update после добавления Docker-репозитория не удался"
+      fi
     fi
     ok "Репозиторий Docker"
 
+    apt_wait_locks 120 || true
     run_step "Установка Docker" \
 "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
  systemctl enable docker && systemctl start docker"
@@ -1220,6 +1337,7 @@ install_remnanode() {
   echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги видны ниже)${NC}"
   hline 40
   info "0️⃣  Проверка apt-репозиториев"
+  apt_pause_background
   sanitize_apt_repos
   info "1️⃣  Базовые пакеты"
   ensure_packages
