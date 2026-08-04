@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.12
+# Версия: 2026.8.13
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.12"
+_REMNANODE_VER="2026.8.13"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -766,6 +766,24 @@ service_status_text() {
         echo "не активен"
       fi
       ;;
+    ports)
+      local n_open=0 n_block=0
+      if [[ -f "$PORTS_CONF" ]]; then
+        n_open=$(grep -cE '^OPEN[[:space:]]' "$PORTS_CONF" 2>/dev/null || true)
+        n_block=$(grep -cE '^BLOCK[[:space:]]' "$PORTS_CONF" 2>/dev/null || true)
+        n_open=${n_open:-0}
+        n_block=${n_block:-0}
+      fi
+      if (( n_open + n_block > 0 )); then
+        if ports_active 2>/dev/null; then
+          echo "OPEN ${n_open}/BLOCK ${n_block}"
+        else
+          echo "сохранены"
+        fi
+      else
+        echo "не настроен"
+      fi
+      ;;
     node_cli)
       local np
       np=$(get_node_port 2>/dev/null || true)
@@ -800,13 +818,13 @@ service_badge_color() {
     "работает"|"подключён"|"настроено"|"патч активен"|"BBR включён"|"нода online"|"SYNPROXY")
       _badge "$GREEN" "$text"
       ;;
-    работает\ :*|online\ :*)
+    работает\ :*|online\ :*|OPEN\ *)
       _badge "$GREEN" "$text"
       ;;
     активен*)
       _badge "$GREEN" "$text"
       ;;
-    "установлен"|"ядро скачано"|"частично"|"выключен"|"только CLI"|"нода offline")
+    "установлен"|"ядро скачано"|"частично"|"выключен"|"только CLI"|"нода offline"|"сохранены")
       _badge "$YELLOW" "$text"
       ;;
     офлайн\ :*|offline\ :*)
@@ -1737,6 +1755,285 @@ setup_antiddos() {
       fi
       ;;
     6) disable_antiddos ;;
+    0) return 0 ;;
+    *) ;;
+  esac
+}
+
+###############################################################################
+# Порты — открыть/закрыть отдельно от UFW (своя таблица nftables)
+###############################################################################
+PORTS_DIR="/etc/remnanode"
+PORTS_CONF="$PORTS_DIR/ports.conf"
+PORTS_RULES="$PORTS_DIR/ports.nft"
+PORTS_UNIT="/etc/systemd/system/remna-ports.service"
+PORTS_TABLE="remna_ports"
+
+_ports_ensure_nft() {
+  if ! command -v nft >/dev/null 2>&1; then
+    info "Устанавливаю nftables…"
+    apt_wait_locks 120 || true
+    if _apt_lists_fresh 2>/dev/null; then
+      :
+    else
+      apt_update_safe || true
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables || {
+      err "Не удалось установить nftables"
+    }
+  fi
+}
+
+_ports_conf_init() {
+  mkdir -p "$PORTS_DIR"
+  [[ -f "$PORTS_CONF" ]] || printf '# remnanode ports (OPEN|BLOCK proto port)\n' >"$PORTS_CONF"
+}
+
+# Список: "OPEN tcp 443" / "BLOCK udp 53"
+_ports_list() {
+  _ports_conf_init
+  grep -E '^(OPEN|BLOCK)[[:space:]]+(tcp|udp)[[:space:]]+[0-9]+' "$PORTS_CONF" 2>/dev/null || true
+}
+
+_ports_has() {
+  local kind="$1" proto="$2" port="$3"
+  grep -qE "^${kind}[[:space:]]+${proto}[[:space:]]+${port}\$" "$PORTS_CONF" 2>/dev/null
+}
+
+_ports_add_line() {
+  local kind="$1" proto="$2" port="$3"
+  _ports_conf_init
+  # убрать противоположное/дубликаты для того же proto+port
+  sed -i -E "/^(OPEN|BLOCK)[[:space:]]+${proto}[[:space:]]+${port}\$/d" "$PORTS_CONF" 2>/dev/null || true
+  printf '%s %s %s\n' "$kind" "$proto" "$port" >>"$PORTS_CONF"
+}
+
+_ports_del_line() {
+  local proto="$1" port="$2"
+  _ports_conf_init
+  sed -i -E "/^(OPEN|BLOCK)[[:space:]]+${proto}[[:space:]]+${port}\$/d" "$PORTS_CONF" 2>/dev/null || true
+}
+
+_ports_rebuild_nft() {
+  _ports_ensure_nft
+  _ports_conf_init
+  local opens blocks line kind proto port
+  opens=""
+  blocks=""
+  while read -r kind proto port; do
+    [[ -z "$kind" ]] && continue
+    case "$kind" in
+      OPEN)
+        if [[ "$proto" == "tcp" ]]; then
+          opens="${opens}        tcp dport ${port} accept comment \"remna-open-tcp-${port}\"
+"
+        else
+          opens="${opens}        udp dport ${port} accept comment \"remna-open-udp-${port}\"
+"
+        fi
+        ;;
+      BLOCK)
+        if [[ "$proto" == "tcp" ]]; then
+          blocks="${blocks}        tcp dport ${port} drop comment \"remna-block-tcp-${port}\"
+"
+        else
+          blocks="${blocks}        udp dport ${port} drop comment \"remna-block-udp-${port}\"
+"
+        fi
+        ;;
+    esac
+  done < <(_ports_list | awk '{print $1,$2,$3}')
+
+  # priority -15: раньше UFW/filter, чтобы «открыть» работало даже при UFW deny
+  # (закрытие DROP тоже сработает до UFW allow)
+  cat > "$PORTS_RULES" <<NFT
+#!/usr/sbin/nft -f
+# remnanode port manager — отдельно от UFW
+table inet ${PORTS_TABLE}
+delete table inet ${PORTS_TABLE}
+table inet ${PORTS_TABLE} {
+    chain input {
+        type filter hook input priority -15; policy accept;
+        iif "lo" accept
+        ct state established,related accept
+${blocks}${opens}    }
+}
+NFT
+  chmod 0644 "$PORTS_RULES"
+
+  if ! nft -f "$PORTS_RULES" 2>/tmp/rn-ports.err; then
+    warn "nft отклонил правила портов:"
+    sed 's/^/    /' /tmp/rn-ports.err >"$_TTY" 2>/dev/null || cat /tmp/rn-ports.err || true
+    return 1
+  fi
+
+  cat > "$PORTS_UNIT" <<UNIT
+[Unit]
+Description=Remnanode port manager (nftables, separate from UFW)
+After=network-online.target nftables.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f ${PORTS_RULES}
+ExecStop=/usr/sbin/nft delete table inet ${PORTS_TABLE}
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable remna-ports.service >/dev/null 2>&1 || true
+  # отметим oneshot как active (правила уже загружены через nft -f)
+  systemctl start remna-ports.service >/dev/null 2>&1 || true
+  return 0
+}
+
+ports_active() {
+  command -v nft >/dev/null 2>&1 || return 1
+  nft list table inet "$PORTS_TABLE" >/dev/null 2>&1
+}
+
+ports_count_open() {
+  local n
+  n=$(_ports_list | grep -c '^OPEN ' 2>/dev/null || true)
+  echo "${n:-0}"
+}
+
+show_ports_status() {
+  echo -e "  ${WHITE}Управляемые порты (не UFW):${NC}"
+  local lines n_open=0 n_block=0
+  lines=$(_ports_list)
+  if [[ -z "$lines" ]]; then
+    echo -e "    ${GRAY}(пусто — ничего не открыто/не заблокировано)${NC}"
+  else
+    while read -r kind proto port; do
+      [[ -z "$kind" ]] && continue
+      local listen=""
+      if [[ "$proto" == "tcp" ]] && is_node_port_listening "$port" 2>/dev/null; then
+        listen=" ${GREEN}· слушает${NC}"
+      fi
+      if [[ "$kind" == "OPEN" ]]; then
+        n_open=$((n_open + 1))
+        echo -e "    ${GREEN}▲ OPEN${NC}  ${proto^^}/${port}${listen}"
+      else
+        n_block=$((n_block + 1))
+        echo -e "    ${RED}▼ BLOCK${NC} ${proto^^}/${port}"
+      fi
+    done <<< "$lines"
+  fi
+  echo
+  if ports_active; then
+    echo -e "    nftables ${GREEN}● применено${NC}  (таблица ${PORTS_TABLE})"
+  else
+    echo -e "    nftables ${GRAY}○ не загружено${NC}"
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    echo -e "    ${YELLOW}⚠ UFW активен${NC} — наши OPEN идут раньше UFW (priority -15)."
+    echo -e "    ${GRAY}  BLOCK тоже сработает до правил UFW.${NC}"
+  fi
+}
+
+ports_open() {
+  local port="$1" proto_choice="$2"
+  local protos=()
+  case "$proto_choice" in
+    1|tcp|TCP) protos=(tcp) ;;
+    2|udp|UDP) protos=(udp) ;;
+    3|both|BOTH|*) protos=(tcp udp) ;;
+  esac
+  local p
+  for p in "${protos[@]}"; do
+    _ports_add_line OPEN "$p" "$port"
+    ok "Открыт ${p^^}/${port}"
+  done
+  _ports_rebuild_nft || warn "Правила сохранены, но nft не применил — см. лог"
+}
+
+ports_close() {
+  local port="$1" proto_choice="$2" do_block="$3"
+  local protos=()
+  case "$proto_choice" in
+    1|tcp|TCP) protos=(tcp) ;;
+    2|udp|UDP) protos=(udp) ;;
+    3|both|BOTH|*) protos=(tcp udp) ;;
+  esac
+  local p
+  for p in "${protos[@]}"; do
+    _ports_del_line "$p" "$port"
+    if [[ "$do_block" =~ ^[Yy]$ ]]; then
+      _ports_add_line BLOCK "$p" "$port"
+      ok "Закрыт и заблокирован (DROP) ${p^^}/${port}"
+    else
+      ok "Убрано открытие ${p^^}/${port}"
+    fi
+  done
+  _ports_rebuild_nft || warn "Правила сохранены, но nft не применил — см. лог"
+}
+
+ports_clear_all() {
+  _ports_conf_init
+  printf '# remnanode ports (OPEN|BLOCK proto port)\n' >"$PORTS_CONF"
+  nft delete table inet "$PORTS_TABLE" 2>/dev/null || true
+  systemctl disable remna-ports.service >/dev/null 2>&1 || true
+  rm -f "$PORTS_RULES" "$PORTS_UNIT" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  ok "Все правила портов сброшены"
+}
+
+setup_ports() {
+  show_header
+  echo -e "${WHITE}${BOLD}  🔓 Порты — открыть / закрыть${NC}"
+  hline 56
+  echo
+  info "Отдельно от UFW: своя таблица nftables (remna_ports)."
+  info "Открыть = ACCEPT · Закрыть = убрать OPEN, опционально DROP."
+  echo
+  show_ports_status
+  echo
+  echo -e "  ${WHITE}1)${NC} 🔓 Открыть порт"
+  echo -e "  ${WHITE}2)${NC} 🔒 Закрыть порт"
+  echo -e "  ${WHITE}3)${NC} 📋 Список / статус"
+  echo -e "  ${WHITE}4)${NC} ♻️  Применить правила заново"
+  echo -e "  ${WHITE}5)${NC} 🗑️  Сбросить все правила портов"
+  echo -e "  ${GRAY}0)${NC} 🔙 Назад"
+  echo
+  ask_choice ch
+
+  local port proto block
+  case "$ch" in
+    1)
+      ask "Номер порта" port
+      [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
+        warn "Нужен порт 1–65535"; return 0
+      }
+      echo -e "  ${WHITE}Протокол:${NC}  1) TCP  2) UDP  3) TCP+UDP"
+      ask "Выбор" proto "3"
+      ports_open "$port" "$proto"
+      echo
+      show_ports_status
+      ;;
+    2)
+      ask "Номер порта" port
+      [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
+        warn "Нужен порт 1–65535"; return 0
+      }
+      echo -e "  ${WHITE}Протокол:${NC}  1) TCP  2) UDP  3) TCP+UDP"
+      ask "Выбор" proto "3"
+      ask_yes_no "Заблокировать вход (DROP), а не только убрать OPEN?" block N
+      ports_close "$port" "$proto" "$block"
+      echo
+      show_ports_status
+      ;;
+    3) show_ports_status ;;
+    4)
+      if _ports_rebuild_nft; then
+        ok "Правила переприменены"
+      fi
+      show_ports_status
+      ;;
+    5)
+      ask_yes_no "Точно сбросить все OPEN/BLOCK?" ans N
+      [[ "$ans" =~ ^[Yy]$ ]] && ports_clear_all
+      ;;
     0) return 0 ;;
     *) ;;
   esac
@@ -3504,7 +3801,8 @@ main_menu() {
 
     section "🛠️  Система"
     menu_item "💾" "7"  "SWAP"       "файл подкачки"      swap
-    menu_item "🛡️" "8"  "UFW"        "порты и защита"     ufw
+    menu_item "🛡️" "8"  "UFW"        "firewall (UFW)"     ufw
+    menu_item "🔓" "13" "Порты"      "открыть / закрыть"  ports
     menu_item "⚙️" "9"  "Тюнинг"     "BBR / буферы / RPS" tune
     menu_item "🧱" "12" "Анти-DDoS"  "SYN-флуд / L4"      antiddos
 
@@ -3529,6 +3827,7 @@ main_menu() {
       10) remnanode_menu ;;
       11) tests_menu ;;
       12) setup_antiddos; pause ;;
+      13) setup_ports; pause ;;
       0)  exit 0 ;;
       *)  ;;
     esac
@@ -3566,6 +3865,7 @@ case "${1:-}" in
   install-mtproto|mtproto)     install_mtproto ;;
   swap)                        _menu_soft_mode; setup_swap ;;
   ufw|firewall)                _menu_soft_mode; setup_ufw ;;
+  ports|port|open-port)        _menu_soft_mode; setup_ports ;;
   tune|performance)            apply_performance_tuning ;;
   antiddos|ddos)               _menu_soft_mode; setup_antiddos ;;
   antiddos-on|ddos-on)         apply_antiddos 0 ;;
