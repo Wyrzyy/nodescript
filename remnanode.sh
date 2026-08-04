@@ -1091,9 +1091,13 @@ apt_update_safe() {
   esac
 
   if [[ "$force" != "1" ]] && _apt_lists_fresh; then
+    local now age=0
+    now=$(date +%s)
+    if (( _APT_UPDATED_AT > 0 )); then
+      age=$(( now - _APT_UPDATED_AT ))
+    fi
     # зафиксируем для этой сессии, чтобы не дергать find повторно
-    (( _APT_UPDATED_AT == 0 )) && _APT_UPDATED_AT=$(date +%s)
-    local age=$(( $(date +%s) - _APT_UPDATED_AT ))
+    (( _APT_UPDATED_AT == 0 )) && _APT_UPDATED_AT=$now
     if (( age >= 60 )); then
       info "apt уже актуален (~$((age / 60)) мин) — пропускаю update"
     else
