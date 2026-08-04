@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.10
+# Версия: 2026.8.11
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.10"
+_REMNANODE_VER="2026.8.11"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -513,7 +513,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.8.10}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.8.11}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -584,7 +584,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.8.10"
+  [[ -n "$v" ]] || v="2026.8.11"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -1032,8 +1032,77 @@ apt_disable_from_errors() {
 }
 
 # Надёжный apt-get update: ждёт lock, чистит битые third-party репо и повторяет.
-# Возвращает 0 если индекс обновлён (хотя бы основными зеркалами).
+# Кэш: в одной сессии и если списки свежие (< TTL) — не гоняем update повторно.
+# Принудительно: apt_update_safe force  (после добавления docker/cloudflare репо).
+_APT_UPDATE_TTL="${_APT_UPDATE_TTL:-1800}"   # 30 минут
+_APT_UPDATED_AT=0
+_APT_STAMP_FILE="/var/cache/remnanode/apt-updated.stamp"
+
+_apt_lists_fresh() {
+  local now stamp age newest
+  now=$(date +%s)
+
+  # 1) уже обновляли в этой сессии лаунчера
+  if (( _APT_UPDATED_AT > 0 )); then
+    age=$((now - _APT_UPDATED_AT))
+    if (( age >= 0 && age < _APT_UPDATE_TTL )); then
+      return 0
+    fi
+  fi
+
+  # 2) stamp от прошлого успешного update нашего скрипта
+  if [[ -f "$_APT_STAMP_FILE" ]]; then
+    stamp=$(tr -dc '0-9' <"$_APT_STAMP_FILE" 2>/dev/null | head -c 12 || true)
+    stamp=${stamp:-0}
+    if [[ "$stamp" =~ ^[0-9]+$ ]] && (( stamp > 0 )); then
+      age=$((now - stamp))
+      if (( age >= 0 && age < _APT_UPDATE_TTL )); then
+        _APT_UPDATED_AT=$stamp
+        return 0
+      fi
+    fi
+  fi
+
+  # 3) mtime файлов /var/lib/apt/lists (система недавно обновляла сама)
+  newest=$(find /var/lib/apt/lists -maxdepth 1 -type f \
+    ! -name 'lock' ! -name '*partial*' ! -name 'auxfiles' \
+    -printf '%T@\n' 2>/dev/null | sort -nr | head -1 | cut -d. -f1 || true)
+  if [[ -n "$newest" && "$newest" =~ ^[0-9]+$ ]]; then
+    age=$((now - newest))
+    if (( age >= 0 && age < _APT_UPDATE_TTL )); then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_apt_mark_updated() {
+  _APT_UPDATED_AT=$(date +%s)
+  mkdir -p "$(dirname "$_APT_STAMP_FILE")" 2>/dev/null || true
+  printf '%s\n' "$_APT_UPDATED_AT" >"$_APT_STAMP_FILE" 2>/dev/null || true
+}
+
+# usage: apt_update_safe [force]
 apt_update_safe() {
+  local force="${1:-0}"
+  case "$force" in
+    force|--force|1|yes|Y|y) force=1 ;;
+    *) force=0 ;;
+  esac
+
+  if [[ "$force" != "1" ]] && _apt_lists_fresh; then
+    # зафиксируем для этой сессии, чтобы не дергать find повторно
+    (( _APT_UPDATED_AT == 0 )) && _APT_UPDATED_AT=$(date +%s)
+    local age=$(( $(date +%s) - _APT_UPDATED_AT ))
+    if (( age >= 60 )); then
+      info "apt уже актуален (~$((age / 60)) мин) — пропускаю update"
+    else
+      info "apt уже актуален — пропускаю update"
+    fi
+    echo "=== $(date '+%F %T') | apt-get update SKIPPED (fresh, ttl=${_APT_UPDATE_TTL}s) ===" >&3
+    return 0
+  fi
+
   local errfile="/tmp/rn-apt-update.err"
   local attempt=1
   local max=8
@@ -1047,6 +1116,7 @@ apt_update_safe() {
     echo "=== $(date '+%F %T') | apt-get update (попытка ${attempt}/${max}) ===" >&3
     # Не используем -qq на ошибках: нужен полный текст для парсинга URL
     if apt-get update -o Acquire::Retries=3 >"$errfile" 2>&1; then
+      _apt_mark_updated
       return 0
     fi
     cat "$errfile" >&3 2>/dev/null || true
@@ -1076,6 +1146,7 @@ apt_update_safe() {
     # Иное: пробуем allow-releaseinfo-change
     apt_wait_locks 60 || true
     if apt-get update --allow-releaseinfo-change -o Acquire::Retries=3 >"$errfile" 2>&1; then
+      _apt_mark_updated
       return 0
     fi
     cat "$errfile" >&3 2>/dev/null || true
@@ -1099,6 +1170,7 @@ apt_update_safe() {
       -o APT::Get::List-Cleanup=0 \
       -o Acquire::Retries=3 >"$errfile" 2>&1; then
     ok "apt update (основные репозитории)"
+    _apt_mark_updated
     return 0
   fi
   cat "$errfile" >&3 2>/dev/null || true
@@ -1120,10 +1192,11 @@ apt_update_safe() {
         -o Acquire::Retries=3 >"$errfile" 2>&1; then
       rm -rf "$tmpparts"
       ok "apt update (системные .sources)"
+      _apt_mark_updated
       return 0
     fi
-    cat "$errfile" >&3 2>/dev/null || true
-    rm -rf "$tmpparts"
+      cat "$errfile" >&3 2>/dev/null || true
+      rm -rf "$tmpparts"
   fi
 
   warn "apt update с ошибками — см. ${errfile} и ${LOG}"
@@ -1133,11 +1206,15 @@ apt_update_safe() {
 ensure_packages() {
   sanitize_apt_repos
   apt_pause_background
-  info "Обновление списков пакетов (1–2 мин)…"
-  if spin_fn "обновление apt" apt_update_safe; then
-    :
+  if _apt_lists_fresh; then
+    info "Списки apt свежие — update не нужен"
   else
-    warn "apt update не идеален — пробую установить пакеты из кэша/основных зеркал"
+    info "Обновление списков пакетов (1–2 мин)…"
+    if spin_fn "обновление apt" apt_update_safe; then
+      :
+    else
+      warn "apt update не идеален — пробую установить пакеты из кэша/основных зеркал"
+    fi
   fi
   apt_wait_locks 120 || true
   info "Установка базовых пакетов…"
@@ -1149,7 +1226,7 @@ ensure_packages() {
   if ! command -v curl >/dev/null 2>&1; then
     warn "Повтор apt update + install…"
     apt_wait_locks 180 || true
-    spin_fn "обновление apt (повтор)" apt_update_safe || true
+    spin_fn "обновление apt (повтор)" apt_update_safe force || true
     apt_wait_locks 120 || true
     run_step "базовые пакеты (повтор)" \
 "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
@@ -1640,11 +1717,12 @@ install_docker() {
     echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
     apt_wait_locks 180 || true
-    info "Обновление apt после Docker-репо…"
-    if ! spin_fn "apt (docker-репо)" apt_update_safe; then
+    # новое репо → нужен принудительный update (иначе пакетов docker не видно)
+    info "Обновление apt под Docker-репозиторий…"
+    if ! spin_fn "apt (docker-репо)" apt_update_safe force; then
       warn "apt update после Docker-репо не удался — повтор после ожидания lock…"
       apt_wait_locks 180 || true
-      if ! spin_fn "apt (docker-репо, повтор)" apt_update_safe; then
+      if ! spin_fn "apt (docker-репо, повтор)" apt_update_safe force; then
         err "apt update после добавления Docker-репозитория не удался"
       fi
     fi
@@ -2256,10 +2334,11 @@ systemctl daemon-reload"
   echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${warp_codename} main" \
     > /etc/apt/sources.list.d/cloudflare-client.list
   apt_wait_locks 180 || true
-  if ! apt_update_safe; then
+  # новое репо Cloudflare → принудительный update
+  if ! spin_fn "apt (WARP-репо)" apt_update_safe force; then
     warn "apt update после Cloudflare-репо не удался — повтор…"
     apt_wait_locks 180 || true
-    if ! apt_update_safe; then
+    if ! spin_fn "apt (WARP-репо, повтор)" apt_update_safe force; then
       err "apt update после добавления Cloudflare-репозитория не удался"
     fi
   fi
