@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.9
+# Версия: 2026.8.10
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.9"
+_REMNANODE_VER="2026.8.10"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -241,27 +241,32 @@ ask_yes_no() {
   printf -v "$varname" '%s' "$_ans"
 }
 
-# Полоса загрузки (неопределённая) — без |/-\ , Termius-friendly
-# Рисует фиксированную ширину с пробелами справа, чтобы не копились символы
-# даже если \r в терминале ведёт себя странно.
-_PROGRESS_W=18
+# Полоса загрузки — ОДНА строка, ширина << терминала (иначе Termius
+# переносит строку и \r рисует «диагональный дождь» как на скрине).
+_PROGRESS_W=12
+_PROGRESS_COLS="${COLUMNS:-80}"
+# ширина tty (тихо; если нет — оставляем COLUMNS/80)
+if [[ -r /dev/tty ]]; then
+  _tc=$(stty size </dev/tty 2>/dev/null | awk '{print $2}' || true)
+  [[ -n "$_tc" && "$_tc" -gt 0 ]] && _PROGRESS_COLS="$_tc"
+fi
+[[ "$_PROGRESS_COLS" =~ ^[0-9]+$ ]] || _PROGRESS_COLS=80
+(( _PROGRESS_COLS < 40 )) && _PROGRESS_COLS=80
+# весь прогресс-текст держим ≤ 56 колонок (с запасом для узких Termius)
+_PROGRESS_MAX=56
+(( _PROGRESS_MAX > _PROGRESS_COLS - 2 )) && _PROGRESS_MAX=$((_PROGRESS_COLS - 2))
+(( _PROGRESS_MAX < 36 )) && _PROGRESS_MAX=36
+unset _tc
 
 _progress_bar_frame() {
-  # скользящий «бегунок» по пустой полосе: ░░▓▓▓▒░░░░…
-  local pos=$1
-  local w="${_PROGRESS_W}"
-  local i bar="" head=3
+  local pos=$1 w="${_PROGRESS_W}" i bar="" head=3
   local p=$((pos % (w + head)))
   for ((i = 0; i < w; i++)); do
     local d=$((i - p))
-    if (( d >= 0 && d < head )); then
-      case $d in
-        0) bar+="▓" ;;
-        1) bar+="█" ;;
-        2) bar+="▓" ;;
-      esac
-    else
-      bar+="░"
+    if (( d == 0 )); then bar+="▓"
+    elif (( d == 1 )); then bar+="█"
+    elif (( d == 2 )); then bar+="▓"
+    else bar+="░"
     fi
   done
   printf '%s' "$bar"
@@ -279,43 +284,54 @@ _progress_bar_fail() {
   printf '%s' "$bar"
 }
 
-# Печать строки прогресса. Добивка пробелами затирает хвост без \033[K (Termius).
+# Обрезать строку по видимым символам (без учёта ANSI)
+_progress_trunc() {
+  local s="$1" max="$2"
+  if (( ${#s} > max )); then
+    printf '%s' "${s:0:$((max - 1))}…"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# Одна короткая строка: очистка + \r (без гигантского pad → без wrap)
 _progress_draw() {
   local bar="$1" msg="$2" suffix="$3" color="${4:-$CYAN}"
-  local m="$msg"
-  (( ${#m} > 34 )) && m="${m:0:31}..."
-  _tty_printf '\r  %b%s%b  %-34s  %-12s                    ' \
-    "$color" "$bar" "$NC" "$m" "$suffix"
+  # бюджет: 2 + bar(12) + 1 + msg + 1 + suffix ≤ _PROGRESS_MAX
+  local budget=$((_PROGRESS_MAX - 2 - _PROGRESS_W - 1 - 1 - ${#suffix}))
+  (( budget < 8 )) && budget=8
+  local m
+  m=$(_progress_trunc "$msg" "$budget")
+  # \033[2K — стереть ВСЮ строку, затем \r в начало
+  _tty_printf '\033[2K\r  %b%s%b %s %b%s%b' \
+    "$color" "$bar" "$NC" "$m" "$GRAY" "$suffix" "$NC"
 }
 
 spin() {
   local pid=$1 msg=$2
   local i=0 start=$SECONDS el=0 bar
-  # восстановить курсор при прерывании
-  trap '_tty_printf "\033[?25h"' RETURN
+  trap '_tty_printf "\033[?25h\r\033[2K"' RETURN
   _tty_printf '\033[?25l'
   bar=$(_progress_bar_frame 0)
-  _progress_draw "$bar" "$msg" "0s" "$CYAN"
+  _progress_draw "$bar" "$msg" "0с" "$CYAN"
   while kill -0 "$pid" 2>/dev/null; do
     el=$((SECONDS - start))
     bar=$(_progress_bar_frame "$i")
-    _progress_draw "$bar" "$msg" "${el}s" "$CYAN"
+    _progress_draw "$bar" "$msg" "${el}с" "$CYAN"
     i=$((i + 1))
-    sleep 0.12
+    sleep 0.15
   done
   wait "$pid"
   local rc=$?
   el=$((SECONDS - start))
+  # финальная строка — тоже короткая и понятная
+  _tty_printf '\033[2K\r'
   if [[ $rc -eq 0 ]]; then
-    bar=$(_progress_bar_done)
-    _tty_printf '\r'
-    _tty_printf '  %b✅%b %b%s%b  %-34s  %b%ss%b                    \n' \
-      "$GREEN" "$NC" "$GREEN" "$bar" "$NC" "$msg" "$GRAY" "$el" "$NC"
+    _tty_printf '  %b✅%b %s %b— готово (%sс)%b\n' \
+      "$GREEN" "$NC" "$msg" "$GRAY" "$el" "$NC"
   else
-    bar=$(_progress_bar_fail)
-    _tty_printf '\r'
-    _tty_printf '  %b❌%b %b%s%b  %-34s  %b%ss%b                    \n' \
-      "$RED" "$NC" "$RED" "$bar" "$NC" "$msg" "$GRAY" "$el" "$NC"
+    _tty_printf '  %b❌%b %s %b— ошибка (%sс)%b\n' \
+      "$RED" "$NC" "$msg" "$GRAY" "$el" "$NC"
   fi
   _tty_printf '\033[?25h'
   trap - RETURN
@@ -497,7 +513,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.8.9}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.8.10}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -568,7 +584,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.8.9"
+  [[ -n "$v" ]] || v="2026.8.10"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -1117,15 +1133,15 @@ apt_update_safe() {
 ensure_packages() {
   sanitize_apt_repos
   apt_pause_background
-  info "Обновление apt (может занять 1–2 мин)…"
-  if spin_fn "apt-get update" apt_update_safe; then
+  info "Обновление списков пакетов (1–2 мин)…"
+  if spin_fn "обновление apt" apt_update_safe; then
     :
   else
     warn "apt update не идеален — пробую установить пакеты из кэша/основных зеркал"
   fi
   apt_wait_locks 120 || true
   info "Установка базовых пакетов…"
-  run_step_soft "apt-get install (curl jq ufw…)" \
+  run_step_soft "базовые пакеты" \
 "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   curl wget ca-certificates gnupg lsb-release python3 \
   jq htop iftop ethtool irqbalance dnsutils unzip \
@@ -1133,9 +1149,9 @@ ensure_packages() {
   if ! command -v curl >/dev/null 2>&1; then
     warn "Повтор apt update + install…"
     apt_wait_locks 180 || true
-    spin_fn "apt-get update (повтор)" apt_update_safe || true
+    spin_fn "обновление apt (повтор)" apt_update_safe || true
     apt_wait_locks 120 || true
-    run_step "Повторная установка базовых пакетов" \
+    run_step "базовые пакеты (повтор)" \
 "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   curl wget ca-certificates gnupg lsb-release python3 \
   jq unzip ca-certificates"
@@ -1624,23 +1640,20 @@ install_docker() {
     echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
     apt_wait_locks 180 || true
-    info "Обновление apt после добавления Docker-репо…"
-    if ! spin_fn "apt-get update (docker)" apt_update_safe; then
+    info "Обновление apt после Docker-репо…"
+    if ! spin_fn "apt (docker-репо)" apt_update_safe; then
       warn "apt update после Docker-репо не удался — повтор после ожидания lock…"
       apt_wait_locks 180 || true
-      if ! spin_fn "apt-get update (docker, повтор)" apt_update_safe; then
+      if ! spin_fn "apt (docker-репо, повтор)" apt_update_safe; then
         err "apt update после добавления Docker-репозитория не удался"
       fi
     fi
-    # статус уже показал spin_fn (✅)
-
-    apt_wait_locks 120 || true
-    run_step "Установка Docker" \
+    run_step "установка Docker Engine" \
 "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
  systemctl enable docker && systemctl start docker"
   fi
 
-  run_step_soft "Docker daemon config" "ensure_docker_daemon_config"
+  run_step_soft "настройка daemon.json" "ensure_docker_daemon_config"
 }
 
 # Аккуратно настроить daemon.json: не затирать чужие зеркала/настройки
@@ -1840,7 +1853,7 @@ install_remnanode() {
   echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги 0–7, со статусом)${NC}"
   hline 40
   info "0️⃣/7  Проверка apt-репозиториев"
-  run_step_soft "sanitize apt + pause background" "apt_pause_background; sanitize_apt_repos"
+  run_step_soft "проверка репозиториев" "apt_pause_background; sanitize_apt_repos"
   info "1️⃣/7  Базовые пакеты"
   ensure_packages
   info "2️⃣/7  Тюнинг производительности"
@@ -1905,22 +1918,19 @@ EOF
 
   cd "$DIR"
   info "5️⃣/7  Скачивание образа (может занять несколько минут)…"
-  run_step "Pull образа remnawave/node" "docker compose pull"
+  run_step "скачивание образа ноды" "docker compose pull"
   info "6️⃣/7  Запуск контейнера"
-  run_step "Запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
+  run_step "запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
 
   info "7️⃣/7  Ожидание готовности ноды…"
   _tty_printf '\033[?25l'
-  local i ready=0 bar
+  local i ready=0
   for i in $(seq 1 30); do
-    bar=$(_progress_bar_frame "$i")
-    # детерминированная заполненность по секундам + бегунок
-    local filled=$(( i * _PROGRESS_W / 30 ))
-    local j mix=""
+    local filled=$(( i * _PROGRESS_W / 30 )) j mix=""
     for ((j = 0; j < _PROGRESS_W; j++)); do
       if (( j < filled )); then mix+="█"; else mix+="░"; fi
     done
-    _progress_draw "$mix" "порт ${NODE_PORT} / контейнер" "${i}/30с" "$CYAN"
+    _progress_draw "$mix" "ожидание порта ${NODE_PORT}" "${i}/30с" "$CYAN"
     sleep 1
     if is_remnanode_up; then
       if ss -tlnp 2>/dev/null | grep -qE ":${NODE_PORT}\\b"; then
@@ -1930,11 +1940,9 @@ EOF
       (( i >= 10 )) && ready=1 && break
     fi
   done
+  _tty_printf '\033[2K\r'
   if is_remnanode_up; then
-    bar=$(_progress_bar_done)
-    _tty_printf '\r'
-    _tty_printf '  %b✅%b %b%s%b  %-34s  %bготово%b                    \n' \
-      "$GREEN" "$NC" "$GREEN" "$bar" "$NC" "контейнер remnanode" "$GRAY" "$NC"
+    _tty_printf '  %b✅%b ожидание ноды %b— готово%b\n' "$GREEN" "$NC" "$GRAY" "$NC"
   fi
   _tty_printf '\033[?25h'
 
