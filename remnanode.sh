@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.7
+# Версия: 2026.8.8
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.7"
+_REMNANODE_VER="2026.8.8"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -156,16 +156,20 @@ ask() {
   printf -v "$varname" '%s' "$_ans"
 }
 
-# Секретный ввод: каждый символ → «•», Backspace работает
+# Секретный ввод: короткая маска (макс. 12 «•») + счётчик символов в той же строке.
+# Длинные ключи Remnawave (~2–3 КБ) больше не заливают экран тысячами точек.
 ask_secret() {
   local prompt="$1" varname="$2"
   local _ans="" _char="" _tty_in="/dev/tty"
+  local _mask_max=12 _n _dots _i _show
   [[ -r $_tty_in ]] || _tty_in="/dev/stdin"
 
-  _tty_printf "  %b%s%b: " "$WHITE" "$prompt" "$NC"
   local _stty_save=""
   _stty_save=$(stty -g <"$_tty_in" 2>/dev/null || true)
   stty -echo -icanon min 1 time 0 <"$_tty_in" 2>/dev/null || true
+
+  # первая отрисовка
+  _tty_printf '\r\033[K  %b%s%b: %b[0]%b' "$WHITE" "$prompt" "$NC" "$GRAY" "$NC"
 
   while true; do
     _char=""
@@ -178,26 +182,35 @@ ask_secret() {
     if [[ "$_char" == $'\x7f' || "$_char" == $'\b' ]]; then
       if [[ -n "$_ans" ]]; then
         _ans="${_ans%?}"
-        _tty_printf '\b \b'
+      else
+        continue
       fi
-      continue
-    fi
-    # Ctrl-C — вернуться в меню, не валить весь скрипт
-    if [[ "$_char" == $'\x03' ]]; then
+    elif [[ "$_char" == $'\x03' ]]; then
+      # Ctrl-C — вернуться в меню, не валить весь скрипт
       [[ -n "$_stty_save" ]] && stty "$_stty_save" <"$_tty_in" 2>/dev/null || true
       _tty_echo ""
       warn "Ввод прерван"
       printf -v "$varname" '%s' ""
       return 1
+    elif [[ "$_char" < ' ' ]]; then
+      continue
+    else
+      _ans+="$_char"
     fi
-    _ans+="$_char"
-    _tty_printf '•'
+
+    _n=${#_ans}
+    _dots=""
+    _show=$_n
+    (( _show > _mask_max )) && _show=$_mask_max
+    for ((_i = 0; _i < _show; _i++)); do _dots+="•"; done
+    _tty_printf '\r\033[K  %b%s%b: %s%b  [%s]%b' \
+      "$WHITE" "$prompt" "$NC" "$_dots" "$GRAY" "$_n" "$NC"
   done
 
   [[ -n "$_stty_save" ]] && stty "$_stty_save" <"$_tty_in" 2>/dev/null || stty sane <"$_tty_in" 2>/dev/null || true
   _tty_echo ""
   if [[ -n "$_ans" ]]; then
-    _tty_printf "  %b👁  Введено символов: %s%b\n" "$GRAY" "${#_ans}" "$NC"
+    _tty_printf "  %b👁  принято, символов: %s%b\n" "$GRAY" "${#_ans}" "$NC"
   else
     _tty_printf "  %b(пусто)%b\n" "$YELLOW" "$NC"
   fi
@@ -231,17 +244,24 @@ ask_yes_no() {
 spin() {
   local pid=$1 msg=$2
   local frames=('|' '/' '-' '\\') i=0
-  _tty_printf "  %b*%b %s " "$CYAN" "$NC" "$msg"
+  local start=$SECONDS el=0
+  # одна строка со спиннером и таймером — видно, что процесс жив
+  _tty_printf '  %b*%b %s %s %b(0s)%b' "$CYAN" "$NC" "$msg" "${frames[0]}" "$GRAY" "$NC"
   while kill -0 "$pid" 2>/dev/null; do
-    _tty_printf '\b%s' "${frames[$((i++ % 4))]}"
-    sleep 0.1
+    el=$((SECONDS - start))
+    _tty_printf '\r\033[K  %b*%b %s %s %b(%ss)%b' \
+      "$CYAN" "$NC" "$msg" "${frames[$((i++ % 4))]}" "$GRAY" "$el" "$NC"
+    sleep 0.15
   done
   wait "$pid"
   local rc=$?
+  el=$((SECONDS - start))
   if [[ $rc -eq 0 ]]; then
-    _tty_printf '\b %bok%b\n' "$GREEN" "$NC"
+    _tty_printf '\r\033[K  %b*%b %s %bok%b %b(%ss)%b\n' \
+      "$CYAN" "$NC" "$msg" "$GREEN" "$NC" "$GRAY" "$el" "$NC"
   else
-    _tty_printf '\b %bfail%b\n' "$RED" "$NC"
+    _tty_printf '\r\033[K  %b*%b %s %bfail%b %b(%ss)%b\n' \
+      "$CYAN" "$NC" "$msg" "$RED" "$NC" "$GRAY" "$el" "$NC"
     return $rc
   fi
 }
@@ -269,6 +289,21 @@ run_step_soft() {
     return 0
   fi
   return 0
+}
+
+# Запуск функции со спиннером; UI info/warn/ok функции глушатся (идут в лог)
+# Возврат = код функции. Пример: spin_fn "apt update" apt_update_safe
+spin_fn() {
+  local msg="$1"; shift
+  echo "=== $(date '+%F %T') | $msg ===" >&3
+  (
+    ok()   { echo "OK: $*" >&3; }
+    info() { echo "INFO: $*" >&3; }
+    warn() { echo "WARN: $*" >&3; }
+    "$@"
+  ) &
+  local pid=$!
+  spin "$pid" "$msg"
 }
 
 require_root() {
@@ -406,7 +441,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.8.7}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.8.8}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -477,7 +512,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.8.7"
+  [[ -n "$v" ]] || v="2026.8.8"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -1026,27 +1061,30 @@ apt_update_safe() {
 ensure_packages() {
   sanitize_apt_repos
   apt_pause_background
-  info "Обновление apt…"
-  if apt_update_safe; then
+  info "Обновление apt (может занять 1–2 мин)…"
+  if spin_fn "apt-get update" apt_update_safe; then
     ok "Обновление apt"
   else
     warn "apt update не идеален — пробую установить пакеты из кэша/основных зеркал"
   fi
   apt_wait_locks 120 || true
-  # Установка не должна валить весь сценарий из‑за одного optional пакета
-  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-      curl wget ca-certificates gnupg lsb-release python3 \
-      jq htop iftop ethtool irqbalance dnsutils unzip \
-      ufw fail2ban; then
+  info "Установка базовых пакетов…"
+  run_step_soft "apt-get install (curl jq ufw…)" \
+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+  curl wget ca-certificates gnupg lsb-release python3 \
+  jq htop iftop ethtool irqbalance dnsutils unzip \
+  ufw fail2ban"
+  if ! command -v curl >/dev/null 2>&1; then
     warn "Повтор apt update + install…"
     apt_wait_locks 180 || true
-    apt_update_safe || true
+    spin_fn "apt-get update (повтор)" apt_update_safe || true
     apt_wait_locks 120 || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-      curl wget ca-certificates gnupg lsb-release python3 \
-      jq unzip ca-certificates || \
-      err "Не удалось установить базовые пакеты (curl/ca-certificates)"
+    run_step "Повторная установка базовых пакетов" \
+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+  curl wget ca-certificates gnupg lsb-release python3 \
+  jq unzip ca-certificates"
   fi
+  command -v curl >/dev/null 2>&1 || err "Не удалось установить базовые пакеты (curl/ca-certificates)"
   ok "Базовые пакеты"
 }
 
@@ -1530,10 +1568,11 @@ install_docker() {
     echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
     apt_wait_locks 180 || true
-    if ! apt_update_safe; then
+    info "Обновление apt после добавления Docker-репо…"
+    if ! spin_fn "apt-get update (docker)" apt_update_safe; then
       warn "apt update после Docker-репо не удался — повтор после ожидания lock…"
       apt_wait_locks 180 || true
-      if ! apt_update_safe; then
+      if ! spin_fn "apt-get update (docker, повтор)" apt_update_safe; then
         err "apt update после добавления Docker-репозитория не удался"
       fi
     fi
@@ -1742,18 +1781,17 @@ install_remnanode() {
   ok "Ключ принят (${#K1} символов)"
   echo
 
-  echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги видны ниже)${NC}"
+  echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги 0–7, со статусом)${NC}"
   hline 40
-  info "0️⃣  Проверка apt-репозиториев"
-  apt_pause_background
-  sanitize_apt_repos
-  info "1️⃣  Базовые пакеты"
+  info "0️⃣/7  Проверка apt-репозиториев"
+  run_step_soft "sanitize apt + pause background" "apt_pause_background; sanitize_apt_repos"
+  info "1️⃣/7  Базовые пакеты"
   ensure_packages
-  info "2️⃣  Тюнинг производительности"
+  info "2️⃣/7  Тюнинг производительности"
   apply_performance_tuning
-  info "3️⃣  Docker"
+  info "3️⃣/7  Docker"
   install_docker
-  info "4️⃣  Конфиг и запуск ноды"
+  info "4️⃣/7  Конфиг ноды (.env + compose)"
 
   mkdir -p "$DIR"
 
@@ -1810,16 +1848,18 @@ EOF
   echo "$NODE_PORT" > "$DIR/.node_port"
 
   cd "$DIR"
-  info "5️⃣  Скачивание образа (может занять время)…"
+  info "5️⃣/7  Скачивание образа (может занять несколько минут)…"
   run_step "Pull образа remnawave/node" "docker compose pull"
-  info "6️⃣  Запуск контейнера"
+  info "6️⃣/7  Запуск контейнера"
   run_step "Запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
 
-  _tty_printf "  * Жду готовности контейнера"
+  info "7️⃣/7  Ожидание готовности ноды…"
+  _tty_printf "  %b*%b Жду контейнер/порт %s " "$CYAN" "$NC" "$NODE_PORT"
   local i ready=0
   for i in $(seq 1 30); do
+    _tty_printf '\r\033[K  %b*%b Жду контейнер/порт %s %b(%s/30с)%b' \
+      "$CYAN" "$NC" "$NODE_PORT" "$GRAY" "$i" "$NC"
     sleep 1
-    echo -n "."
     if is_remnanode_up; then
       if ss -tlnp 2>/dev/null | grep -qE ":${NODE_PORT}\\b"; then
         ready=1
@@ -1829,7 +1869,7 @@ EOF
       (( i >= 10 )) && ready=1 && break
     fi
   done
-  echo
+  _tty_echo ""
 
   if ! is_remnanode_up; then
     echo -e "  ${RED}Логи контейнера:${NC}"
@@ -1844,7 +1884,7 @@ EOF
     warn "Порт ${NODE_PORT} пока может подниматься — проверьте: ss -tlnp | grep ${NODE_PORT}"
   fi
 
-  info "7️⃣  Установка команды управления"
+  info "Установка команды управления…"
   install_self_cli
 
   echo
