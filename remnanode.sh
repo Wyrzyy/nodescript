@@ -4,10 +4,10 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.19
+# Версия: 2026.8.20
 #
 # Запуск лаунчера (меню со всеми возможностями):
-#   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
+#   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
 #
 # Скрипт сам перезапустится из tempfile (фикс Termius /dev/fd).
 # Установка ноды — пункт меню «1», не через аргумент @ install.
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.19"
+_REMNANODE_VER="2026.8.20"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -416,10 +416,21 @@ gh_candidates() {
 # Скачать URL в файл (с зеркалами). Возврат 0 при успехе.
 gh_download() {
   local url="$1" dest="$2"
-  local candidate
+  local candidate bust
+  bust="$(date +%s)"
   while IFS= read -r candidate; do
     [[ -z "$candidate" ]] && continue
-    if curl -fsSL --connect-timeout 8 --max-time 120 --retry 2 -o "$dest" "$candidate" 2>/dev/null; then
+    # anti-cache для raw.githubusercontent / зеркал
+    if [[ "$candidate" == *"raw.githubusercontent.com"* || "$candidate" == *"ghfast.top"* || "$candidate" == *"ghproxy.com"* ]]; then
+      if [[ "$candidate" == *\?* ]]; then
+        candidate="${candidate}&_=${bust}"
+      else
+        candidate="${candidate}?_=${bust}"
+      fi
+    fi
+    if curl -fsSL --connect-timeout 8 --max-time 120 --retry 2 \
+        -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+        -o "$dest" "$candidate" 2>/dev/null; then
       if [[ -s "$dest" ]]; then
         echo "$candidate" >&3
         return 0
@@ -905,11 +916,9 @@ _apt_is_busy() {
     elif command -v lsof >/dev/null 2>&1; then
       lsof "$l" >/dev/null 2>&1 && return 0
     elif command -v flock >/dev/null 2>&1; then
-      # не смогли взять — значит занят
       flock -n "$l" -c true 2>/dev/null || return 0
     fi
   done
-  # процессы (исключаем себя и детей текущего шелла ненадёжно — смотрим по имени)
   if pgrep -x apt-get >/dev/null 2>&1 \
     || pgrep -x apt >/dev/null 2>&1 \
     || pgrep -x dpkg >/dev/null 2>&1 \
@@ -919,37 +928,115 @@ _apt_is_busy() {
   return 1
 }
 
-# Приглушить фоновые авто-обновления на время нашей установки
-apt_pause_background() {
+# PID-ы, держащие apt/dpkg lock
+_apt_lock_pids() {
+  local l pids=""
+  for l in \
+    /var/lib/dpkg/lock-frontend \
+    /var/lib/dpkg/lock \
+    /var/lib/apt/lists/lock \
+    /var/cache/apt/archives/lock
+  do
+    [[ -e "$l" ]] || continue
+    if command -v fuser >/dev/null 2>&1; then
+      pids+=" $(fuser "$l" 2>/dev/null | tr -s ' ' || true)"
+    fi
+  done
+  # плюс известные фоновые
+  pids+=" $(pgrep -x unattended-upgr 2>/dev/null || true)"
+  pids+=" $(pgrep -x packagekitd 2>/dev/null || true)"
+  printf '%s' "$pids" | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -u
+}
+
+# Можно ли безопасно убить процесс (фоновый update/upgrade, не наш install)
+_apt_pid_is_background() {
+  local pid="$1" args
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  # не трогаем себя
+  [[ "$pid" == "$$" ]] && return 1
+  args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+  [[ -z "$args" ]] && return 1
+  # unattended / packagekit / daily
+  echo "$args" | grep -qiE 'unattended-upgrade|packagekit|apt\.systemd\.daily' && return 0
+  # apt-get update / upgrade / dist-upgrade / autoclean (не наш install -y docker)
+  if echo "$args" | grep -qE 'apt-get|apt '; then
+    echo "$args" | grep -qE ' (update|upgrade|dist-upgrade|full-upgrade|autoclean|autoremove)( |$)' && return 0
+    # cloud-init стиль: apt-get --assume-yes --quiet update
+    echo "$args" | grep -qE -- '--quiet update|--quiet dist-upgrade|--quiet upgrade' && return 0
+  fi
+  return 1
+}
+
+# Остановить авто-apt Ubuntu/cloud-init и убрать фоновые update/dist-upgrade
+apt_takeover() {
+  # таймеры/сервисы — runtime mask до ребута
   systemctl stop unattended-upgrades.service 2>/dev/null || true
   systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+  systemctl stop packagekit.service 2>/dev/null || true
   systemctl kill --kill-who=all apt-daily.service 2>/dev/null || true
   systemctl kill --kill-who=all apt-daily-upgrade.service 2>/dev/null || true
-  # не возвращаем ошибку
+  systemctl kill --kill-who=all unattended-upgrades.service 2>/dev/null || true
+  systemctl mask --runtime apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+  systemctl mask --runtime unattended-upgrades.service 2>/dev/null || true
+
+  local pid args killed=0
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    if _apt_pid_is_background "$pid"; then
+      args=$(ps -p "$pid" -o args= 2>/dev/null | head -c 120 || true)
+      info "Останавливаю фоновый apt (pid ${pid}): ${args}"
+      kill -TERM "$pid" 2>/dev/null || true
+      killed=1
+    fi
+  done < <(_apt_lock_pids)
+
+  if (( killed )); then
+    sleep 2
+    # если не умер — KILL
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      if _apt_pid_is_background "$pid" && kill -0 "$pid" 2>/dev/null; then
+        warn "Принудительно завершаю зависший apt pid ${pid}"
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    done < <(_apt_lock_pids)
+    sleep 1
+    # dpkg мог остаться в состоянии — попробуем --configure -a мягко позже
+  fi
   return 0
 }
 
-# Ждать освобождения apt-lock (иначе ретраи сгорают за 1–2 сек)
+# Совместимость со старыми вызовами
+apt_pause_background() { apt_takeover; }
+
+# Ждать освобождения apt-lock. После половины таймаута — убиваем фоновый apt.
 # usage: apt_wait_locks [timeout_sec]
 apt_wait_locks() {
-  local timeout="${1:-180}"
+  local timeout="${1:-300}"
   local waited=0 shown=0
   local pidinfo=""
+  local half=$(( timeout / 2 ))
+  (( half < 15 )) && half=15
 
-  apt_pause_background
+  apt_takeover
 
   while _apt_is_busy; do
     if (( waited >= timeout )); then
-      warn "apt-блокировка не снялась за ${timeout}с"
-      # кто держит
-      if command -v fuser >/dev/null 2>&1; then
-        fuser -v /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend 2>&1 | sed 's/^/    /' >&3 || true
+      warn "apt-блокировка не снялась за ${timeout}с — последний шанс: kill фонового apt"
+      apt_takeover
+      sleep 2
+      if _apt_is_busy; then
+        warn "apt всё ещё занят"
+        if command -v fuser >/dev/null 2>&1; then
+          fuser -v /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend 2>&1 | sed 's/^/    /' >&3 || true
+        fi
+        return 1
       fi
-      return 1
+      return 0
     fi
     if (( shown == 0 )); then
-      pidinfo=$(pgrep -a -x apt-get 2>/dev/null | head -3 || true)
-      [[ -z "$pidinfo" ]] && pidinfo=$(pgrep -a -x apt 2>/dev/null | head -3 || true)
+      pidinfo=$(pgrep -a -x apt-get 2>/dev/null | head -2 || true)
+      [[ -z "$pidinfo" ]] && pidinfo=$(pgrep -a unattended-upgr 2>/dev/null | head -1 || true)
       if [[ -n "$pidinfo" ]]; then
         info "⏳ Жду освобождения apt (занято: ${pidinfo})…"
       else
@@ -957,10 +1044,14 @@ apt_wait_locks() {
       fi
       shown=1
     fi
+    # после половины таймаута — агрессивно гасим фоновые update/upgrade
+    if (( waited >= half )); then
+      apt_takeover
+    else
+      (( waited % 20 == 0 )) && apt_takeover
+    fi
     sleep 3
     waited=$((waited + 3))
-    # периодически снова гасим daily-сервисы — они могут перезапуститься
-    (( waited % 30 == 0 )) && apt_pause_background
   done
   return 0
 }
@@ -2177,41 +2268,113 @@ setup_ports() {
 ###############################################################################
 # Docker
 ###############################################################################
-install_docker() {
-  sanitize_apt_repos
-  if command -v docker >/dev/null 2>&1; then
-    info "Docker уже установлен"
-  else
-    info "🐳 Добавляю репозиторий Docker…"
-    install -m 0755 -d /etc/apt/keyrings
-    # без интерактива: gpg иначе спрашивает Overwrite? если ключ уже есть
-    local _dk_tmp
-    _dk_tmp=$(mktemp /tmp/rn-docker-gpg.XXXXXX)
-    if ! curl -fsSL "https://download.docker.com/linux/${ID}/gpg" \
-        | gpg --batch --yes --dearmor -o "$_dk_tmp" 2>/dev/null; then
-      rm -f "$_dk_tmp"
-      err "Не удалось скачать GPG-ключ Docker"
-    fi
-    install -m 0644 "$_dk_tmp" /etc/apt/keyrings/docker.gpg
+# Установка Docker через официальный convenience-скрипт (обходит зависший apt lock)
+_install_docker_via_get_docker() {
+  info "Fallback: установка Docker через get.docker.com…"
+  apt_takeover
+  apt_wait_locks 120 || true
+  local tmp
+  tmp=$(mktemp /tmp/rn-get-docker.XXXXXX.sh)
+  if ! curl -fsSL --connect-timeout 10 --max-time 60 https://get.docker.com -o "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # скрипт сам делает apt update/install; перед этим ещё раз захватим apt
+  apt_takeover
+  apt_wait_locks 180 || true
+  if ! sh "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  systemctl enable docker >/dev/null 2>&1 || true
+  systemctl start docker >/dev/null 2>&1 || true
+  command -v docker >/dev/null 2>&1
+}
+
+_install_docker_via_apt() {
+  info "🐳 Добавляю репозиторий Docker…"
+  install -m 0755 -d /etc/apt/keyrings
+  local _dk_tmp
+  _dk_tmp=$(mktemp /tmp/rn-docker-gpg.XXXXXX)
+  if ! curl -fsSL --connect-timeout 10 --max-time 30 "https://download.docker.com/linux/${ID}/gpg" \
+      | gpg --batch --yes --dearmor -o "$_dk_tmp" 2>/dev/null; then
     rm -f "$_dk_tmp"
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
-      > /etc/apt/sources.list.d/docker.list
-    apt_wait_locks 60 || true
-    # новое репо: обновляем только docker.list (быстро), не все зеркала
-    info "Обновление apt под Docker-репозиторий…"
-    if ! spin_fn "apt (docker-репо)" apt_update_one_repo /etc/apt/sources.list.d/docker.list; then
-      warn "Точечный update Docker-репо не удался — полный update…"
-      apt_wait_locks 60 || true
-      if ! spin_fn "apt (docker-репо, полный)" apt_update_safe force; then
-        err "apt update после добавления Docker-репозитория не удался"
-      fi
-    fi
-    run_step "установка Docker Engine" \
-"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
- systemctl enable docker && systemctl start docker"
+    warn "Не удалось скачать GPG-ключ Docker"
+    return 1
+  fi
+  install -m 0644 "$_dk_tmp" /etc/apt/keyrings/docker.gpg
+  rm -f "$_dk_tmp"
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  apt_takeover
+  apt_wait_locks 180 || true
+  info "Обновление apt под Docker-репозиторий…"
+  if ! spin_fn "apt (docker-репо)" apt_update_one_repo /etc/apt/sources.list.d/docker.list; then
+    warn "Точечный update Docker-репо не удался — полный update…"
+    apt_takeover
+    apt_wait_locks 120 || true
+    spin_fn "apt (docker-репо, полный)" apt_update_safe force || true
   fi
 
+  local attempt=1
+  local errf="/tmp/rn-docker-apt.err"
+  while (( attempt <= 4 )); do
+    apt_takeover
+    if ! apt_wait_locks 180; then
+      warn "apt занят перед установкой Docker (попытка ${attempt}/4)…"
+    fi
+    # починить прерванный dpkg после kill фонового apt
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+    echo "=== $(date '+%F %T') | apt install docker (попытка ${attempt}/4) ===" >&3
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+        >"$errf" 2>&1; then
+      systemctl enable docker >/dev/null 2>&1 || true
+      systemctl start docker >/dev/null 2>&1 || true
+      ok "Docker Engine установлен"
+      return 0
+    fi
+    cat "$errf" >&3 2>/dev/null || true
+    if _apt_err_is_lock "$errf" || grep -qiE 'Could not get lock|Unable to acquire' "$errf" 2>/dev/null; then
+      warn "Docker: apt lock (попытка ${attempt}/4) — жду и повторяю…"
+      apt_takeover
+      sleep 5
+      attempt=$((attempt + 1))
+      continue
+    fi
+    warn "apt install docker не удался — см. лог"
+    return 1
+  done
+  return 1
+}
+
+install_docker() {
+  sanitize_apt_repos
+  apt_takeover
+
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    ok "Docker уже установлен"
+    run_step_soft "настройка daemon.json" "ensure_docker_daemon_config"
+    return 0
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    info "Docker есть, проверяю compose-plugin…"
+  fi
+
+  if _install_docker_via_apt; then
+    :
+  else
+    warn "Установка Docker через apt не вышла — пробую get.docker.com"
+    if ! _install_docker_via_get_docker; then
+      err "Не удалось установить Docker. Освободите apt: systemctl stop unattended-upgrades; затем повторите."
+    fi
+    ok "Docker установлен через get.docker.com"
+  fi
+
+  command -v docker >/dev/null 2>&1 || err "docker не найден после установки"
   run_step_soft "настройка daemon.json" "ensure_docker_daemon_config"
 }
 
@@ -2476,7 +2639,7 @@ install_remnanode() {
   echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги 0–8, со статусом)${NC}"
   hline 40
   info "0️⃣/8  Проверка apt-репозиториев"
-  run_step_soft "проверка репозиториев" "apt_pause_background; sanitize_apt_repos"
+  run_step_soft "проверка репозиториев" "apt_takeover; sanitize_apt_repos; apt_wait_locks 120 || true"
   info "1️⃣/8  Базовые пакеты"
   ensure_packages
   info "2️⃣/8  Тюнинг производительности"
