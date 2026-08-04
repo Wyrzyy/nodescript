@@ -12,9 +12,9 @@
 # ║  Author:  DigneZzZ (https://github.com/DigneZzZ)               ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=2.10.0
+# VERSION=2.10.1
 
-SCRIPT_VERSION="2.10.0"
+SCRIPT_VERSION="2.10.1"
 
 # Handle @ prefix for consistency на other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
@@ -1846,15 +1846,24 @@ validate_domain_dns() {
     else
         echo -e "${YELLOW}⚠️  Проверка DNS завершилась с предупреждениями.${NC}"
         echo
-        read -p "Всё равно продолжить? [y/N]: " -r continue_anyway
-        
-        if [[ $continue_anyway =~ ^[Yy]$ ]]; then
-            echo -e "${YELLOW}⚠️  Продолжаю установку несмотря на проблемы DNS…${NC}"
-            return 0
+        local continue_anyway=""
+        if [ "$dns_match" = "true" ]; then
+            # Домен указывает на сервер, ограничено только распространение —
+            # по умолчанию продолжаем
+            continue_anyway=$(ui_ask "Всё равно продолжить? [Y/n]:")
+            if [[ ! $continue_anyway =~ ^[Nn]$ ]]; then
+                echo -e "${YELLOW}⚠️  Продолжаю установку (DNS ещё распространяется)…${NC}"
+                return 0
+            fi
         else
-            echo -e "${GRAY}Установка отменена. Сначала исправьте DNS.${NC}"
-            return 1
+            continue_anyway=$(ui_ask "Всё равно продолжить? [y/N]:")
+            if [[ $continue_anyway =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}⚠️  Продолжаю установку несмотря на проблемы DNS…${NC}"
+                return 0
+            fi
         fi
+        echo -e "${GRAY}DNS не подтверждён для этого домена.${NC}"
+        return 1
     fi
 }
 
@@ -2875,7 +2884,8 @@ install_command() {
                             domain=""
                             continue
                         else
-                            return 1
+                            # Не отменяем установку: продолжаем с этим доменом
+                            log_warning "Продолжаю установку с доменом $domain (DNS не подтверждён)"
                         fi
                     fi
                     ;;
