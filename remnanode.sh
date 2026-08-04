@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.13
+# Версия: 2026.8.14
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.13"
+_REMNANODE_VER="2026.8.14"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -3802,13 +3802,13 @@ main_menu() {
     section "🛠️  Система"
     menu_item "💾" "7"  "SWAP"       "файл подкачки"      swap
     menu_item "🛡️" "8"  "UFW"        "firewall (UFW)"     ufw
-    menu_item "🔓" "13" "Порты"      "открыть / закрыть"  ports
-    menu_item "⚙️" "9"  "Тюнинг"     "BBR / буферы / RPS" tune
-    menu_item "🧱" "12" "Анти-DDoS"  "SYN-флуд / L4"      antiddos
+    menu_item "🔓" "9"  "Порты"      "открыть / закрыть"  ports
+    menu_item "⚙️" "10" "Тюнинг"     "BBR / буферы / RPS" tune
+    menu_item "🧱" "11" "Анти-DDoS"  "SYN-флуд / L4"      antiddos
 
     section "🎛️  Сервис"
-    menu_item "📡" "10" "Нода"       "меню управления"    node_cli
-    menu_item "🧪" "11" "Тесты"      "speed / ping / DNS"
+    menu_item "📡" "12" "Нода"       "меню управления"    node_cli
+    menu_item "🧪" "13" "Тесты"      "speed / ping / DNS"
     _tty_echo ""
     menu_item "🚪" "0"  "Выход"      ""
     _tty_echo ""
@@ -3823,11 +3823,11 @@ main_menu() {
       6)  install_mtproto; pause ;;
       7)  setup_swap; pause ;;
       8)  setup_ufw; pause ;;
-      9)  apply_performance_tuning; pause ;;
-      10) remnanode_menu ;;
-      11) tests_menu ;;
-      12) setup_antiddos; pause ;;
-      13) setup_ports; pause ;;
+      9)  setup_ports; pause ;;
+      10) apply_performance_tuning; pause ;;
+      11) setup_antiddos; pause ;;
+      12) remnanode_menu ;;
+      13) tests_menu ;;
       0)  exit 0 ;;
       *)  ;;
     esac
