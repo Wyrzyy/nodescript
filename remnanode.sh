@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.5
+# Версия: 2026.8.6
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.5"
+_REMNANODE_VER="2026.8.6"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -26,7 +26,8 @@ if [[ "$_SRC" == /dev/fd/* || "$_SRC" == /proc/self/fd/* || "$_SRC" == /dev/stdi
   _RN_TMP="$(mktemp /tmp/remnanode-run.XXXXXX.sh)"
   cat "$_SRC" > "$_RN_TMP"
   chmod +x "$_RN_TMP"
-  exec bash "$_RN_TMP" "$@"
+  # не оставляем копию скрипта в /tmp после завершения
+  exec bash -c 'trap "rm -f \"$1\"" EXIT; shift; exec bash "$0" "$@"' "$_RN_TMP" "$_RN_TMP" "$@"
 fi
 APP="remnanode"
 DIR="/opt/$APP"
@@ -98,7 +99,14 @@ err()  {
 }
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
-: > "$LOG" 2>/dev/null || true
+# Не затираем лог при каждом запуске — только ротация если > 2 МБ
+if [[ -f "$LOG" ]] && [[ "$(wc -c <"$LOG" 2>/dev/null || echo 0)" -gt 2097152 ]]; then
+  tail -c 1048576 "$LOG" >"${LOG}.tmp" 2>/dev/null && mv -f "${LOG}.tmp" "$LOG" || true
+fi
+{
+  echo
+  echo "======== $(date '+%F %T') | start pid=$$ ========"
+} >>"$LOG" 2>/dev/null || true
 exec 3>>"$LOG" 2>/dev/null || exec 3>/dev/null
 
 hline() {
@@ -174,11 +182,13 @@ ask_secret() {
       fi
       continue
     fi
-    # Ctrl-C
+    # Ctrl-C — вернуться в меню, не валить весь скрипт
     if [[ "$_char" == $'\x03' ]]; then
       [[ -n "$_stty_save" ]] && stty "$_stty_save" <"$_tty_in" 2>/dev/null || true
       _tty_echo ""
-      err "Ввод прерван"
+      warn "Ввод прерван"
+      printf -v "$varname" '%s' ""
+      return 1
     fi
     _ans+="$_char"
     _tty_printf '•'
@@ -246,6 +256,19 @@ run_step() {
     warn "└─ подробности в логе: ${LOG}"
     err "Ошибка на шаге: $msg"
   }
+}
+
+# Мягкий шаг: fail не валит установку (тюнинг, optional)
+run_step_soft() {
+  local msg="$1" cmd="$2"
+  echo "=== $(date '+%F %T') | $msg (soft) ===" >&3
+  ( eval "$cmd" >&3 2>&3 ) &
+  local pid=$!
+  if ! spin "$pid" "$msg"; then
+    warn "└─ шаг пропущен (некритично): $msg — см. ${LOG}"
+    return 0
+  fi
+  return 0
 }
 
 require_root() {
@@ -383,7 +406,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.8.5}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.8.6}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -393,6 +416,20 @@ esac
 
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
 CODENAME=${VERSION_CODENAME:-}
+if [[ -z "$CODENAME" ]]; then
+  CODENAME=$(lsb_release -cs 2>/dev/null || true)
+fi
+if [[ -z "$CODENAME" ]]; then
+  case "${VERSION_ID:-}" in
+    24.04*) CODENAME=noble ;;
+    22.04*) CODENAME=jammy ;;
+    20.04*) CODENAME=focal ;;
+    12*)    CODENAME=bookworm ;;
+    11*)    CODENAME=bullseye ;;
+    *)      CODENAME=noble ;;
+  esac
+  warn "VERSION_CODENAME пуст — используем ${CODENAME}"
+fi
 CPU=$(nproc)
 RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
 
@@ -440,7 +477,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.8.5"
+  [[ -n "$v" ]] || v="2026.8.6"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -450,11 +487,8 @@ launcher_version() {
 
 show_header() {
   ui_clear
-  # Жёстко фиксируем версию на каждом показе шапки (защита от пустого env)
-  _REMNANODE_VER="2026.8.5"
-  RN_VERSION="$_REMNANODE_VER"
-  SCRIPT_VERSION="$_REMNANODE_VER"
-  local ver="$_REMNANODE_VER"
+  local ver
+  ver=$(launcher_version)
 
   # Рамка ASCII + цвет; emoji только вне линий фиксированной ширины
   _tty_printf '%b' "${CYAN}${BOLD}"
@@ -495,9 +529,16 @@ service_status_text() {
       fi
       ;;
     selfsteal)
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '(caddy|nginx).*selfsteal|selfsteal'; then
+      # Не считать «установленным» просто из‑за /opt/caddy (чужой Caddy)
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qiE 'selfsteal'; then
         echo "работает"
-      elif [[ -d /opt/caddy ]] || [[ -d /opt/nginx-selfsteal ]] || command -v selfsteal >/dev/null 2>&1; then
+      elif [[ -f /opt/caddy/docker-compose.yml ]] || [[ -f /opt/nginx-selfsteal/docker-compose.yml ]]; then
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -qiE '^(caddy|nginx)(-|$)'; then
+          echo "работает"
+        else
+          echo "установлен"
+        fi
+      elif [[ -d /opt/nginx-selfsteal ]]; then
         echo "установлен"
       else
         echo "не установлен"
@@ -505,8 +546,14 @@ service_status_text() {
       ;;
     warp)
       if command -v warp-cli >/dev/null 2>&1; then
-        if warp-cli --accept-tos status 2>/dev/null | grep -qi connected; then
-          echo "подключён"
+        local _ws=""
+        _ws=$(warp-cli --accept-tos status 2>/dev/null || true)
+        if echo "$_ws" | grep -qiE 'connected|Status[[:space:]]*[:=]?[[:space:]]*Connected'; then
+          if ss -tlnp 2>/dev/null | grep -qE ":${WARP_PORT}\\b"; then
+            echo "подключён"
+          else
+            echo "установлен"
+          fi
         else
           echo "установлен"
         fi
@@ -515,8 +562,13 @@ service_status_text() {
       fi
       ;;
     hysteria)
-      if [[ -d /opt/hysteria/certs ]] \
-        || { [[ -f "$COMPOSE" ]] && grep -qE 'hysteria|/opt/hysteria' "$COMPOSE" 2>/dev/null; }; then
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qiE 'hysteria'; then
+        echo "настроено"
+      elif [[ -f /opt/hysteria/config.yaml ]] || [[ -f /opt/hysteria/config.json ]]; then
+        echo "настроено"
+      elif [[ -d /opt/hysteria/certs ]] && compgen -G '/opt/hysteria/certs/*' >/dev/null 2>&1; then
+        echo "настроено"
+      elif [[ -f "$COMPOSE" ]] && grep -qE 'hysteria|/opt/hysteria' "$COMPOSE" 2>/dev/null; then
         echo "настроено"
       else
         echo "не настроено"
@@ -972,7 +1024,7 @@ ensure_packages() {
   apt_wait_locks 120 || true
   # Установка не должна валить весь сценарий из‑за одного optional пакета
   if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-      curl wget ca-certificates gnupg lsb-release \
+      curl wget ca-certificates gnupg lsb-release python3 \
       jq htop iftop ethtool irqbalance dnsutils unzip \
       ufw fail2ban; then
     warn "Повтор apt update + install…"
@@ -980,7 +1032,7 @@ ensure_packages() {
     apt_update_safe || true
     apt_wait_locks 120 || true
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-      curl wget ca-certificates gnupg lsb-release \
+      curl wget ca-certificates gnupg lsb-release python3 \
       jq unzip ca-certificates || \
       err "Не удалось установить базовые пакеты (curl/ca-certificates)"
   fi
@@ -1089,7 +1141,7 @@ DefaultLimitNOFILE=1048576
 DefaultLimitNPROC=infinity
 EOF'"
 
-  run_step "CPU governor: performance" \
+  run_step_soft "CPU governor: performance" \
 "bash -c 'for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
   [ -w \"\$cpu\" ] && echo performance > \"\$cpu\" || true
 done
@@ -1107,7 +1159,7 @@ EOF
 systemctl daemon-reload && systemctl enable cpu-performance.service >/dev/null 2>&1 || true'"
 
   if (( CPU > 1 )); then
-    run_step "RPS / IRQ balance" \
+    run_step_soft "RPS / IRQ balance" \
 "bash -c 'IFACE=\$(ip route show default | awk \"/default/ {print \\\$5; exit}\")
 if [ -n \"\$IFACE\" ]; then
   MASK=\$(printf \"%x\" \$(( (1 << $CPU) - 1 )))
@@ -1187,26 +1239,72 @@ install_docker() {
  systemctl enable docker && systemctl start docker"
   fi
 
-  run_step "Docker daemon config" \
-"bash -c 'mkdir -p /etc/docker && cat > /etc/docker/daemon.json <<EOF
+  run_step_soft "Docker daemon config" "ensure_docker_daemon_config"
+}
+
+# Аккуратно настроить daemon.json: не затирать чужие зеркала/настройки
+ensure_docker_daemon_config() {
+  mkdir -p /etc/docker
+  local cfg=/etc/docker/daemon.json
+  local changed=0
+
+  if [[ ! -f "$cfg" ]]; then
+    cat > "$cfg" <<'EOF'
 {
-  \"log-driver\": \"json-file\",
-  \"log-opts\": {
-    \"max-size\": \"10m\",
-    \"max-file\": \"3\"
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
   },
-  \"live-restore\": true,
-  \"userland-proxy\": false,
-  \"default-ulimits\": {
-    \"nofile\": {
-      \"Name\": \"nofile\",
-      \"Hard\": 1048576,
-      \"Soft\": 1048576
+  "live-restore": true,
+  "userland-proxy": false,
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 1048576,
+      "Soft": 1048576
     }
   }
 }
 EOF
-systemctl restart docker'"
+    changed=1
+    info "Создан /etc/docker/daemon.json"
+  elif command -v jq >/dev/null 2>&1; then
+    local tmp before after
+    tmp=$(mktemp)
+    before=$(wc -c <"$cfg" 2>/dev/null || echo 0)
+    # Мержим только недостающие ключи — не трогаем registry-mirrors и пр.
+    if jq '
+      .["log-driver"] = (.["log-driver"] // "json-file") |
+      .["log-opts"] = (.["log-opts"] // {}) |
+      .["log-opts"]["max-size"] = (.["log-opts"]["max-size"] // "10m") |
+      .["log-opts"]["max-file"] = (.["log-opts"]["max-file"] // "3") |
+      .["live-restore"] = (.["live-restore"] // true) |
+      .["userland-proxy"] = (.["userland-proxy"] // false) |
+      .["default-ulimits"] = (.["default-ulimits"] // {}) |
+      .["default-ulimits"]["nofile"] = (.["default-ulimits"]["nofile"] // {"Name":"nofile","Hard":1048576,"Soft":1048576})
+    ' "$cfg" >"$tmp" 2>/dev/null; then
+      after=$(wc -c <"$tmp" 2>/dev/null || echo 0)
+      if ! cmp -s "$cfg" "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$cfg"
+        changed=1
+        info "Обновлён /etc/docker/daemon.json (merge)"
+      else
+        rm -f "$tmp"
+        info "Docker daemon.json уже настроен — без изменений"
+      fi
+    else
+      rm -f "$tmp"
+      info "Docker daemon.json есть — оставляю как есть"
+    fi
+  else
+    info "Docker daemon.json уже есть — не перезаписываю"
+  fi
+
+  if [[ "$changed" -eq 1 ]]; then
+    systemctl restart docker 2>/dev/null || true
+  fi
+  return 0
 }
 
 ###############################################################################
@@ -1214,7 +1312,7 @@ systemctl restart docker'"
 ###############################################################################
 install_self_cli() {
   local src="${BASH_SOURCE[0]:-$0}"
-  local src_dir=""
+  local src_dir="" quiet="${RN_QUIET:-0}"
   src_dir=$(cd "$(dirname "$src")" 2>/dev/null && pwd || true)
   mkdir -p "$DIR"
 
@@ -1224,7 +1322,7 @@ install_self_cli() {
   fi
   # Если в установленной копии нет версии — скачать свежий с GitHub
   if [[ ! -f "$LAUNCHER_PATH" ]] \
-     || ! grep -qE '^_REMNANODE_VER="?2026\.' "$LAUNCHER_PATH" 2>/dev/null; then
+     || ! grep -qE '^_REMNANODE_VER="?[0-9]{4}\.' "$LAUNCHER_PATH" 2>/dev/null; then
     gh_download "$LAUNCHER_RAW" "$LAUNCHER_PATH" 2>/dev/null || true
   fi
   chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
@@ -1239,7 +1337,9 @@ install_self_cli() {
   fi
   ln -sfn "$LAUNCHER_PATH" "$CLI_PATH"
   chmod +x "$CLI_PATH" 2>/dev/null || true
-  ok "Команда управления: remnanode"
+  if [[ "$quiet" != "1" ]]; then
+    ok "Команда управления: remnanode"
+  fi
 }
 
 ###############################################################################
@@ -1251,7 +1351,8 @@ is_remnanode_installed() {
   if [[ -f "$COMPOSE" ]] && grep -qE 'container_name:[[:space:]]*remnanode|remnawave/node' "$COMPOSE" 2>/dev/null; then
     return 0
   fi
-  if [[ -f "$ENV_FILE" ]] && grep -qE '^SECRET_KEY=' "$ENV_FILE" 2>/dev/null; then
+  # .env считаем установкой только при непустом SECRET_KEY
+  if [[ -f "$ENV_FILE" ]] && grep -qE '^SECRET_KEY=.+' "$ENV_FILE" 2>/dev/null; then
     return 0
   fi
   if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
@@ -1264,7 +1365,8 @@ is_remnanode_up() { docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remn
 # Удалить только файлы ноды; лаунчер (installer.sh / selfsteal.sh) оставляем
 _remove_remnanode_files() {
   if [[ -f "$COMPOSE" ]]; then
-    (cd "$DIR" && docker compose down -v 2>/dev/null) || true
+    # без -v: не сносить чужие named volumes (certs H2/selfsteal)
+    (cd "$DIR" && docker compose down 2>/dev/null) || true
   fi
   docker rm -f remnanode 2>/dev/null || true
   rm -f "$COMPOSE" "$ENV_FILE" \
@@ -1325,8 +1427,8 @@ install_remnanode() {
   info "🔑 SECRET_KEY скопируйте из панели Remnawave → Nodes → Create"
   local K1="" K2=""
   while true; do
-    ask_secret "SECRET_KEY" K1
-    ask_secret "Повтор SECRET_KEY" K2
+    ask_secret "SECRET_KEY" K1 || { warn "Отмена ввода ключа"; return 0; }
+    ask_secret "Повтор SECRET_KEY" K2 || { warn "Отмена ввода ключа"; return 0; }
     [[ -z "$K1" ]] && { warn "Пусто — введите ключ"; continue; }
     [[ "$K1" != "$K2" ]] && { warn "Не совпадает — ещё раз"; continue; }
     break
@@ -1370,6 +1472,8 @@ services:
     hostname: remnanode
     network_mode: host
     restart: always
+    init: true
+    stop_grace_period: 30s
     env_file:
       - .env
     cap_add:
@@ -1378,8 +1482,19 @@ services:
       nofile:
         soft: 1048576
         hard: 1048576
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - /dev/shm:/dev/shm
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f xray >/dev/null 2>&1 || pgrep -f node >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
 EOF
   chmod 600 "$COMPOSE"
   ok "docker-compose.yml создан"
@@ -1395,11 +1510,18 @@ EOF
   run_step "Запуск контейнера" "docker compose down >/dev/null 2>&1 || true; docker compose up -d"
 
   _tty_printf "  * Жду готовности контейнера"
-  local i
-  for i in 1 2 3 4 5 6; do
+  local i ready=0
+  for i in $(seq 1 30); do
     sleep 1
     echo -n "."
-    is_remnanode_up && break
+    if is_remnanode_up; then
+      if ss -tlnp 2>/dev/null | grep -qE ":${NODE_PORT}\\b"; then
+        ready=1
+        break
+      fi
+      # контейнер up, порт ещё может подниматься
+      (( i >= 10 )) && ready=1 && break
+    fi
   done
   echo
 
@@ -1410,10 +1532,10 @@ EOF
   fi
   ok "Контейнер remnanode запущен"
 
-  if ss -tlnp 2>/dev/null | grep -q ":${NODE_PORT} "; then
+  if ss -tlnp 2>/dev/null | grep -qE ":${NODE_PORT}\\b"; then
     ok "Нода слушает порт ${NODE_PORT}"
   else
-    warn "Порт ${NODE_PORT} пока может подниматься — проверьте через пару секунд"
+    warn "Порт ${NODE_PORT} пока может подниматься — проверьте: ss -tlnp | grep ${NODE_PORT}"
   fi
 
   info "7️⃣  Установка команды управления"
@@ -1458,7 +1580,7 @@ install_selfsteal() {
   fi
 
   # Обновим локальную RU-копию перед запуском
-  install_self_cli >/dev/null 2>&1 || true
+  RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
 
   echo -e "  ${WHITE}🌐 Веб-сервер:${NC}"
   echo -e "    ${WHITE}1)${NC} 🟩 Caddy   ${GRAY}(проще, авто-SSL)${NC}"
@@ -1611,7 +1733,8 @@ apply_custom_xray_patch() {
   if grep -q 'custom-xray/xray:/usr/local/bin/xray' "$COMPOSE"; then
     info "Volume уже есть в docker-compose.yml"
   else
-    python3 - "$COMPOSE" "$CUSTOM_XRAY_DIR" <<'PY'
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - "$COMPOSE" "$CUSTOM_XRAY_DIR" <<'PY'
 import sys, re
 path, xdir = sys.argv[1], sys.argv[2]
 mount = f"      - '{xdir}/xray:/usr/local/bin/xray:ro'\n"
@@ -1619,19 +1742,25 @@ with open(path) as f:
     content = f.read()
 if "custom-xray/xray:/usr/local/bin/xray" in content:
     sys.exit(0)
-# Если есть секция volumes — вставляем сразу после строки volumes:
 m = re.search(r'(^[ \t]*volumes:[ \t]*\n)', content, re.M)
 if m:
     pos = m.end()
     content = content[:pos] + mount + content[pos:]
 else:
-    # Добавляем секцию в конец сервиса remnanode
     if not content.endswith("\n"):
         content += "\n"
     content += "    volumes:\n" + mount
 with open(path, "w") as f:
     f.write(content)
 PY
+    else
+      # fallback без python3: вставить mount после volumes: или добавить секцию
+      if grep -qE '^[[:space:]]*volumes:' "$COMPOSE"; then
+        sed -i "/^[[:space:]]*volumes:/a\\${mount_line}" "$COMPOSE"
+      else
+        printf '\n    volumes:\n%s\n' "$mount_line" >> "$COMPOSE"
+      fi
+    fi
     ok "Volume добавлен в docker-compose.yml"
   fi
 
@@ -1694,16 +1823,29 @@ systemctl daemon-reload"
   esac
 
   info "☁️  Добавляю репозиторий Cloudflare WARP…"
-  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
-    gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+  local _wg_tmp
+  _wg_tmp=$(mktemp /tmp/rn-warp-gpg.XXXXXX)
+  if ! curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+      | gpg --batch --yes --dearmor -o "$_wg_tmp" 2>/dev/null; then
+    rm -f "$_wg_tmp"
+    err "Не удалось скачать GPG-ключ Cloudflare WARP"
+  fi
+  install -m 0644 "$_wg_tmp" /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+  rm -f "$_wg_tmp"
   echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${warp_codename} main" \
     > /etc/apt/sources.list.d/cloudflare-client.list
+  apt_wait_locks 180 || true
   if ! apt_update_safe; then
-    err "apt update после добавления Cloudflare-репозитория не удался"
+    warn "apt update после Cloudflare-репо не удался — повтор…"
+    apt_wait_locks 180 || true
+    if ! apt_update_safe; then
+      err "apt update после добавления Cloudflare-репозитория не удался"
+    fi
   fi
   ok "Репозиторий Cloudflare"
 
-  run_step "Установка cloudflare-warp" "apt-get install -y -qq cloudflare-warp"
+  apt_wait_locks 120 || true
+  run_step "Установка cloudflare-warp" "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp"
 
   # /32 VPS fix
   local iface prefix
@@ -1717,14 +1859,20 @@ systemctl daemon-reload"
   fi
 
   sleep 3
-  run_step "Регистрация WARP" \
-"warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
-warp-cli --accept-tos registration new >/dev/null 2>&1 || (sleep 3 && warp-cli --accept-tos registration new >/dev/null 2>&1) || true"
-
-  run_step "Режим SOCKS5 :${WARP_PORT}" \
-"warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
-warp-cli --accept-tos proxy port $WARP_PORT >/dev/null 2>&1 || true
-warp-cli --accept-tos connect >/dev/null 2>&1 || true"
+  info "Регистрация и подключение WARP…"
+  warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+  if ! warp-cli --accept-tos registration new >/dev/null 2>&1; then
+    sleep 3
+    if ! warp-cli --accept-tos registration new >/dev/null 2>&1; then
+      warn "Регистрация WARP не удалась — проверьте: warp-cli registration new"
+    fi
+  fi
+  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
+  warp-cli --accept-tos proxy port "$WARP_PORT" >/dev/null 2>&1 || true
+  if ! warp-cli --accept-tos connect >/dev/null 2>&1; then
+    sleep 2
+    warp-cli --accept-tos connect >/dev/null 2>&1 || warn "WARP connect не удался"
+  fi
 
   cat > /usr/local/bin/warp-fix-network.sh <<'FIXSCRIPT'
 #!/bin/bash
@@ -1757,15 +1905,28 @@ SYSTEMD
   systemctl daemon-reload
   systemctl enable warp-auto >/dev/null 2>&1 || true
 
-  local warp_ip
-  warp_ip=$(curl -s --max-time 10 --socks5 "127.0.0.1:${WARP_PORT}" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
+  local warp_ip warp_ok=0
+  sleep 2
+  if ss -tlnp 2>/dev/null | grep -qE ":${WARP_PORT}\\b"; then
+    warp_ok=1
+  fi
+  warp_ip=$(curl -s --max-time 10 --socks5 "127.0.0.1:${WARP_PORT}" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2 || true)
 
   echo
-  echo -e "${GREEN}${BOLD}"
-  echo "  ╔════════════════════════════════════════════════════╗"
-  echo "  ║        ✅  WARP УСТАНОВЛЕН                        ║"
-  echo "  ╚════════════════════════════════════════════════════╝"
-  echo -e "${NC}"
+  if [[ "$warp_ok" -eq 1 && -n "$warp_ip" ]]; then
+    echo -e "${GREEN}${BOLD}"
+    echo "  ╔════════════════════════════════════════════════════╗"
+    echo "  ║        ✅  WARP УСТАНОВЛЕН И РАБОТАЕТ             ║"
+    echo "  ╚════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+  else
+    echo -e "${YELLOW}${BOLD}"
+    echo "  ╔════════════════════════════════════════════════════╗"
+    echo "  ║     ⚠️  WARP УСТАНОВЛЕН, НО SOCKS ЕЩЁ НЕ ГОТОВ    ║"
+    echo "  ╚════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    warn "Проверьте: warp-cli status && ss -tlnp | grep ${WARP_PORT}"
+  fi
   echo -e "  SOCKS5:  ${CYAN}127.0.0.1:${WARP_PORT}${NC}"
   [[ -n "$warp_ip" ]] && echo -e "  CF IP:   ${CYAN}${warp_ip}${NC}"
   echo -e "  Статус:  ${CYAN}warp-cli status${NC}"
@@ -1926,7 +2087,12 @@ setup_ufw() {
   local panel_ip node_port ssh_port
   panel_ip=$(cat "$DIR/.panel_ip" 2>/dev/null || echo "$PANEL_IP_DEFAULT")
   node_port=$(cat "$DIR/.node_port" 2>/dev/null || echo "3000")
-  ssh_port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -1)
+  # Надёжнее: порт из sshd_config, затем ss
+  ssh_port=$(grep -E '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null \
+    | awk '{print $2}' | tail -1)
+  if [[ -z "$ssh_port" ]]; then
+    ssh_port=$(ss -tlnp 2>/dev/null | awk '/sshd|ssh\.service/ {print $4}' | sed 's/.*://' | head -1)
+  fi
   ssh_port=${ssh_port:-22}
 
   echo -e "  ${WHITE}1)${NC} 🛡️  Быстрая защита ноды (SSH + NODE_PORT с панели + 443)"
@@ -1945,10 +2111,14 @@ setup_ufw() {
       ask "🌐 IP панели" panel_ip "$panel_ip"
       ask "🔌 NODE_PORT" node_port "$node_port"
       ask "🔑 SSH порт" ssh_port "$ssh_port"
+      info "Обнаружен SSH-порт: ${ssh_port} — убедитесь, что верный (иначе lockout!)"
       ask_yes_no "Открыть 443/tcp+udp (Reality/Hysteria)?" p443 Y
       ask_yes_no "Открыть 80/tcp (ACME/Selfsteal)?" p80 N
+      ask_yes_no "⚠️  Сбросить все правила UFW (ufw reset)?" do_reset N
 
-      ufw --force reset >/dev/null 2>&1 || true
+      if [[ "$do_reset" =~ ^[Yy]$ ]]; then
+        ufw --force reset >/dev/null 2>&1 || true
+      fi
       ufw default deny incoming
       ufw default allow outgoing
       ufw allow "${ssh_port}/tcp" comment 'SSH'
@@ -2109,7 +2279,8 @@ speedtest_capture() {
   ok "Результат сохранён"
   info "Последний:  ${SPEEDTEST_LAST}"
   info "История:    ${SPEEDTEST_LOG}"
-  return "$rc"
+  # Не валим интерактивное меню из‑за ненулевого кода теста
+  return 0
 }
 
 show_speedtest_last() {
@@ -2214,24 +2385,22 @@ run_dns_test() {
   for r in "${resolvers[@]}"; do
     echo -e "  ${WHITE}Резолвер ${r}${NC}"
     for d in "${domains[@]}"; do
-      t0=$(date +%s%N)
-      if getent hosts "$d" >/dev/null 2>&1 || dig @"$r" +short +time=2 +tries=1 "$d" >/dev/null 2>&1; then
-        t1=$(date +%s%N)
-        ms=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", (b-a)/1000000}')
-        # Более точный замер через dig, если есть
-        if command -v dig >/dev/null 2>&1; then
-          local dig_ms
-          dig_ms=$(dig @"$r" +stats +time=2 +tries=1 "$d" 2>/dev/null | awk '/Query time:/ {print $4; exit}')
-          if [[ -n "$dig_ms" ]]; then
-            printf "     %-22s ${GREEN}%s ms${NC}\n" "$d" "$dig_ms"
-          else
-            printf "     %-22s ${YELLOW}%s ms${NC}\n" "$d" "$ms"
-          fi
-        else
-          printf "     %-22s ${GREEN}ok${NC} (~%s ms)\n" "$d" "$ms"
+      local dig_ms="" ok_r=0
+      if command -v dig >/dev/null 2>&1; then
+        dig_ms=$(dig @"$r" +stats +time=2 +tries=1 "$d" 2>/dev/null | awk '/Query time:/ {print $4; exit}')
+        if [[ -n "$dig_ms" ]]; then
+          ok_r=1
+          printf "     %-22s ${GREEN}%s ms${NC}\n" "$d" "$dig_ms"
         fi
-      else
-        printf "     %-22s ${RED}fail${NC}\n" "$d"
+      fi
+      if [[ "$ok_r" -eq 0 ]]; then
+        # fallback: dig +short или getent (без привязки к резолверу)
+        if dig @"$r" +short +time=2 +tries=1 "$d" >/dev/null 2>&1 \
+          || host "$d" "$r" >/dev/null 2>&1; then
+          printf "     %-22s ${GREEN}ok${NC}\n" "$d"
+        else
+          printf "     %-22s ${RED}fail${NC}\n" "$d"
+        fi
       fi
     done
     echo
@@ -2497,8 +2666,8 @@ system_menu() {
     show_header
     echo -e "${WHITE}${BOLD}  🛠️  Система и защита${NC}"
     hline 56
-    echo -e "  SWAP:  $(service_badge swap)"
-    echo -e "  UFW:   $(service_badge ufw)"
+    echo -e "  SWAP:  $(service_status_text swap)"
+    echo -e "  UFW:   $(service_status_text ufw)"
     echo
     echo -e "  ${WHITE}1)${NC} 💾 SWAP — создать / удалить"
     echo -e "  ${WHITE}2)${NC} 🛡️  UFW и порты"
@@ -2566,7 +2735,7 @@ node_status_screen() {
 }
 
 remnanode_menu() {
-  install_self_cli >/dev/null 2>&1 || true
+  RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
 
   while true; do
     PUBLIC_IP=$(get_public_ip)
@@ -2685,8 +2854,9 @@ remnanode_menu() {
 }
 
 live_panel() {
-  trap 'return 0' INT
-  while true; do
+  local _live_stop=0
+  trap '_live_stop=1' INT
+  while (( _live_stop == 0 )); do
     ui_clear
     echo -e "${BLUE}${BOLD}  📺 LIVE PANEL${NC}  ${GRAY}(Ctrl+C — в меню)${NC}"
     hline 56
@@ -2729,15 +2899,18 @@ live_panel() {
       RX1=$(cat /sys/class/net/$IFACE/statistics/rx_bytes)
       TX1=$(cat /sys/class/net/$IFACE/statistics/tx_bytes)
       sleep 1
+      (( _live_stop == 1 )) && break
       RX2=$(cat /sys/class/net/$IFACE/statistics/rx_bytes)
       TX2=$(cat /sys/class/net/$IFACE/statistics/tx_bytes)
       printf "\n  %-6s  RX: %6s KB/s   TX: %6s KB/s\n" "$IFACE" "$(( (RX2-RX1)/1024 ))" "$(( (TX2-TX1)/1024 ))"
     else
       sleep 1
     fi
+    (( _live_stop == 1 )) && break
     sleep 1
   done
   trap - INT
+  return 0
 }
 
 ###############################################################################
@@ -2745,7 +2918,7 @@ live_panel() {
 ###############################################################################
 main_menu() {
   # Чтобы команда remnanode была доступна сразу
-  install_self_cli >/dev/null 2>&1 || true
+  RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
 
   while true; do
     PUBLIC_IP=$(get_public_ip)
@@ -2793,8 +2966,13 @@ main_menu() {
 ###############################################################################
 # Точка входа
 ###############################################################################
-# Снимаем ERR-trap для интерактивных меню (иначе Ctrl+C / cancel ломают UI)
 entry_name="$(basename "${BASH_SOURCE[0]:-$0}")"
+
+# Мягкий режим для меню: ошибка команды не убивает весь UI
+_menu_soft_mode() {
+  set +e
+  trap - ERR
+}
 
 # Стиль DigneZzZ: bash <(curl …) @ install  →  меню лаунчера (не установка ноды)
 if [[ "${1:-}" == "@" ]]; then
@@ -2803,8 +2981,9 @@ fi
 
 case "${1:-}" in
   # @ install / install — поставить CLI и открыть главное меню
-  install|launcher)
-    install_self_cli >/dev/null 2>&1 || true
+  install|launcher|menu)
+    _menu_soft_mode
+    RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
     main_menu
     ;;
   install-remnanode)           install_remnanode ;;
@@ -2813,10 +2992,10 @@ case "${1:-}" in
   fix-hysteria|fix-online)    fix_hysteria2_online ;;
   install-warp)                install_warp ;;
   install-mtproto|mtproto)     install_mtproto ;;
-  swap)                        setup_swap ;;
-  ufw|firewall)                setup_ufw ;;
+  swap)                        _menu_soft_mode; setup_swap ;;
+  ufw|firewall)                _menu_soft_mode; setup_ufw ;;
   tune|performance)            apply_performance_tuning ;;
-  tests|test)                  tests_menu ;;
+  tests|test)                  _menu_soft_mode; tests_menu ;;
   up)
     cd "$DIR" && docker compose up -d
     ;;
@@ -2837,12 +3016,11 @@ case "${1:-}" in
     cd "$DIR" && docker compose pull && docker compose up -d
     ;;
   manage|node|panel)
+    _menu_soft_mode
     remnanode_menu
     ;;
-  menu)
-    main_menu
-    ;;
   *)
+    _menu_soft_mode
     if [[ "$entry_name" == "remnanode" ]]; then
       remnanode_menu
     else
