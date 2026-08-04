@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.7.20
+# Версия: 2026.8.4
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.7.20"
+_REMNANODE_VER="2026.8.4"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -383,7 +383,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.7.20}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.8.4}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -440,7 +440,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.7.20"
+  [[ -n "$v" ]] || v="2026.8.4"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -451,7 +451,7 @@ launcher_version() {
 show_header() {
   ui_clear
   # Жёстко фиксируем версию на каждом показе шапки (защита от пустого env)
-  _REMNANODE_VER="2026.7.20"
+  _REMNANODE_VER="2026.8.4"
   RN_VERSION="$_REMNANODE_VER"
   SCRIPT_VERSION="$_REMNANODE_VER"
   local ver="$_REMNANODE_VER"
@@ -485,9 +485,10 @@ service_status_text() {
   local name="$1"
   case "$name" in
     remnanode)
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+      # /opt/remnanode есть и у лаунчера (installer.sh) — это НЕ установка ноды
+      if is_remnanode_up; then
         echo "работает"
-      elif [[ -f "$COMPOSE" ]] || [[ -d "$DIR" ]]; then
+      elif is_remnanode_installed; then
         echo "установлен"
       else
         echo "не установлен"
@@ -572,9 +573,9 @@ service_status_text() {
       fi
       ;;
     node_cli)
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+      if is_remnanode_up; then
         echo "нода online"
-      elif [[ -f "$COMPOSE" ]]; then
+      elif is_remnanode_installed; then
         echo "нода offline"
       elif [[ -x "$CLI_PATH" ]] || command -v remnanode >/dev/null 2>&1; then
         echo "только CLI"
@@ -1046,10 +1047,16 @@ install_docker() {
   else
     info "🐳 Добавляю репозиторий Docker…"
     install -m 0755 -d /etc/apt/keyrings
+    # без интерактива: gpg иначе спрашивает Overwrite? если ключ уже есть
+    local _dk_tmp
+    _dk_tmp=$(mktemp /tmp/rn-docker-gpg.XXXXXX)
     if ! curl -fsSL "https://download.docker.com/linux/${ID}/gpg" \
-        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
+        | gpg --batch --yes --dearmor -o "$_dk_tmp" 2>/dev/null; then
+      rm -f "$_dk_tmp"
       err "Не удалось скачать GPG-ключ Docker"
     fi
+    install -m 0644 "$_dk_tmp" /etc/apt/keyrings/docker.gpg
+    rm -f "$_dk_tmp"
     chmod a+r /etc/apt/keyrings/docker.gpg
     echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
@@ -1059,7 +1066,7 @@ install_docker() {
     ok "Репозиторий Docker"
 
     run_step "Установка Docker" \
-"apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
  systemctl enable docker && systemctl start docker"
   fi
 
@@ -1121,15 +1128,42 @@ install_self_cli() {
 ###############################################################################
 # REMNANODE — установка (своя стабильная, не из DigneZzZ)
 ###############################################################################
-is_remnanode_installed() { [[ -f "$COMPOSE" ]] || [[ -d "$DIR" ]]; }
+# Нода установлена только при реальных артефактах compose/.env/контейнере.
+# Один каталог /opt/remnanode НЕ считается установкой: туда кладётся лаунчер.
+is_remnanode_installed() {
+  if [[ -f "$COMPOSE" ]] && grep -qE 'container_name:[[:space:]]*remnanode|remnawave/node' "$COMPOSE" 2>/dev/null; then
+    return 0
+  fi
+  if [[ -f "$ENV_FILE" ]] && grep -qE '^SECRET_KEY=' "$ENV_FILE" 2>/dev/null; then
+    return 0
+  fi
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+    return 0
+  fi
+  return 1
+}
 is_remnanode_up() { docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; }
+
+# Удалить только файлы ноды; лаунчер (installer.sh / selfsteal.sh) оставляем
+_remove_remnanode_files() {
+  if [[ -f "$COMPOSE" ]]; then
+    (cd "$DIR" && docker compose down -v 2>/dev/null) || true
+  fi
+  docker rm -f remnanode 2>/dev/null || true
+  rm -f "$COMPOSE" "$ENV_FILE" \
+    "$DIR/.panel_ip" "$DIR/.node_port" 2>/dev/null || true
+  rm -rf "$CUSTOM_XRAY_DIR" 2>/dev/null || true
+}
 
 remove_existing_remnanode() {
   warn "Найдена существующая установка Remnanode."
   echo
-  [[ -d "$DIR" ]] && echo -e "    • 📁 Директория: ${GRAY}$DIR${NC}"
+  [[ -f "$COMPOSE" ]] && echo -e "    • 📄 Compose: ${GRAY}$COMPOSE${NC}"
+  [[ -f "$ENV_FILE" ]] && echo -e "    • 🔐 .env: ${GRAY}$ENV_FILE${NC}"
   if is_remnanode_up; then
-    echo -e "    • 🐳 Контейнер: ${GRAY}remnanode${NC}"
+    echo -e "    • 🐳 Контейнер: ${GRAY}remnanode (online)${NC}"
+  elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+    echo -e "    • 🐳 Контейнер: ${GRAY}remnanode (stopped)${NC}"
   fi
   echo
   local ans=""
@@ -1140,13 +1174,7 @@ remove_existing_remnanode() {
   fi
   echo
   info "🧹 Удаляю старую установку…"
-  if [[ -f "$COMPOSE" ]]; then
-    run_step "Остановка контейнера" "cd '$DIR' && docker compose down -v 2>/dev/null || true"
-  fi
-  docker rm -f remnanode 2>/dev/null || true
-  if [[ -d "$DIR" ]]; then
-    run_step "Удаление файлов" "rm -rf '$DIR'"
-  fi
+  run_step "Остановка и очистка ноды" "_remove_remnanode_files"
   ok "Старая установка удалена"
   echo
   return 0
@@ -2478,10 +2506,8 @@ remnanode_menu() {
         if is_remnanode_installed; then
           ask_yes_no "🗑️  Точно удалить RemnaNode?" ans N
           if [[ "$ans" =~ ^[Yy]$ ]]; then
-            cd "$DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true
-            docker rm -f remnanode 2>/dev/null || true
-            rm -rf "$DIR"
-            ok "Удалено"
+            _remove_remnanode_files
+            ok "Удалено (лаунчер в /opt/remnanode сохранён)"
           fi
         else
           warn "Не установлено"
