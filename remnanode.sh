@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.6
+# Версия: 2026.8.7
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.6"
+_REMNANODE_VER="2026.8.7"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -406,7 +406,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.8.6}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.8.7}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -477,7 +477,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.8.6"
+  [[ -n "$v" ]] || v="2026.8.7"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -624,6 +624,17 @@ service_status_text() {
         echo "не применён"
       fi
       ;;
+    antiddos)
+      if antiddos_active; then
+        if [[ -f "$DDOS_CONF" ]] && grep -q '^SYNPROXY=1' "$DDOS_CONF" 2>/dev/null; then
+          echo "SYNPROXY"
+        else
+          echo "активен"
+        fi
+      else
+        echo "не активен"
+      fi
+      ;;
     node_cli)
       if is_remnanode_up; then
         echo "нода online"
@@ -643,7 +654,7 @@ service_badge_color() {
   local name="$1" text
   text=$(service_status_text "$name")
   case "$text" in
-    "работает"|"подключён"|"настроено"|"патч активен"|"BBR включён"|"нода online")
+    "работает"|"подключён"|"настроено"|"патч активен"|"BBR включён"|"нода online"|"SYNPROXY")
       _badge "$GREEN" "$text"
       ;;
     активен*)
@@ -652,7 +663,7 @@ service_badge_color() {
     "установлен"|"ядро скачано"|"частично"|"выключен"|"только CLI"|"нода offline")
       _badge "$YELLOW" "$text"
       ;;
-    "не установлен"|"не настроено"|"не применён"|"не создан"|"не настроен"|"нет CLI"|"неизвестно")
+    "не установлен"|"не настроено"|"не применён"|"не создан"|"не настроен"|"нет CLI"|"неизвестно"|"не активен")
       _badge "$RED" "$text"
       ;;
     *)
@@ -1075,9 +1086,22 @@ net.ipv4.tcp_moderate_rcvbuf = 1
 net.core.somaxconn = $BACKLOG
 net.core.netdev_max_backlog = $BACKLOG
 net.ipv4.tcp_max_syn_backlog = $BACKLOG
+
+# --- Анти-DDoS: защита от SYN-флуда (L4) ---
+# syncookies спасают, когда очередь SYN переполнена флудом
 net.ipv4.tcp_syncookies = 1
+# меньше повторов SYN/ACK — быстрее отбрасываем полуоткрытые соединения
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_syn_retries = 3
+# защита от старых/дублей SYN в TIME_WAIT (RFC1337)
+net.ipv4.tcp_rfc1337 = 1
+# не завышаем max_orphans, чтобы флуд не съедал память
+net.ipv4.tcp_max_orphans = 262144
+# быстрее убирать полуоткрытые в conntrack (SYN_RECV)
+net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 20
+net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 20
+# не считать соединение invalid при потере пакета под флудом
+net.netfilter.nf_conntrack_tcp_loose = 1
 
 # Буферы (критично для Reality / Hysteria2 / высоких скоростей)
 net.core.rmem_default = 1048576
@@ -1198,6 +1222,288 @@ systemctl enable irqbalance >/dev/null 2>&1 && systemctl restart irqbalance || t
   fi
 
   ok "Тюнинг производительности применён"
+}
+
+###############################################################################
+# Анти-DDoS (L4): nftables — SYN-флуд, мусорные пакеты, пер-IP лимиты
+# Совместимо с Remnawave: policy accept, режем только явный мусор и флуд.
+###############################################################################
+DDOS_DIR="/etc/remnanode"
+DDOS_RULES="$DDOS_DIR/ddos.nft"
+DDOS_CONF="$DDOS_DIR/ddos.conf"
+DDOS_UNIT="/etc/systemd/system/remna-ddos.service"
+DDOS_TABLE="remna_ddos"
+
+# Значения по умолчанию (щедрые, чтобы не резать легитимных VPN-клиентов)
+DDOS_SYN_RATE_DEFAULT=60        # новых SYN в секунду с одного IP
+DDOS_SYN_BURST_DEFAULT=120
+DDOS_CONN_PER_IP_DEFAULT=400    # одновременных соединений с одного IP
+DDOS_GLOBAL_SYN_DEFAULT=15000   # глобальный потолок новых SYN/с (бэкстоп)
+DDOS_ICMP_RATE_DEFAULT=50
+
+antiddos_active() {
+  command -v nft >/dev/null 2>&1 || return 1
+  nft list table inet "$DDOS_TABLE" >/dev/null 2>&1
+}
+
+# Собрать список защищаемых TCP-портов (нода + типовые VPN + SSH)
+_ddos_service_ports() {
+  local node_port ssh_port ports
+  node_port=$(cat "$DIR/.node_port" 2>/dev/null || echo "")
+  ssh_port=$(grep -E '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)
+  [[ -z "$ssh_port" ]] && ssh_port=22
+  ports="22, 80, 443"
+  [[ -n "$ssh_port" && "$ssh_port" != "22" ]] && ports="$ports, $ssh_port"
+  [[ -n "$node_port" ]] && ports="$ports, $node_port"
+  # уникализируем
+  echo "$ports" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -E '^[0-9]+$' \
+    | sort -un | paste -sd, -
+}
+
+_ddos_write_rules() {
+  local syn_rate="$1" syn_burst="$2" conn_ip="$3" gsyn="$4" icmp_rate="$5" synproxy="$6"
+  local ports mss
+  ports=$(_ddos_service_ports)
+  [[ -z "$ports" ]] && ports="22, 80, 443"
+  mss=1400
+
+  mkdir -p "$DDOS_DIR"
+
+  local synproxy_pre="" synproxy_in=""
+  if [[ "$synproxy" == "1" ]]; then
+    synproxy_pre="
+    # SYNPROXY: не трекать входящие SYN до валидации (снимает нагрузку с conntrack)
+    chain pre_synproxy {
+        type filter hook prerouting priority raw; policy accept;
+        tcp dport { ${ports} } tcp flags syn / fin,syn,rst,ack ct state new notrack
+    }"
+    synproxy_in="
+        # SYNPROXY на сервисных портах — аппаратно-подобная защита от SYN-флуда
+        tcp dport { ${ports} } tcp flags syn / fin,syn,rst,ack ct state untracked synproxy mss ${mss} wscale 7 timestamp sack-perm
+        tcp dport { ${ports} } ct state invalid drop"
+  fi
+
+  cat > "$DDOS_RULES" <<NFT
+#!/usr/sbin/nft -f
+# remnanode anti-DDoS (L4). policy accept — режем только мусор и флуд.
+# Управление: команда remnanode → меню → Анти-DDoS
+table inet ${DDOS_TABLE}
+delete table inet ${DDOS_TABLE}
+table inet ${DDOS_TABLE} {
+${synproxy_pre}
+    chain input {
+        type filter hook input priority mangle; policy accept;
+
+        # loopback и уже установленные соединения — не трогаем
+        iif "lo" accept
+        ct state established,related accept
+
+        # битые/фейковые пакеты conntrack
+        ct state invalid drop
+${synproxy_in}
+
+        # Мусорные комбинации TCP-флагов (сканеры/флуд)
+        tcp flags & (fin|syn) == (fin|syn) drop
+        tcp flags & (syn|rst) == (syn|rst) drop
+        tcp flags & (fin|rst) == (fin|rst) drop
+        tcp flags & (fin|ack) == fin drop
+        tcp flags & (ack|urg) == urg drop
+        tcp flags & (fin|syn|rst|psh|ack|urg) == 0 drop
+        tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|syn|rst|psh|ack|urg) drop
+
+        # Глобальный бэкстоп по новым SYN (до syncookies)
+        tcp flags syn / fin,syn,rst,ack ct state new limit rate over ${gsyn}/second burst 5000 packets drop
+
+        # Пер-IP лимит новых SYN на сервисные порты (анти SYN-флуд с одного источника)
+        tcp dport { ${ports} } tcp flags syn / fin,syn,rst,ack ct state new \\
+            meter syn_per_ip { ip saddr limit rate over ${syn_rate}/second burst ${syn_burst} packets } drop
+        tcp dport { ${ports} } tcp flags syn / fin,syn,rst,ack ct state new \\
+            meter syn6_per_ip { ip6 saddr limit rate over ${syn_rate}/second burst ${syn_burst} packets } drop
+
+        # Пер-IP лимит одновременных соединений
+        tcp dport { ${ports} } ct state new \\
+            meter conn_per_ip { ip saddr ct count over ${conn_ip} } drop
+        tcp dport { ${ports} } ct state new \\
+            meter conn6_per_ip { ip6 saddr ct count over ${conn_ip} } drop
+
+        # ICMP: пинг разрешён, но с ограничением скорости
+        ip protocol icmp icmp type echo-request limit rate over ${icmp_rate}/second burst 100 packets drop
+        ip6 nexthdr icmpv6 icmpv6 type echo-request limit rate over ${icmp_rate}/second burst 100 packets drop
+    }
+}
+NFT
+  chmod 0644 "$DDOS_RULES"
+
+  cat > "$DDOS_CONF" <<CONF
+SYN_RATE=${syn_rate}
+SYN_BURST=${syn_burst}
+CONN_PER_IP=${conn_ip}
+GLOBAL_SYN=${gsyn}
+ICMP_RATE=${icmp_rate}
+SYNPROXY=${synproxy}
+PORTS=${ports}
+CONF
+}
+
+_ddos_write_unit() {
+  cat > "$DDOS_UNIT" <<UNIT
+[Unit]
+Description=Remnanode anti-DDoS (nftables L4)
+After=network-online.target nftables.service docker.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f ${DDOS_RULES}
+ExecStop=/usr/sbin/nft delete table inet ${DDOS_TABLE}
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload 2>/dev/null || true
+}
+
+_ddos_load_synproxy_modules() {
+  modprobe nf_synproxy 2>/dev/null || modprobe nft_synproxy 2>/dev/null || true
+  # для корректной работы SYNPROXY нужны syncookies + timestamps
+  sysctl -qw net.ipv4.tcp_syncookies=1 2>/dev/null || true
+  sysctl -qw net.ipv4.tcp_timestamps=1 2>/dev/null || true
+}
+
+apply_antiddos() {
+  local synproxy="${1:-0}"
+  local syn_rate="${2:-$DDOS_SYN_RATE_DEFAULT}"
+  local syn_burst="${3:-$DDOS_SYN_BURST_DEFAULT}"
+  local conn_ip="${4:-$DDOS_CONN_PER_IP_DEFAULT}"
+  local gsyn="${5:-$DDOS_GLOBAL_SYN_DEFAULT}"
+  local icmp_rate="${6:-$DDOS_ICMP_RATE_DEFAULT}"
+
+  if ! command -v nft >/dev/null 2>&1; then
+    info "Устанавливаю nftables…"
+    apt_wait_locks 120 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables || {
+      err "Не удалось установить nftables"
+    }
+  fi
+
+  if [[ "$synproxy" == "1" ]]; then
+    _ddos_load_synproxy_modules
+  fi
+
+  _ddos_write_rules "$syn_rate" "$syn_burst" "$conn_ip" "$gsyn" "$icmp_rate" "$synproxy"
+
+  # Пробная загрузка правил
+  if ! nft -f "$DDOS_RULES" 2>/tmp/rn-ddos.err; then
+    warn "nft отклонил правила — подробности:"
+    sed 's/^/    /' /tmp/rn-ddos.err >"$_TTY" 2>/dev/null || cat /tmp/rn-ddos.err || true
+    if [[ "$synproxy" == "1" ]]; then
+      warn "Пробую без SYNPROXY (ядро/VPS может не поддерживать)…"
+      _ddos_write_rules "$syn_rate" "$syn_burst" "$conn_ip" "$gsyn" "$icmp_rate" "0"
+      nft -f "$DDOS_RULES" 2>/tmp/rn-ddos.err || {
+        err "Не удалось применить правила анти-DDoS"
+      }
+      synproxy=0
+    else
+      err "Не удалось применить правила анти-DDoS"
+    fi
+  fi
+
+  _ddos_write_unit
+  systemctl enable remna-ddos.service >/dev/null 2>&1 || true
+
+  ok "Анти-DDoS активирован"
+  echo
+  echo -e "  ${WHITE}Параметры защиты:${NC}"
+  echo -e "    • SYN/с на IP:        ${CYAN}${syn_rate}${NC} (burst ${syn_burst})"
+  echo -e "    • Соединений на IP:   ${CYAN}${conn_ip}${NC}"
+  echo -e "    • Глобальный SYN/с:   ${CYAN}${gsyn}${NC}"
+  echo -e "    • ICMP echo/с:        ${CYAN}${icmp_rate}${NC}"
+  if [[ "$synproxy" == "1" ]]; then
+    echo -e "    • SYNPROXY:           ${GREEN}включён${NC}"
+  else
+    echo -e "    • SYNPROXY:           ${GRAY}выключен${NC}"
+  fi
+  echo -e "    • Порты:              ${GRAY}$(_ddos_service_ports)${NC}"
+  echo
+  info "Правила сохранены: ${DDOS_RULES} (автозагрузка после ребута)"
+}
+
+disable_antiddos() {
+  nft delete table inet "$DDOS_TABLE" 2>/dev/null || true
+  systemctl disable remna-ddos.service >/dev/null 2>&1 || true
+  rm -f "$DDOS_UNIT" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  rm -f "$DDOS_RULES" "$DDOS_CONF" 2>/dev/null || true
+  ok "Анти-DDoS отключён, правила удалены"
+}
+
+show_antiddos_status() {
+  echo -e "  ${WHITE}Состояние анти-DDoS:${NC}"
+  if antiddos_active; then
+    echo -e "    ${GREEN}● Активен${NC}"
+    if [[ -f "$DDOS_CONF" ]]; then
+      sed 's/^/      /' "$DDOS_CONF"
+    fi
+    echo
+    echo -e "  ${WHITE}Счётчики (drop-правила):${NC}"
+    nft list table inet "$DDOS_TABLE" 2>/dev/null | grep -E 'drop|synproxy' | sed 's/^/    /' | head -30 || true
+  else
+    echo -e "    ${GRAY}○ Не активен${NC}"
+  fi
+}
+
+setup_antiddos() {
+  show_header
+  echo -e "${WHITE}${BOLD}  🛡️  Анти-DDoS (L4 / SYN-флуд)${NC}"
+  hline 56
+  echo
+  info "nftables-защита от SYN-флуда и мусорного L4-трафика."
+  info "Политика accept — режем только явный флуд/мусор, панель работает штатно."
+  echo
+  show_antiddos_status
+  echo
+  echo -e "  ${WHITE}1)${NC} 🛡️  Включить защиту ${GRAY}(рекомендуемые лимиты)${NC}"
+  echo -e "  ${WHITE}2)${NC} 🚀 Включить + SYNPROXY ${GRAY}(максимум против SYN-флуда)${NC}"
+  echo -e "  ${WHITE}3)${NC} 🎚️  Включить со своими лимитами"
+  echo -e "  ${WHITE}4)${NC} 📊 Показать статус и счётчики"
+  echo -e "  ${WHITE}5)${NC} ♻️  Перезагрузить правила (после смены портов)"
+  echo -e "  ${WHITE}6)${NC} ⛔ Отключить защиту"
+  echo -e "  ${GRAY}0)${NC} 🔙 Назад"
+  echo
+  ask_choice ch
+
+  case "$ch" in
+    1) apply_antiddos 0 ;;
+    2)
+      info "SYNPROXY эффективнее всего против SYN-флуда, но требует поддержки ядра."
+      apply_antiddos 1
+      ;;
+    3)
+      local sr sb cip gs ic sp
+      ask "SYN/с на один IP" sr "$DDOS_SYN_RATE_DEFAULT"
+      ask "Burst SYN на IP" sb "$DDOS_SYN_BURST_DEFAULT"
+      ask "Макс. соединений на IP" cip "$DDOS_CONN_PER_IP_DEFAULT"
+      ask "Глобальный лимит SYN/с" gs "$DDOS_GLOBAL_SYN_DEFAULT"
+      ask "ICMP echo/с" ic "$DDOS_ICMP_RATE_DEFAULT"
+      ask_yes_no "Включить SYNPROXY?" sp N
+      [[ "$sp" =~ ^[Yy]$ ]] && sp=1 || sp=0
+      apply_antiddos "$sp" "$sr" "$sb" "$cip" "$gs" "$ic"
+      ;;
+    4) show_antiddos_status ;;
+    5)
+      if [[ -f "$DDOS_CONF" ]]; then
+        # перечитать сохранённые параметры и пересобрать (порты могли измениться)
+        local SYN_RATE SYN_BURST CONN_PER_IP GLOBAL_SYN ICMP_RATE SYNPROXY
+        # shellcheck disable=SC1090
+        . "$DDOS_CONF"
+        apply_antiddos "${SYNPROXY:-0}" "${SYN_RATE}" "${SYN_BURST}" "${CONN_PER_IP}" "${GLOBAL_SYN}" "${ICMP_RATE}"
+      else
+        warn "Защита ещё не настраивалась — выберите пункт 1 или 2"
+      fi
+      ;;
+    6) disable_antiddos ;;
+    0) return 0 ;;
+    *) ;;
+  esac
 }
 
 ###############################################################################
@@ -2936,6 +3242,7 @@ main_menu() {
     menu_item "💾" "7"  "SWAP"       "файл подкачки"      swap
     menu_item "🛡️" "8"  "UFW"        "порты и защита"     ufw
     menu_item "⚙️" "9"  "Тюнинг"     "BBR / буферы / RPS" tune
+    menu_item "🧱" "12" "Анти-DDoS"  "SYN-флуд / L4"      antiddos
 
     section "🎛️  Сервис"
     menu_item "📡" "10" "Нода"       "меню управления"    node_cli
@@ -2957,6 +3264,7 @@ main_menu() {
       9)  apply_performance_tuning; pause ;;
       10) remnanode_menu ;;
       11) tests_menu ;;
+      12) setup_antiddos; pause ;;
       0)  exit 0 ;;
       *)  ;;
     esac
@@ -2995,6 +3303,10 @@ case "${1:-}" in
   swap)                        _menu_soft_mode; setup_swap ;;
   ufw|firewall)                _menu_soft_mode; setup_ufw ;;
   tune|performance)            apply_performance_tuning ;;
+  antiddos|ddos)               _menu_soft_mode; setup_antiddos ;;
+  antiddos-on|ddos-on)         apply_antiddos 0 ;;
+  antiddos-synproxy)           apply_antiddos 1 ;;
+  antiddos-off|ddos-off)       disable_antiddos ;;
   tests|test)                  _menu_soft_mode; tests_menu ;;
   up)
     cd "$DIR" && docker compose up -d
