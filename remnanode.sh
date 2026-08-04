@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.11
+# Версия: 2026.8.12
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.11"
+_REMNANODE_VER="2026.8.12"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -513,7 +513,7 @@ require_root
 
 # os-release задаёт VERSION=... — восстанавливаем версию лаунчера сразу после
 . /etc/os-release
-_REMNANODE_VER="${_REMNANODE_VER:-2026.8.11}"
+_REMNANODE_VER="${_REMNANODE_VER:-2026.8.12}"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 case "$ID" in
@@ -584,7 +584,7 @@ launcher_version() {
       v=$(grep -E '^_REMNANODE_VER=' "$src" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
     fi
   fi
-  [[ -n "$v" ]] || v="2026.8.11"
+  [[ -n "$v" ]] || v="2026.8.12"
   # Синхронизируем все имена
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
@@ -613,6 +613,18 @@ show_header() {
   _tty_printf '  %b🧠 CPU/RAM:%b   %s\n' "$WHITE" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
   _tty_printf '  %b🌐 Public IP:%b %b%s%b\n' "$WHITE" "$NC" "$CYAN" "${PUBLIC_IP:-n/a}" "$NC"
   _tty_printf '  %b🏠 Local IP:%b  %s\n' "$WHITE" "$NC" "${LOCAL_IP:-n/a}"
+  # Порт ноды из установки — сразу видно, слушает ли
+  local _np
+  _np=$(get_node_port 2>/dev/null || true)
+  if [[ -n "$_np" ]]; then
+    if is_node_port_listening "$_np"; then
+      _tty_printf '  %b🔌 NODE_PORT:%b  %b%s%b  %b[слушает]%b\n' \
+        "$WHITE" "$NC" "$CYAN" "$_np" "$NC" "$GREEN" "$NC"
+    else
+      _tty_printf '  %b🔌 NODE_PORT:%b  %b%s%b  %b[не слушает]%b\n' \
+        "$WHITE" "$NC" "$CYAN" "$_np" "$NC" "$RED" "$NC"
+    fi
+  fi
   _tty_echo ""
 }
 
@@ -627,10 +639,22 @@ service_status_text() {
   case "$name" in
     remnanode)
       # /opt/remnanode есть и у лаунчера (installer.sh) — это НЕ установка ноды
+      local np
+      np=$(get_node_port 2>/dev/null || true)
       if is_remnanode_up; then
-        echo "работает"
+        if [[ -n "$np" ]] && is_node_port_listening "$np"; then
+          echo "работает :${np}"
+        elif [[ -n "$np" ]]; then
+          echo "порт :${np} ✗"
+        else
+          echo "работает"
+        fi
       elif is_remnanode_installed; then
-        echo "установлен"
+        if [[ -n "$np" ]]; then
+          echo "офлайн :${np}"
+        else
+          echo "установлен"
+        fi
       else
         echo "не установлен"
       fi
@@ -743,10 +767,22 @@ service_status_text() {
       fi
       ;;
     node_cli)
+      local np
+      np=$(get_node_port 2>/dev/null || true)
       if is_remnanode_up; then
-        echo "нода online"
+        if [[ -n "$np" ]] && is_node_port_listening "$np"; then
+          echo "online :${np}"
+        elif [[ -n "$np" ]]; then
+          echo "online, :${np} ✗"
+        else
+          echo "нода online"
+        fi
       elif is_remnanode_installed; then
-        echo "нода offline"
+        if [[ -n "$np" ]]; then
+          echo "offline :${np}"
+        else
+          echo "нода offline"
+        fi
       elif [[ -x "$CLI_PATH" ]] || command -v remnanode >/dev/null 2>&1; then
         echo "только CLI"
       else
@@ -764,11 +800,20 @@ service_badge_color() {
     "работает"|"подключён"|"настроено"|"патч активен"|"BBR включён"|"нода online"|"SYNPROXY")
       _badge "$GREEN" "$text"
       ;;
+    работает\ :*|online\ :*)
+      _badge "$GREEN" "$text"
+      ;;
     активен*)
       _badge "$GREEN" "$text"
       ;;
     "установлен"|"ядро скачано"|"частично"|"выключен"|"только CLI"|"нода offline")
       _badge "$YELLOW" "$text"
+      ;;
+    офлайн\ :*|offline\ :*)
+      _badge "$YELLOW" "$text"
+      ;;
+    порт\ :*|online,\ :*)
+      _badge "$RED" "$text"
       ;;
     "не установлен"|"не настроено"|"не применён"|"не создан"|"не настроен"|"нет CLI"|"неизвестно"|"не активен")
       _badge "$RED" "$text"
@@ -1841,6 +1886,27 @@ install_self_cli() {
 ###############################################################################
 # REMNANODE — установка (своя стабильная, не из DigneZzZ)
 ###############################################################################
+# Порт ноды из установки (.node_port или NODE_PORT в .env)
+get_node_port() {
+  local p=""
+  if [[ -f "$DIR/.node_port" ]]; then
+    p=$(tr -dc '0-9' <"$DIR/.node_port" 2>/dev/null | head -c 8 || true)
+  fi
+  if [[ -z "$p" && -f "$ENV_FILE" ]]; then
+    p=$(grep -E '^NODE_PORT=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2 | tr -dc '0-9' || true)
+  fi
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$p"
+}
+
+# Слушает ли TCP-порт на хосте (host-network нода)
+is_node_port_listening() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  ss -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)" \
+    || ss -tln 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"
+}
+
 # Нода установлена только при реальных артефактах compose/.env/контейнере.
 # Один каталог /opt/remnanode НЕ считается установкой: туда кладётся лаунчер.
 is_remnanode_installed() {
