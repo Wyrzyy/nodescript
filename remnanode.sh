@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.14
+# Версия: 2026.8.15
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh) @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + несколько имён (env/os-release не должны её затереть)
-_REMNANODE_VER="2026.8.14"
+_REMNANODE_VER="2026.8.15"
 RN_VERSION="$_REMNANODE_VER"
 SCRIPT_VERSION="$_REMNANODE_VER"
 
@@ -613,17 +613,23 @@ show_header() {
   _tty_printf '  %b🧠 CPU/RAM:%b   %s\n' "$WHITE" "$NC" "${CPU} cores | ${RAM_MB} MB | ${ARCH}"
   _tty_printf '  %b🌐 Public IP:%b %b%s%b\n' "$WHITE" "$NC" "$CYAN" "${PUBLIC_IP:-n/a}" "$NC"
   _tty_printf '  %b🏠 Local IP:%b  %s\n' "$WHITE" "$NC" "${LOCAL_IP:-n/a}"
-  # Порт ноды из установки — сразу видно, слушает ли
+  # Порт ноды: «слушает» = процесс, «firewall» = наше OPEN (не UFW)
   local _np
   _np=$(get_node_port 2>/dev/null || true)
   if [[ -n "$_np" ]]; then
+    local _listen_lbl _fw_lbl
     if is_node_port_listening "$_np"; then
-      _tty_printf '  %b🔌 NODE_PORT:%b  %b%s%b  %b[слушает]%b\n' \
-        "$WHITE" "$NC" "$CYAN" "$_np" "$NC" "$GREEN" "$NC"
+      _listen_lbl="${GREEN}[слушает]${NC}"
     else
-      _tty_printf '  %b🔌 NODE_PORT:%b  %b%s%b  %b[не слушает]%b\n' \
-        "$WHITE" "$NC" "$CYAN" "$_np" "$NC" "$RED" "$NC"
+      _listen_lbl="${RED}[не слушает]${NC}"
     fi
+    if _ports_has OPEN tcp "$_np" 2>/dev/null; then
+      _fw_lbl="${GREEN}[firewall OPEN]${NC}"
+    else
+      _fw_lbl="${GRAY}[firewall —]${NC}"
+    fi
+    _tty_printf '  %b🔌 NODE_PORT:%b  %b%s%b  %b  %b\n' \
+      "$WHITE" "$NC" "$CYAN" "$_np" "$NC" "$_listen_lbl" "$_fw_lbl"
   fi
   _tty_echo ""
 }
@@ -1900,6 +1906,7 @@ ports_count_open() {
 
 show_ports_status() {
   echo -e "  ${WHITE}Управляемые порты (не UFW):${NC}"
+  echo -e "  ${GRAY}OPEN = firewall разрешил вход · «слушает» = процесс на порту (это разное)${NC}"
   local lines n_open=0 n_block=0
   lines=$(_ports_list)
   if [[ -z "$lines" ]]; then
@@ -1908,8 +1915,12 @@ show_ports_status() {
     while read -r kind proto port; do
       [[ -z "$kind" ]] && continue
       local listen=""
-      if [[ "$proto" == "tcp" ]] && is_node_port_listening "$port" 2>/dev/null; then
-        listen=" ${GREEN}· слушает${NC}"
+      if [[ "$proto" == "tcp" ]]; then
+        if is_node_port_listening "$port" 2>/dev/null; then
+          listen=" ${GREEN}· процесс слушает${NC}"
+        else
+          listen=" ${YELLOW}· процесс не слушает${NC}"
+        fi
       fi
       if [[ "$kind" == "OPEN" ]]; then
         n_open=$((n_open + 1))
@@ -1943,9 +1954,61 @@ ports_open() {
   local p
   for p in "${protos[@]}"; do
     _ports_add_line OPEN "$p" "$port"
-    ok "Открыт ${p^^}/${port}"
+    ok "Firewall: открыт ${p^^}/${port}"
   done
   _ports_rebuild_nft || warn "Правила сохранены, но nft не применил — см. лог"
+}
+
+# Открыть NODE_PORT для связи панели Remnawave с нодой (только TCP)
+ports_open_panel() {
+  local port=""
+  port=$(get_node_port 2>/dev/null || true)
+  if [[ -z "$port" ]]; then
+    ask "NODE_PORT ноды (для панели Remnawave)" port "3000"
+  fi
+  [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
+    warn "Нужен порт 1–65535"
+    return 1
+  }
+
+  echo
+  info "Открываю TCP/${port} для взаимодействия с Remnawave Panel…"
+  info "Это правило firewall (nftables), не запуск процесса на порту."
+  ports_open "$port" tcp
+
+  # Сохраним как известный порт ноды, если файла ещё нет
+  mkdir -p "$DIR" 2>/dev/null || true
+  if [[ ! -f "$DIR/.node_port" ]]; then
+    echo "$port" > "$DIR/.node_port" 2>/dev/null || true
+  fi
+
+  echo
+  if is_node_port_listening "$port"; then
+    ok "Порт ${port}: firewall OPEN и процесс слушает — панель может подключаться"
+  else
+    warn "Firewall OPEN для TCP/${port}, но процесс пока НЕ слушает этот порт."
+    if is_remnanode_up; then
+      warn "Контейнер remnanode запущен, но нода не приняла порт — смотрите логи / перезапуск."
+      ask_yes_no "Перезапустить контейнер remnanode?" ans N
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        if [[ -f "$COMPOSE" ]]; then
+          (cd "$DIR" && docker compose down && docker compose up -d) || warn "Перезапуск не удался"
+          sleep 3
+          if is_node_port_listening "$port"; then
+            ok "После перезапуска порт ${port} слушает"
+          else
+            warn "Всё ещё не слушает. Логи: docker logs --tail 50 remnanode"
+            docker logs --tail 30 remnanode 2>&1 | sed 's/^/    /' || true
+          fi
+        fi
+      fi
+    elif is_remnanode_installed; then
+      warn "Нода установлена, но контейнер не запущен — пункт «Нода» → Запустить."
+    else
+      warn "Нода ещё не установлена — сначала пункт 1) Remnanode."
+    fi
+  fi
+  return 0
 }
 
 ports_close() {
@@ -1985,15 +2048,22 @@ setup_ports() {
   hline 56
   echo
   info "Отдельно от UFW: своя таблица nftables (remna_ports)."
-  info "Открыть = ACCEPT · Закрыть = убрать OPEN, опционально DROP."
+  info "OPEN = разрешить вход в firewall. «Слушает» = процесс ноды на порту."
   echo
   show_ports_status
   echo
-  echo -e "  ${WHITE}1)${NC} 🔓 Открыть порт"
-  echo -e "  ${WHITE}2)${NC} 🔒 Закрыть порт"
-  echo -e "  ${WHITE}3)${NC} 📋 Список / статус"
-  echo -e "  ${WHITE}4)${NC} ♻️  Применить правила заново"
-  echo -e "  ${WHITE}5)${NC} 🗑️  Сбросить все правила портов"
+  local np
+  np=$(get_node_port 2>/dev/null || true)
+  if [[ -n "$np" ]]; then
+    echo -e "  ${WHITE}1)${NC} 📡 Открыть порт ноды для Remnawave Panel ${GRAY}(TCP/${np})${NC}"
+  else
+    echo -e "  ${WHITE}1)${NC} 📡 Открыть порт ноды для Remnawave Panel"
+  fi
+  echo -e "  ${WHITE}2)${NC} 🔓 Открыть произвольный порт"
+  echo -e "  ${WHITE}3)${NC} 🔒 Закрыть порт"
+  echo -e "  ${WHITE}4)${NC} 📋 Список / статус"
+  echo -e "  ${WHITE}5)${NC} ♻️  Применить правила заново"
+  echo -e "  ${WHITE}6)${NC} 🗑️  Сбросить все правила портов"
   echo -e "  ${GRAY}0)${NC} 🔙 Назад"
   echo
   ask_choice ch
@@ -2001,6 +2071,11 @@ setup_ports() {
   local port proto block
   case "$ch" in
     1)
+      ports_open_panel
+      echo
+      show_ports_status
+      ;;
+    2)
       ask "Номер порта" port
       [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
         warn "Нужен порт 1–65535"; return 0
@@ -2009,9 +2084,14 @@ setup_ports() {
       ask "Выбор" proto "3"
       ports_open "$port" "$proto"
       echo
+      if [[ "$proto" == "1" || "$proto" == "tcp" || "$proto" == "3" || "$proto" == "both" || -z "$proto" ]]; then
+        if ! is_node_port_listening "$port" 2>/dev/null; then
+          info "Firewall открыт. Если нужен процесс на порту — это делает сервис (нода), не это меню."
+        fi
+      fi
       show_ports_status
       ;;
-    2)
+    3)
       ask "Номер порта" port
       [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
         warn "Нужен порт 1–65535"; return 0
@@ -2023,14 +2103,14 @@ setup_ports() {
       echo
       show_ports_status
       ;;
-    3) show_ports_status ;;
-    4)
+    4) show_ports_status ;;
+    5)
       if _ports_rebuild_nft; then
         ok "Правила переприменены"
       fi
       show_ports_status
       ;;
-    5)
+    6)
       ask_yes_no "Точно сбросить все OPEN/BLOCK?" ans N
       [[ "$ans" =~ ^[Yy]$ ]] && ports_clear_all
       ;;
@@ -2404,6 +2484,10 @@ EOF
     warn "Порт ${NODE_PORT} пока может подниматься — проверьте: ss -tlnp | grep ${NODE_PORT}"
   fi
 
+  # Firewall для связи с панелью (отдельно от UFW)
+  info "Открываю TCP/${NODE_PORT} для Remnawave Panel (nftables)…"
+  ports_open "$NODE_PORT" tcp 2>/dev/null || warn "Не удалось открыть порт в nftables — пункт меню «Порты»"
+
   info "Установка команды управления…"
   install_self_cli
 
@@ -2421,6 +2505,7 @@ EOF
   echo -e "  📋 Лог:         ${GRAY}${LOG}${NC}"
   echo
   echo -e "  ${YELLOW}💡 Рекомендуется отдельно:${NC}"
+  echo -e "    • 🔓 Порты — пункт «Открыть порт ноды для Remnawave Panel»"
   echo -e "    • 🛡️  UFW — ограничить NODE_PORT только IP панели"
   echo -e "    • 💾 SWAP — если мало RAM"
   echo -e "    • ⚡ Hysteria2 — если нужен UDP-протокол"
@@ -3633,11 +3718,12 @@ remnanode_menu() {
     _tty_echo "    ${WHITE}16)${NC} ⚡ Настройка Hysteria2"
     _tty_echo "    ${WHITE}17)${NC} 🎭 Selfsteal"
     _tty_echo "    ${WHITE}18)${NC} 🏠 Открыть главное меню лаунчера"
+    _tty_echo "    ${WHITE}19)${NC} 📡 Открыть порт ноды для Remnawave Panel"
     _tty_echo ""
     hline 56
     _tty_echo "    ${GRAY}0)${NC} 🚪 Выход"
     _tty_echo ""
-    ask_choice choice "👉 Выберите пункт [0-18]:"
+    ask_choice choice "👉 Выберите пункт [0-19]:"
 
     case "$choice" in
       1) install_remnanode; pause ;;
@@ -3714,6 +3800,7 @@ remnanode_menu() {
       16) install_hysteria2; pause ;;
       17) install_selfsteal; pause ;;
       18) main_menu; return 0 ;;
+      19) ports_open_panel; pause ;;
       0) exit 0 ;;
       *) ;;
     esac
@@ -3866,6 +3953,7 @@ case "${1:-}" in
   swap)                        _menu_soft_mode; setup_swap ;;
   ufw|firewall)                _menu_soft_mode; setup_ufw ;;
   ports|port|open-port)        _menu_soft_mode; setup_ports ;;
+  panel-port|open-panel-port)  _menu_soft_mode; ports_open_panel ;;
   tune|performance)            apply_performance_tuning ;;
   antiddos|ddos)               _menu_soft_mode; setup_antiddos ;;
   antiddos-on|ddos-on)         apply_antiddos 0 ;;
