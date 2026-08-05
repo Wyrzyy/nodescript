@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.21
+# Версия: 2026.8.22
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.8.21"
+_REMNANODE_VER_PIN="2026.8.22"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -3875,6 +3875,196 @@ run_speedtest_menu() {
   esac
 }
 
+###############################################################################
+# Проверка блокировки сервера из РФ (ТСПУ / РКН) через check-host.net
+# TCP-доступность IP:порт с нескольких РФ-операторов + контрольные узлы вне РФ.
+###############################################################################
+_CH_API="https://check-host.net"
+_CH_RESULT_JSON=""
+
+_ch_get() {
+  # $1 = путь+query. Возврат тела ответа (JSON) в stdout.
+  curl -fsSL -H 'Accept: application/json' --connect-timeout 8 --max-time 20 "${_CH_API}$1" 2>/dev/null
+}
+
+# Статус узла из _CH_RESULT_JSON: печатает "OK|время" / "FAIL|причина" / "PENDING|—"
+_ch_status_of() {
+  local n="$1"
+  echo "$_CH_RESULT_JSON" | jq -r --arg n "$n" '
+    .[$n] as $v
+    | if $v == null then "PENDING|—"
+      elif ($v|type)=="array" and ($v|length>0) then
+        ($v[0]) as $r
+        | if   ($r|type)=="object" and ($r.address? != null) then "OK|\($r.time)"
+          elif ($r|type)=="object" and ($r.error?   != null) then "FAIL|\($r.error)"
+          else "FAIL|нет ответа" end
+      else "FAIL|нет ответа" end' 2>/dev/null
+}
+
+run_tspu_check() {
+  ui_clear
+  echo -e "${CYAN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║      🇷🇺 БЛОКИРОВКА ИЗ РФ (ТСПУ / РКН)             ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "Нужен curl"; return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    info "Устанавливаю jq…"
+    apt_wait_locks 30 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends jq >/dev/null 2>&1 || true
+  fi
+  command -v jq >/dev/null 2>&1 || { warn "jq недоступен — проверка невозможна"; return 1; }
+
+  # Хост и порт для проверки
+  local host port def_ip node_port def_port
+  def_ip=$(get_public_ip 2>/dev/null || true)
+  [[ "$def_ip" == "неизвестен" ]] && def_ip=""
+  node_port=$(get_node_port 2>/dev/null || echo "")
+  ask "IP/домен для проверки" host "${def_ip}"
+  [[ -z "$host" ]] && { warn "Не указан хост"; return 1; }
+  def_port="443"
+  [[ -n "$node_port" ]] && def_port="$node_port"
+  echo -e "  ${GRAY}Обычно проверяют клиентский порт: 443 (Reality) или NODE_PORT.${NC}"
+  ask "Порт" port "$def_port"
+  [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { warn "Порт 1–65535"; return 1; }
+
+  info "Получаю список узлов check-host.net…"
+  local nodes_json
+  nodes_json=$(_ch_get "/nodes/hosts")
+  [[ -z "$nodes_json" ]] && { warn "check-host.net недоступен (сеть/файрвол)"; return 1; }
+
+  # РФ-узлы: уникальные по ASN (=разные операторы), до 6 штук
+  local -A NODE_LABEL=()
+  local -a ru_nodes=() ctrl_nodes=()
+  local seen_asn=" "
+  local k city asn country cc
+  while IFS=$'\t' read -r k city asn; do
+    [[ -z "$k" ]] && continue
+    [[ "$seen_asn" == *" $asn "* ]] && continue
+    seen_asn+="$asn "
+    ru_nodes+=("$k")
+    NODE_LABEL["$k"]="РФ · ${city:-?} (${asn:-?})"
+    (( ${#ru_nodes[@]} >= 6 )) && break
+  done < <(echo "$nodes_json" | jq -r '
+    .nodes | to_entries[]
+    | select(.value.location[0]=="ru")
+    | "\(.key)\t\(.value.location[2] // "?")\t\(.value.asn // "?")"' 2>/dev/null)
+
+  # Если РФ-узлов с уникальным ASN мало — добираем любыми РФ-узлами
+  if (( ${#ru_nodes[@]} < 3 )); then
+    while IFS=$'\t' read -r k city asn; do
+      [[ -z "$k" ]] && continue
+      [[ -n "${NODE_LABEL[$k]:-}" ]] && continue
+      ru_nodes+=("$k")
+      NODE_LABEL["$k"]="РФ · ${city:-?} (${asn:-?})"
+      (( ${#ru_nodes[@]} >= 6 )) && break
+    done < <(echo "$nodes_json" | jq -r '
+      .nodes | to_entries[]
+      | select(.value.location[0]=="ru")
+      | "\(.key)\t\(.value.location[2] // "?")\t\(.value.asn // "?")"' 2>/dev/null)
+  fi
+
+  # Контрольные узлы вне РФ (2 шт.: de/nl/fi/us) — чтобы отличить бан от «сервер лежит»
+  while IFS=$'\t' read -r k country cc; do
+    [[ -z "$k" ]] && continue
+    ctrl_nodes+=("$k")
+    NODE_LABEL["$k"]="${country:-?} · контроль"
+    (( ${#ctrl_nodes[@]} >= 2 )) && break
+  done < <(echo "$nodes_json" | jq -r '
+    .nodes | to_entries[]
+    | select(.value.location[0] as $c | ($c=="de" or $c=="nl" or $c=="fi" or $c=="us"))
+    | "\(.key)\t\(.value.location[1] // "?")\t\(.value.location[0])"' 2>/dev/null)
+
+  if (( ${#ru_nodes[@]} == 0 )); then
+    warn "Сейчас нет доступных РФ-узлов у check-host.net — повторите позже"
+    return 1
+  fi
+
+  local params="" n
+  for n in "${ru_nodes[@]}" "${ctrl_nodes[@]}"; do
+    params+="&node=${n}"
+  done
+
+  info "TCP-проверка ${host}:${port} — РФ-узлов: ${#ru_nodes[@]}, контрольных: ${#ctrl_nodes[@]}…"
+  local req rid permalink
+  req=$(_ch_get "/check-tcp?host=${host}:${port}${params}")
+  rid=$(echo "$req" | jq -r '.request_id // empty' 2>/dev/null)
+  permalink=$(echo "$req" | jq -r '.permanent_link // empty' 2>/dev/null)
+  [[ -z "$rid" ]] && { warn "check-host.net не принял запрос (лимит/сеть) — повторите позже"; return 1; }
+
+  # Опрос результата: до ~28с, пока не пропадут PENDING
+  local tries=0 pending=1 v
+  while (( tries < 14 )); do
+    sleep 2
+    _CH_RESULT_JSON=$(_ch_get "/check-result/${rid}")
+    if [[ -n "$_CH_RESULT_JSON" ]]; then
+      pending=0
+      for n in "${ru_nodes[@]}" "${ctrl_nodes[@]}"; do
+        v=$(echo "$_CH_RESULT_JSON" | jq -r --arg n "$n" '.[$n] // "null"' 2>/dev/null)
+        [[ "$v" == "null" || -z "$v" ]] && { pending=1; break; }
+      done
+      (( pending == 0 )) && break
+    fi
+    tries=$((tries + 1))
+  done
+
+  local st detail label ru_ok=0 ru_fail=0 ctrl_ok=0 ctrl_fail=0
+  echo
+  echo -e "  ${WHITE}Результаты по РФ-операторам:${NC}"
+  for n in "${ru_nodes[@]}"; do
+    IFS='|' read -r st detail < <(_ch_status_of "$n")
+    label="${NODE_LABEL[$n]:-$n}"
+    case "$st" in
+      OK)   printf "    ${GREEN}✅ %-26s доступен${NC} ${GRAY}(%ss)${NC}\n" "$label" "${detail:-?}"; ru_ok=$((ru_ok + 1)) ;;
+      FAIL) printf "    ${RED}⛔ %-26s НЕ доступен${NC} — %s\n" "$label" "$detail"; ru_fail=$((ru_fail + 1)) ;;
+      *)    printf "    ${GRAY}… %-26s (не успел)${NC}\n" "$label" ;;
+    esac
+  done
+
+  if (( ${#ctrl_nodes[@]} > 0 )); then
+    echo
+    echo -e "  ${WHITE}Контроль (вне РФ):${NC}"
+    for n in "${ctrl_nodes[@]}"; do
+      IFS='|' read -r st detail < <(_ch_status_of "$n")
+      label="${NODE_LABEL[$n]:-$n}"
+      case "$st" in
+        OK)   printf "    ${GREEN}✅ %-26s доступен${NC} ${GRAY}(%ss)${NC}\n" "$label" "${detail:-?}"; ctrl_ok=$((ctrl_ok + 1)) ;;
+        FAIL) printf "    ${RED}⛔ %-26s НЕ доступен${NC} — %s\n" "$label" "$detail"; ctrl_fail=$((ctrl_fail + 1)) ;;
+        *)    printf "    ${GRAY}… %-26s (не успел)${NC}\n" "$label" ;;
+      esac
+    done
+  fi
+
+  local total_ru=$(( ru_ok + ru_fail ))
+  echo
+  echo -e "  ${WHITE}Итог:${NC}"
+  if (( ${#ctrl_nodes[@]} > 0 && ctrl_ok == 0 )); then
+    warn "Контрольные узлы (вне РФ) тоже не подключились."
+    echo -e "    ${GRAY}Это НЕ ТСПУ: порт ${port} недоступен глобально. Проверьте, что сервис слушает и открыт в firewall.${NC}"
+  elif (( total_ru == 0 )); then
+    warn "РФ-узлы не дали ответа — повторите позже."
+  elif (( ru_fail == 0 )); then
+    ok "Из РФ порт ${port} доступен со всех проверенных операторов — блокировки нет."
+  elif (( ru_ok == 0 )); then
+    echo -e "    ${RED}${BOLD}⛔ Похоже на блокировку ТСПУ/РКН.${NC}"
+    echo -e "    ${GRAY}Из РФ порт недоступен со всех операторов, а контрольные узлы подключились.${NC}"
+  else
+    echo -e "    ${YELLOW}⚠️  Частичная недоступность из РФ: ${ru_ok}/${total_ru} операторов ОК.${NC}"
+    echo -e "    ${GRAY}Возможна выборочная фильтрация у части операторов или временная нестабильность.${NC}"
+  fi
+
+  echo
+  echo -e "  ${GRAY}Проверка TCP-доступности IP:порт (блок по IP/порту).${NC}"
+  echo -e "  ${GRAY}DPI-блок по SNI/протоколу так не виден — TCP может проходить, а TLS резаться.${NC}"
+  echo -e "  ${GRAY}Узлы check-host — дата-центры; у мобильных/домашних ISP ТСПУ может вести себя иначе.${NC}"
+  [[ -n "$permalink" ]] && echo -e "  ${GRAY}Полный отчёт: ${permalink}${NC}"
+  echo
+}
+
 tests_menu() {
   while true; do
     ui_clear
@@ -3890,7 +4080,8 @@ tests_menu() {
     echo -e "  ${WHITE}5)${NC} 🌐 Информация об IP"
     echo -e "  ${WHITE}6)${NC} 🖥️  Система / CPU / диск"
     echo -e "  ${WHITE}7)${NC} 🔌 Порты и контейнеры"
-    echo -e "  ${WHITE}8)${NC} 🏁 Полный прогон       ${GRAY}— speed + ping + DNS…${NC}"
+    echo -e "  ${WHITE}8)${NC} 🇷🇺 Блокировка из РФ    ${GRAY}— ТСПУ/РКН, разные операторы${NC}"
+    echo -e "  ${WHITE}9)${NC} 🏁 Полный прогон       ${GRAY}— speed + ping + DNS…${NC}"
     echo
     echo -e "  ${GRAY}0)${NC} 🔙 Назад"
     echo
@@ -3904,13 +4095,15 @@ tests_menu() {
       5) run_ip_info_test; pause ;;
       6) run_system_bench; pause ;;
       7) run_ports_check; pause ;;
-      8)
+      8) run_tspu_check; pause ;;
+      9)
         run_ip_info_test
         run_latency_test
         run_dns_test
         run_speedtest_menu
         run_system_bench
         run_ports_check
+        run_tspu_check
         ok "🏁 Полный прогон завершён"
         pause
         ;;
@@ -4277,6 +4470,7 @@ case "${1:-}" in
   antiddos-synproxy)           apply_antiddos 1 ;;
   antiddos-off|ddos-off)       disable_antiddos ;;
   tests|test)                  _menu_soft_mode; tests_menu ;;
+  tspu|rkn|ru-check|rublock)   _menu_soft_mode; run_tspu_check ;;
   up)
     cd "$DIR" && docker compose up -d
     ;;
