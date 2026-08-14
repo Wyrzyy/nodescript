@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.22
+# Версия: 2026.8.23
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.8.22"
+_REMNANODE_VER_PIN="2026.8.23"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -475,7 +475,15 @@ gh_run_bash() {
   fi
   chmod +x "$tmp"
   set +e
-  bash "$tmp" "$@"
+  # stdin обязательно с терминала: внешние скрипты читают ответы через `read`,
+  # а bash показывает prompt у `read -p` только когда stdin — терминал.
+  # Если лаунчер запущен через pipe (curl | bash), stdin пуст → read падает
+  # и скрипт с `set -e` завершается молча.
+  if [[ -r /dev/tty ]]; then
+    bash "$tmp" "$@" < /dev/tty
+  else
+    bash "$tmp" "$@"
+  fi
   local rc=$?
   set -e
   rm -f "$tmp"
@@ -512,7 +520,11 @@ run_selfsteal() {
   chmod +x "$src" "$SELFSTEAL_LOCAL" 2>/dev/null || true
   info "🎭 Selfsteal (RU): $src"
   set +e
-  bash "$src" "$@"
+  if [[ -r /dev/tty ]]; then
+    bash "$src" "$@" < /dev/tty
+  else
+    bash "$src" "$@"
+  fi
   local rc=$?
   set -e
   return $rc
@@ -590,15 +602,17 @@ launcher_version() {
   [[ -n "$v" ]] || v="${_REMNANODE_VER:-}"
   [[ -n "$v" ]] || v="${RN_VERSION:-}"
   [[ -n "$v" ]] || v="${SCRIPT_VERSION:-}"
-  # Запасной путь: первая строка вида _REMNANODE_VER="YYYY...."
+  # Запасной путь: вытащить литерал из файла скрипта / установленной копии
   if [[ -z "$v" || "$v" == "unknown" ]]; then
-    local src="${BASH_SOURCE[0]:-$0}"
-    if [[ -f "$src" ]]; then
+    local src
+    for src in "${BASH_SOURCE[0]:-}" "$0" "${LAUNCHER_PATH:-}"; do
+      [[ -n "$src" && -f "$src" ]] || continue
       v=$(grep -E '^_REMNANODE_VER(_PIN)?="[0-9]{4}\.' "$src" 2>/dev/null | head -1 \
         | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g' || true)
-    fi
+      [[ -n "$v" ]] && break
+    done
   fi
-  [[ -n "$v" ]] || v="0.0.0"
+  [[ -n "$v" ]] || v="н/д (обновите лаунчер)"
   _REMNANODE_VER="$v"
   RN_VERSION="$v"
   SCRIPT_VERSION="$v"
@@ -2882,44 +2896,333 @@ install_selfsteal() {
 ###############################################################################
 # HYSTERIA2 — через h2-script (без установки ноды из того скрипта)
 ###############################################################################
+###############################################################################
+# Hysteria2 — своя автоустановка «от и до» (нужен только домен)
+# Делает: certbot standalone, сертификаты в /opt/hysteria/certs, deploy-hook
+# авто-продления, volume в compose ноды, порты 80/tcp + 443/udp, рестарт ноды.
+###############################################################################
+H2_DIR="/opt/hysteria"
+H2_CERTS="$H2_DIR/certs"
+H2_DOMAIN_FILE="$H2_DIR/.domain"
+
+_h2_ensure_certbot() {
+  command -v certbot >/dev/null 2>&1 && return 0
+  info "Устанавливаю certbot…"
+  apt_takeover
+  apt_wait_locks 120 || true
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends certbot >>"$LOG" 2>&1; then
+    return 0
+  fi
+  spin_fn "apt update (для certbot)" apt_update_safe || true
+  apt_wait_locks 60 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends certbot >>"$LOG" 2>&1
+}
+
+# Кто держит :80 — печатает "docker <id>" | "unit <name>" | ""
+_h2_port80_holder() {
+  local pid cid unit
+  pid=$(ss -tlnp 'sport = :80' 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+  [[ -z "$pid" ]] && return 0
+  cid=$(grep -oE '[0-9a-f]{64}' "/proc/${pid}/cgroup" 2>/dev/null | head -1)
+  if [[ -n "$cid" ]] && command -v docker >/dev/null 2>&1 && docker inspect "$cid" >/dev/null 2>&1; then
+    printf 'docker %s' "$cid"
+    return 0
+  fi
+  unit=$(cat "/proc/${pid}/cgroup" 2>/dev/null | grep -oE '[a-zA-Z0-9_.@-]+\.service' | head -1)
+  [[ -n "$unit" ]] && printf 'unit %s' "$unit"
+  return 0
+}
+
+_H2_STOPPED_KIND=""
+_H2_STOPPED_ID=""
+
+_h2_free_port80() {
+  _H2_STOPPED_KIND=""
+  _H2_STOPPED_ID=""
+  local holder kind id
+  holder=$(_h2_port80_holder)
+  [[ -z "$holder" ]] && return 0
+  kind="${holder%% *}"
+  id="${holder#* }"
+  case "$kind" in
+    docker)
+      local name
+      name=$(docker inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##')
+      warn "Порт 80 занят контейнером ${name:-$id} — остановлю на время выпуска сертификата"
+      docker stop "$id" >/dev/null 2>&1 || return 0
+      _H2_STOPPED_KIND="docker"
+      _H2_STOPPED_ID="$id"
+      ;;
+    unit)
+      warn "Порт 80 занят сервисом ${id} — остановлю на время выпуска сертификата"
+      systemctl stop "$id" >/dev/null 2>&1 || return 0
+      _H2_STOPPED_KIND="unit"
+      _H2_STOPPED_ID="$id"
+      ;;
+  esac
+  return 0
+}
+
+_h2_restore_port80() {
+  case "$_H2_STOPPED_KIND" in
+    docker) docker start "$_H2_STOPPED_ID" >/dev/null 2>&1 && info "Контейнер возвращён в работу" ;;
+    unit)   systemctl start "$_H2_STOPPED_ID" >/dev/null 2>&1 && info "Сервис ${_H2_STOPPED_ID} запущен обратно" ;;
+  esac
+  _H2_STOPPED_KIND=""
+  _H2_STOPPED_ID=""
+  return 0
+}
+
+# Добавить volume-монтирование в compose ноды (идемпотентно, без python)
+_compose_add_mount() {
+  local mount="$1"
+  [[ -f "$COMPOSE" ]] || return 1
+  if grep -qF "$mount" "$COMPOSE" 2>/dev/null; then
+    return 0
+  fi
+  cp -f "$COMPOSE" "${COMPOSE}.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  if grep -qE '^[[:space:]]*volumes:[[:space:]]*$' "$COMPOSE"; then
+    awk -v m="$mount" '
+      BEGIN { done = 0 }
+      {
+        print
+        if (!done && $0 ~ /^[ \t]*volumes:[ \t]*$/) {
+          match($0, /^[ \t]*/)
+          printf "%s  - \x27%s\x27\n", substr($0, 1, RLENGTH), m
+          done = 1
+        }
+      }' "$COMPOSE" > "${COMPOSE}.tmp" 2>/dev/null && mv -f "${COMPOSE}.tmp" "$COMPOSE"
+  else
+    printf '    volumes:\n      - '\''%s'\''\n' "$mount" >> "$COMPOSE"
+  fi
+  chmod 600 "$COMPOSE" 2>/dev/null || true
+  grep -qF "$mount" "$COMPOSE" 2>/dev/null
+}
+
+# Выпуск сертификата: вывод certbot — в лог (fd 3), чтобы не рвать спиннер
+_h2_certbot_issue() {
+  local domain="$1" email="$2"
+  certbot certonly --standalone -d "$domain" \
+    --agree-tos -m "$email" --non-interactive --no-eff-email \
+    --keep-until-expiring >&3 2>&3
+}
+
+_h2_write_renew_hook() {
+  local domain="$1"
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  local hook="/etc/letsencrypt/renewal-hooks/deploy/hysteria-copy-${domain}.sh"
+  cat > "$hook" <<EOF
+#!/bin/bash
+# автопродление: копируем свежие сертификаты для Hysteria2 и перезапускаем ноду
+cp -f /etc/letsencrypt/live/${domain}/fullchain.pem ${H2_CERTS}/fullchain.pem
+cp -f /etc/letsencrypt/live/${domain}/privkey.pem  ${H2_CERTS}/privkey.pem
+chmod 644 ${H2_CERTS}/fullchain.pem
+chmod 640 ${H2_CERTS}/privkey.pem
+docker compose -f ${COMPOSE} restart remnanode >/dev/null 2>&1 || true
+EOF
+  chmod +x "$hook"
+  printf '%s' "$hook"
+}
+
+# usage: install_hysteria2 [домен]
 install_hysteria2() {
   show_header
-  echo -e "${WHITE}${BOLD}  ⚡ Автонастройка Hysteria2${NC}"
+  echo -e "${WHITE}${BOLD}  ⚡ Hysteria2 — автоматическая настройка${NC}"
   hline 56
   echo
-  info "Скрипт Origamidnd/h2-script (уже на русском): certbot, сертификаты, volume, BBR."
-  echo -e "  ${GRAY}https://github.com/Origamidnd/h2-script${NC}"
-  echo
-  warn "⚠️  Нода Remnanode уже должна быть установлена."
+  info "Всё делается само: сертификат Let's Encrypt, авто-продление,"
+  info "монтирование сертификатов в ноду, порты 80/tcp и 443/udp."
+  echo -e "  ${GRAY}От вас нужен только домен, который указывает на этот сервер.${NC}"
   echo
 
   if ! is_remnanode_installed; then
     warn "Сначала установите Remnanode (пункт меню «Remnanode»)."
     return 1
   fi
+  if [[ ! -f "$COMPOSE" ]]; then
+    warn "Не найден $COMPOSE — переустановите ноду"
+    return 1
+  fi
 
+  # Домен: аргумент → сохранённый ранее → спросить
+  local domain="${1:-}" saved=""
+  [[ -f "$H2_DOMAIN_FILE" ]] && saved=$(tr -d '[:space:]' <"$H2_DOMAIN_FILE" 2>/dev/null || true)
+  if [[ -z "$domain" ]]; then
+    ask "🌐 Домен для этой ноды" domain "$saved"
+  fi
+  domain=$(printf '%s' "$domain" | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+  domain="${domain#http://}"
+  domain="${domain#https://}"
+  domain="${domain%%/*}"
+  if [[ "$domain" =~ ^[0-9.]+$ ]]; then
+    warn "Нужен домен, а не IP — Let's Encrypt не выдаёт сертификаты на IP"
+    return 1
+  fi
+  if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    warn "Домен некорректный: «${domain}»"
+    return 1
+  fi
+
+  # Email для Let's Encrypt: не спрашиваем, если не задан через окружение
+  local email="${H2_EMAIL:-admin@${domain}}"
+
+  mkdir -p "$H2_CERTS"
+  printf '%s\n' "$domain" > "$H2_DOMAIN_FILE" 2>/dev/null || true
+
+  echo
+  echo -e "  ${WHITE}Параметры:${NC}"
+  echo -e "    Домен:         ${CYAN}${domain}${NC}"
+  echo -e "    Email (ACME):  ${GRAY}${email}${NC}"
+  echo -e "    Сертификаты:   ${GRAY}${H2_CERTS}${NC}"
+  echo -e "    Compose ноды:  ${GRAY}${COMPOSE}${NC}"
+  echo
+
+  # 1/6 DNS
+  info "1️⃣/6  Проверка DNS"
+  local resolved
+  resolved=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+  if [[ -z "$resolved" ]]; then
+    resolved=$(dig +short +time=3 +tries=1 A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)
+  fi
+  if [[ -z "$resolved" ]]; then
+    warn "Домен ${domain} не резолвится — создайте A-запись на ${PUBLIC_IP} и повторите"
+    return 1
+  fi
+  if [[ -n "$PUBLIC_IP" && "$resolved" != "$PUBLIC_IP" ]]; then
+    warn "Домен ведёт на ${resolved}, а IP сервера — ${PUBLIC_IP}"
+    echo -e "    ${GRAY}Для Let's Encrypt (standalone) нужен именно этот сервер.${NC}"
+    local go=""
+    ask_yes_no "Всё равно продолжить?" go N
+    [[ "$go" =~ ^[Yy]$ ]] || { warn "Отменено — поправьте A-запись"; return 1; }
+  else
+    ok "DNS: ${domain} → ${resolved}"
+  fi
+
+  # 2/6 порты
+  info "2️⃣/6  Открываю порты 80/tcp (ACME) и 443/udp (Hysteria2)"
+  ports_open 80 tcp >/dev/null 2>&1 || warn "Не удалось открыть 80/tcp в nftables"
+  ports_open 443 udp >/dev/null 2>&1 || warn "Не удалось открыть 443/udp в nftables"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    ufw allow 80/tcp  >/dev/null 2>&1 || true
+    ufw allow 443/udp >/dev/null 2>&1 || true
+    info "UFW активен — правила 80/tcp и 443/udp добавлены"
+  fi
+  ok "Порты готовы"
+
+  # 3/6 certbot
+  info "3️⃣/6  Сертификат Let's Encrypt"
+  if ! _h2_ensure_certbot; then
+    warn "certbot не установился — см. ${LOG}"
+    return 1
+  fi
+  if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+    ok "Сертификат для ${domain} уже есть — использую его"
+  else
+    _h2_free_port80
+    local rc=0
+    spin_fn "выпуск сертификата (certbot standalone)" \
+      _h2_certbot_issue "$domain" "$email" || rc=$?
+    _h2_restore_port80
+    if (( rc != 0 )) || [[ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+      warn "Не удалось выпустить сертификат (код ${rc})."
+      echo -e "    ${GRAY}Частые причины: 80/tcp закрыт в firewall провайдера, домен не на этот сервер,${NC}"
+      echo -e "    ${GRAY}или лимит Let's Encrypt. Подробности: ${LOG}${NC}"
+      return 1
+    fi
+    ok "Сертификат выпущен"
+  fi
+
+  # 4/6 сертификаты + hook
+  info "4️⃣/6  Сертификаты в ${H2_CERTS} и авто-продление"
+  cp -f "/etc/letsencrypt/live/${domain}/fullchain.pem" "$H2_CERTS/fullchain.pem"
+  cp -f "/etc/letsencrypt/live/${domain}/privkey.pem"  "$H2_CERTS/privkey.pem"
+  chmod 644 "$H2_CERTS/fullchain.pem" 2>/dev/null || true
+  chmod 640 "$H2_CERTS/privkey.pem" 2>/dev/null || true
+  local hook
+  hook=$(_h2_write_renew_hook "$domain")
+  ok "Deploy-hook: ${hook}"
+
+  # 5/6 volume в compose
+  info "5️⃣/6  Монтирую сертификаты в контейнер ноды"
+  if _compose_add_mount "${H2_CERTS}:${H2_CERTS}:ro"; then
+    ok "Volume ${H2_CERTS} прописан в compose"
+  else
+    warn "Не удалось прописать volume — добавьте вручную в ${COMPOSE}:"
+    echo -e "    ${GRAY}- '${H2_CERTS}:${H2_CERTS}:ro'${NC}"
+  fi
+
+  # 6/6 перезапуск ноды
+  info "6️⃣/6  Пересоздаю контейнер ноды (подхватить сертификаты)"
+  fix_remnanode_s6_init || true
+  if (cd "$DIR" && docker compose up -d >>"$LOG" 2>&1); then
+    ok "Нода перезапущена"
+  else
+    warn "Не удалось перезапустить ноду — docker compose logs remnanode"
+  fi
+  sleep 3
+
+  # Проверка результата
+  echo
+  echo -e "  ${WHITE}Проверка:${NC}"
+  if [[ -s "$H2_CERTS/fullchain.pem" && -s "$H2_CERTS/privkey.pem" ]]; then
+    echo -e "    ${GREEN}✅ сертификаты на месте${NC} ${GRAY}(${H2_CERTS})${NC}"
+  else
+    echo -e "    ${RED}⛔ сертификаты не найдены${NC}"
+  fi
+  if docker inspect remnanode --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' 2>/dev/null | grep -q "$H2_CERTS"; then
+    echo -e "    ${GREEN}✅ сертификаты видны внутри контейнера${NC}"
+  else
+    echo -e "    ${YELLOW}⚠️  контейнер пока без монтирования — перезапустите ноду${NC}"
+  fi
+  local exp=""
+  exp=$(openssl x509 -enddate -noout -in "$H2_CERTS/fullchain.pem" 2>/dev/null | cut -d= -f2 || true)
+  [[ -n "$exp" ]] && echo -e "    ${GRAY}Сертификат действителен до: ${exp}${NC}"
+  if systemctl list-timers 2>/dev/null | grep -q certbot; then
+    echo -e "    ${GREEN}✅ авто-продление certbot активно${NC}"
+  else
+    echo -e "    ${GRAY}Продление: systemctl list-timers | grep certbot${NC}"
+  fi
+
+  echo
+  ok "Hysteria2 готов на сервере"
+  echo
+  echo -e "  ${WHITE}Остался один шаг в панели Remnawave:${NC}"
+  echo -e "    1) Config profile с Hysteria2 → привязать к этой ноде"
+  echo -e "    2) В конфиге указать сертификаты:"
+  echo -e "       ${GRAY}cert: ${H2_CERTS}/fullchain.pem${NC}"
+  echo -e "       ${GRAY}key:  ${H2_CERTS}/privkey.pem${NC}"
+  echo -e "       ${GRAY}домен (SNI): ${domain}, порт 443/udp${NC}"
+  echo
+  echo -e "  ${GRAY}Если онлайн в ноде не отображается (ядро 26.3.x) —${NC}"
+  echo -e "  ${GRAY}пункт «Фикс онлайна Hysteria2».${NC}"
+  echo
+}
+
+# Старый внешний скрипт (Origamidnd/h2-script) — на случай, если нужен именно он
+install_hysteria2_legacy() {
+  show_header
+  echo -e "${WHITE}${BOLD}  ⚡ Hysteria2 — внешний скрипт (h2-script)${NC}"
+  hline 56
+  echo
+  info "Скрипт Origamidnd/h2-script (на русском): certbot, сертификаты, volume, BBR."
+  echo -e "  ${GRAY}https://github.com/Origamidnd/h2-script${NC}"
+  echo
+  if ! is_remnanode_installed; then
+    warn "Сначала установите Remnanode."
+    return 1
+  fi
   ensure_packages
-
   echo
   info "Запуск setup.sh (RU) из h2-script…"
   echo
-
   set +e
   gh_pipe_bash "$H2_RAW"
   local rc=$?
   set -e
   if [[ $rc -eq 0 ]]; then
-    ok "Hysteria2 настроен"
-    echo
-    echo -e "  ${WHITE}✨ Дополнительно:${NC}"
-    echo -e "    • Привяжите Hysteria2 config profile в панели Remnawave"
-    echo -e "    • Порт 80/tcp нужен только для ACME — можно закрыть после выпуска"
-    echo
-    echo -e "  ${YELLOW}Если онлайн в ноде не отображается (ядро 26.3.x) —${NC}"
-    echo -e "  ${YELLOW}используйте пункт «Фикс онлайна Hysteria2» (благодарность @markrouting).${NC}"
-    echo
+    ok "Hysteria2 настроен внешним скриптом"
   else
-    warn "Настройка Hysteria2 завершилась с кодом $rc"
+    warn "Внешний скрипт завершился с кодом $rc"
   fi
 }
 
@@ -4385,7 +4688,7 @@ main_menu() {
     section "📦  Установка"
     menu_item "🚀" "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
     menu_item "🎭" "2"  "Selfsteal"  "маскировка Reality" selfsteal
-    menu_item "⚡" "3"  "Hysteria2"  "автонастройка"      hysteria
+    menu_item "⚡" "3"  "Hysteria2"  "авто: нужен домен"  hysteria
     menu_item "🔧" "4"  "Фикс H2"    "custom Xray"        xrayfix
     menu_item "☁️" "5"  "WARP"       "Cloudflare SOCKS5"  warp
     menu_item "✈️" "6"  "MTProto"    "прокси Telegram"    mtproto
@@ -4456,7 +4759,11 @@ case "${1:-}" in
     ;;
   install-remnanode)           install_remnanode ;;
   install-selfsteal)           install_selfsteal ;;
-  install-hysteria2|hysteria2) install_hysteria2 ;;
+  install-hysteria2|hysteria2|h2)
+    shift 2>/dev/null || true
+    install_hysteria2 "${1:-}"
+    ;;
+  hysteria2-legacy|h2-legacy)  install_hysteria2_legacy ;;
   fix-hysteria|fix-online)    fix_hysteria2_online ;;
   install-warp)                install_warp ;;
   install-mtproto|mtproto)     install_mtproto ;;
