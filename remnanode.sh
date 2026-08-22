@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.23
+# Версия: 2026.8.24
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.8.23"
+_REMNANODE_VER_PIN="2026.8.24"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -157,48 +157,149 @@ ask() {
   printf -v "$varname" '%s' "$_ans"
 }
 
-# Секретный ввод: короткая маска (макс. 12 «•») + счётчик символов в той же строке.
-# Длинные ключи Remnawave (~2–3 КБ) больше не заливают экран тысячами точек.
+# Убрать мусор терминала из вставки SECRET_KEY (bracketed paste, CR).
+# Нельзя выкидывать ESC «по одному»: от \e[200~ останется «[200~» и ключ станет битым.
+strip_paste_noise() {
+  local s="$1"
+  s="${s//$'\r'/}"
+  s="${s//$'\033'[200~/}"
+  s="${s//$'\033'[201~/}"
+  s="${s//$'\033'[?2004h/}"
+  s="${s//$'\033'[?2004l/}"
+  printf '%s' "$s"
+}
+
+# SECRET_KEY панели — base64(JSON {caCertPem,jwtPublicKey,nodeCertPem,nodeKeyPem}).
+# Старый SSL_CERT (PEM) оставляем как есть. Обёртки JWT с переносами склеиваем.
+normalize_secret_key() {
+  local s="$1"
+  s="$(strip_paste_noise "$s")"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  if [[ "$s" == *"-----BEGIN"* ]]; then
+    printf '%s' "$s"
+    return 0
+  fi
+  s=$(printf '%s' "$s" | sed -E \
+    -e 's/^[[:space:]]*-[[:space:]]*//' \
+    -e 's/^(SECRET_KEY|SSL_CERT)=//' \
+    -e 's/^["'\'']//' \
+    -e 's/["'\'']$//')
+  s="${s//[$'\n\t ']/}"
+  printf '%s' "$s"
+}
+
+# Проверка payload без вывода самого ключа. python3/jq не обязательны.
+secret_key_valid() {
+  local key="$1" dec
+  [[ ${#key} -ge 200 ]] || return 1
+  dec=$(printf '%s' "$key" | base64 -d 2>/dev/null) || return 1
+  printf '%s' "$dec" | grep -q '"caCertPem"' || return 1
+  printf '%s' "$dec" | grep -q '"jwtPublicKey"' || return 1
+  printf '%s' "$dec" | grep -q '"nodeCertPem"' || return 1
+  printf '%s' "$dec" | grep -q '"nodeKeyPem"' || return 1
+  return 0
+}
+
+secret_key_preview() {
+  local key="$1" n a b
+  n=${#key}
+  if (( n <= 16 )); then
+    _tty_printf '  %bдлина:%b %s\n' "$GRAY" "$NC" "$n"
+    return 0
+  fi
+  a="${key:0:8}"
+  b="${key: -8}"
+  _tty_printf '  %bдлина:%b %s   %bначало:%b %s…   %bконец:%b …%s\n' \
+    "$GRAY" "$NC" "$n" "$GRAY" "$NC" "$a" "$GRAY" "$NC" "$b"
+}
+
+get_env_secret_key() {
+  [[ -f "$ENV_FILE" ]] || return 1
+  local v
+  v=$(sed -n 's/^SECRET_KEY=//p' "$ENV_FILE" 2>/dev/null | head -1 || true)
+  v="$(normalize_secret_key "$v")"
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
+}
+
+# Запись .env через printf — без раскрытия $ внутри ключа (unquoted heredoc ломал payload).
+write_remnanode_env() {
+  local port="$1" key="$2" xtls="${3:-61000}" old_umask
+  mkdir -p "$DIR"
+  old_umask=$(umask)
+  umask 077
+  {
+    printf '%s\n' '### NODE ###'
+    printf 'NODE_PORT=%s\n' "$port"
+    printf '\n'
+    printf '%s\n' '### XRAY ###'
+    printf 'SECRET_KEY=%s\n' "$key"
+    printf '\n'
+    printf '%s\n' '### Internal ###'
+    printf 'XTLS_API_PORT=%s\n' "$xtls"
+  } > "$ENV_FILE"
+  umask "$old_umask"
+  chmod 600 "$ENV_FILE"
+}
+
+# Секретный ввод длинного SECRET_KEY (~2–8 КБ).
+# read -n1 + пропуск Ctrl-символов портил вставку в Termius (bracketed paste → [200~…,
+# обрезка, только первая строка PEM). Читаем чанками в raw-режиме до паузы.
 ask_secret() {
   local prompt="$1" varname="$2"
-  local _ans="" _char="" _tty_in="/dev/tty"
+  local _ans="" _chunk="" _tty_in="/dev/tty"
   local _mask_max=12 _n _dots _i _show
   [[ -r $_tty_in ]] || _tty_in="/dev/stdin"
 
   local _stty_save=""
   _stty_save=$(stty -g <"$_tty_in" 2>/dev/null || true)
+  # -icanon: ключ длиннее 4096 иначе обрежет line discipline.
+  # min 1 time 0 — первый байт блокирующий; дальше чанки с таймаутом.
   stty -echo -icanon min 1 time 0 <"$_tty_in" 2>/dev/null || true
 
-  # первая отрисовка
-  _tty_printf '\r\033[K  %b%s%b: %b[0]%b' "$WHITE" "$prompt" "$NC" "$GRAY" "$NC"
+  _tty_printf '\r\033[K  %b%s%b: %bвставьте ключ, затем пауза%b %b[0]%b' \
+    "$WHITE" "$prompt" "$NC" "$GRAY" "$NC" "$GRAY" "$NC"
 
+  _restore_ask_secret() {
+    [[ -n "$_stty_save" ]] && stty "$_stty_save" <"$_tty_in" 2>/dev/null \
+      || stty sane <"$_tty_in" 2>/dev/null || true
+  }
+
+  # первый байт — ждём вставку
+  _chunk=""
+  IFS= read -r -n 1 -s _chunk <"$_tty_in" || true
+  if [[ -z "$_chunk" || "$_chunk" == $'\n' || "$_chunk" == $'\r' ]]; then
+    _restore_ask_secret
+    _tty_echo ""
+    _tty_printf "  %b(пусто)%b\n" "$YELLOW" "$NC"
+    printf -v "$varname" '%s' ""
+    return 1
+  fi
+  if [[ "$_chunk" == $'\x03' ]]; then
+    _restore_ask_secret
+    _tty_echo ""
+    warn "Ввод прерван"
+    printf -v "$varname" '%s' ""
+    return 1
+  fi
+  _ans+="$_chunk"
+
+  # Остаток вставки: крупные чанки, выход по паузе (~2 с).
   while true; do
-    _char=""
-    IFS= read -r -n1 -s _char <"$_tty_in" || true
-    # Enter
-    if [[ -z "$_char" || "$_char" == $'\n' || "$_char" == $'\r' ]]; then
+    _chunk=""
+    IFS= read -r -n 8192 -s -t 2 _chunk <"$_tty_in" || true
+    if [[ -z "$_chunk" ]]; then
       break
     fi
-    # Backspace / Delete
-    if [[ "$_char" == $'\x7f' || "$_char" == $'\b' ]]; then
-      if [[ -n "$_ans" ]]; then
-        _ans="${_ans%?}"
-      else
-        continue
-      fi
-    elif [[ "$_char" == $'\x03' ]]; then
-      # Ctrl-C — вернуться в меню, не валить весь скрипт
-      [[ -n "$_stty_save" ]] && stty "$_stty_save" <"$_tty_in" 2>/dev/null || true
+    if [[ "$_chunk" == *$'\x03'* ]]; then
+      _restore_ask_secret
       _tty_echo ""
       warn "Ввод прерван"
       printf -v "$varname" '%s' ""
       return 1
-    elif [[ "$_char" < ' ' ]]; then
-      continue
-    else
-      _ans+="$_char"
     fi
-
+    _ans+="$_chunk"
     _n=${#_ans}
     _dots=""
     _show=$_n
@@ -208,8 +309,13 @@ ask_secret() {
       "$WHITE" "$prompt" "$NC" "$_dots" "$GRAY" "$_n" "$NC"
   done
 
-  [[ -n "$_stty_save" ]] && stty "$_stty_save" <"$_tty_in" 2>/dev/null || stty sane <"$_tty_in" 2>/dev/null || true
+  _restore_ask_secret
   _tty_echo ""
+
+  # хвостовые Enter после вставки
+  _ans="${_ans%"${_ans##*[!$'\n\r']}"}"
+  _ans="$(normalize_secret_key "$_ans")"
+
   if [[ -n "$_ans" ]]; then
     _tty_printf "  %b👁  принято, символов: %s%b\n" "$GRAY" "${#_ans}" "$NC"
   else
@@ -2600,6 +2706,47 @@ fix_remnanode_s6_init() {
   return 0
 }
 
+remnanode_logs_secret_error() {
+  docker logs --tail 80 remnanode 2>&1 | grep -qiE \
+    'Invalid SECRET_KEY|SECRET_KEY contains invalid|SECRET_KEY missing|SECRET_KEY payload'
+}
+
+# Сверить SECRET_KEY в .env и в контейнере; поймать типичный EPROTO (битый ключ).
+verify_remnanode_secret() {
+  local file_key="" file_len=0 box_key="" box_len=0
+  file_key=$(get_env_secret_key 2>/dev/null || true)
+  file_len=${#file_key}
+  if [[ "$file_len" -eq 0 ]]; then
+    warn "SECRET_KEY в .env пустой — панель получит EPROTO / handshake failure"
+    return 1
+  fi
+  if ! secret_key_valid "$file_key"; then
+    warn "SECRET_KEY в .env не декодируется как payload панели (длина ${file_len})"
+    warn "Смените ключ: меню «Нода» → SECRET_KEY / EPROTO  или  remnanode secret"
+    return 1
+  fi
+  if is_remnanode_up; then
+    box_key=$(docker exec remnanode printenv SECRET_KEY 2>/dev/null || true)
+    box_key="${box_key//$'\r'/}"
+    box_len=${#box_key}
+    if [[ "$box_len" -eq 0 ]]; then
+      warn "Контейнер не видит SECRET_KEY — проверьте env_file / .env"
+      return 1
+    fi
+    if [[ "$box_len" -ne "$file_len" ]]; then
+      warn "SECRET_KEY в контейнере ${box_len} симв., в .env ${file_len} — ключ обрезан"
+      return 1
+    fi
+    ok "SECRET_KEY в контейнере совпадает с .env (${file_len} символов)"
+  fi
+  if remnanode_logs_secret_error; then
+    warn "В логах ноды: SECRET_KEY отклонён. Пересоздайте ключ в панели и вставьте снова."
+    docker logs --tail 20 remnanode 2>&1 | sed 's/^/    /' || true
+    return 1
+  fi
+  return 0
+}
+
 # Перезапуск ноды с авто-фиксом s6/init при необходимости
 restart_remnanode_safe() {
   [[ -f "$COMPOSE" ]] || { warn "docker-compose.yml не найден"; return 1; }
@@ -2673,14 +2820,28 @@ install_remnanode() {
   ask "🔗 XTLS_API_PORT" XTLS_API_PORT "61000"
 
   echo
-  info "🔑 SECRET_KEY скопируйте из панели Remnawave → Nodes → Create"
-  local K1="" K2=""
+  info "🔑 SECRET_KEY — из панели Remnawave → Nodes → нода → иконка копирования"
+  echo -e "  ${GRAY}Одна вставка (Ctrl+Shift+V). Двойной ввод убран: оба раза одинаково обрезались.${NC}"
+  echo -e "  ${GRAY}В панели Node Port = этот NODE_PORT, не 443 (иначе EPROTO / handshake 40).${NC}"
+  local K1="" _sk_ok="" _sk_confirm=""
   while true; do
     ask_secret "SECRET_KEY" K1 || { warn "Отмена ввода ключа"; return 0; }
-    ask_secret "Повтор SECRET_KEY" K2 || { warn "Отмена ввода ключа"; return 0; }
-    [[ -z "$K1" ]] && { warn "Пусто — введите ключ"; continue; }
-    [[ "$K1" != "$K2" ]] && { warn "Не совпадает — ещё раз"; continue; }
-    break
+    [[ -z "$K1" ]] && { warn "Пусто — вставьте ключ из панели"; continue; }
+    if secret_key_valid "$K1"; then
+      _sk_ok=1
+    else
+      _sk_ok=0
+      warn "Ключ не похож на SECRET_KEY панели (base64 JSON с сертификатами mTLS)."
+      warn "Скопируйте ключ иконкой в карточке ноды. Сейчас длина: ${#K1}"
+    fi
+    secret_key_preview "$K1"
+    if [[ "$_sk_ok" == "1" ]]; then
+      ask_yes_no "Ключ принят. Продолжить?" _sk_confirm Y
+      [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
+    else
+      ask_yes_no "Всё равно сохранить этот ключ?" _sk_confirm N
+      [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
+    fi
   done
   ok "Ключ принят (${#K1} символов)"
   echo
@@ -2699,18 +2860,8 @@ install_remnanode() {
 
   mkdir -p "$DIR"
 
-  cat > "$ENV_FILE" <<EOF
-### NODE ###
-NODE_PORT=${NODE_PORT}
-
-### XRAY ###
-SECRET_KEY=${K1}
-
-### Internal ###
-XTLS_API_PORT=${XTLS_API_PORT}
-EOF
-  chmod 600 "$ENV_FILE"
-  ok ".env сохранён"
+  write_remnanode_env "$NODE_PORT" "$K1" "$XTLS_API_PORT"
+  ok ".env сохранён (SECRET_KEY ${#K1} символов, без раскрытия \$)"
 
   cat > "$COMPOSE" <<EOF
 services:
@@ -2723,6 +2874,8 @@ services:
     stop_grace_period: 30s
     env_file:
       - .env
+    environment:
+      - NODE_PORT=${NODE_PORT}
     cap_add:
       - NET_ADMIN
     ulimits:
@@ -2786,6 +2939,7 @@ EOF
     err "Контейнер не запустился. Логи: docker logs remnanode"
   fi
   ok "Контейнер remnanode запущен"
+  verify_remnanode_secret || true
 
   if ss -tlnp 2>/dev/null | grep -qE ":${NODE_PORT}\\b"; then
     ok "Нода слушает порт ${NODE_PORT}"
@@ -2826,14 +2980,137 @@ EOF
   echo -e "  🖥️  Панель IP:   ${PANEL_IP}"
   echo -e "  🔌 NODE_PORT:   ${NODE_PORT}  ${GRAY}(firewall OPEN)${NC}"
   echo -e "  🔗 XTLS_API:    ${XTLS_API_PORT}"
+  echo -e "  🔑 SECRET_KEY:  ${#K1} символов"
   echo -e "  📡 Управление:  ${CYAN}remnanode${NC}"
   echo -e "  📋 Лог:         ${GRAY}${LOG}${NC}"
+  echo
+  echo -e "  ${YELLOW}⚠  В панели Remnawave:${NC}"
+  echo -e "    • Address = IP этой ноды, ${WHITE}Node Port = ${NODE_PORT}${NC}  ${GRAY}(не 443)${NC}"
+  echo -e "    • EPROTO / SSL alert 40 = неверный SECRET_KEY или порт 443 вместо NODE_PORT"
+  echo -e "    • Сменить ключ: ${CYAN}remnanode secret${NC}"
   echo
   echo -e "  ${YELLOW}💡 Рекомендуется отдельно:${NC}"
   echo -e "    • 🛡️  UFW — ограничить NODE_PORT только IP панели"
   echo -e "    • 💾 SWAP — если мало RAM"
   echo -e "    • ⚡ Hysteria2 — если нужен UDP-протокол"
   echo
+}
+
+# Диагностика EPROTO / handshake 40 + смена SECRET_KEY без полной переустановки
+diagnose_remnanode_eproto() {
+  show_header
+  echo -e "${WHITE}${BOLD}  🔑 SECRET_KEY / EPROTO (handshake 40)${NC}"
+  hline 56
+  echo
+  echo -e "  ${GRAY}write EPROTO … ssl/tls alert handshake failure … alert number 40${NC}"
+  echo -e "  ${GRAY}Панель не смогла пройти mTLS к ноде. Это не «порт OPEN» в firewall.${NC}"
+  echo
+  local port="" file_key="" file_len=0
+  port=$(get_node_port 2>/dev/null || true)
+  [[ -n "$port" ]] || port="—"
+
+  echo -e "  ${WHITE}1. Порт в панели${NC}"
+  echo -e "     NODE_PORT ноды: ${CYAN}${port}${NC}"
+  echo -e "     В карточке ноды поле Node Port должно быть ${WHITE}${port}${NC}, не 443."
+  echo -e "     443 — Selfsteal/Reality, там другой TLS → та же ошибка EPROTO."
+  echo
+
+  echo -e "  ${WHITE}2. Контейнер и слушатель${NC}"
+  if is_remnanode_up; then
+    ok "Контейнер remnanode запущен"
+  else
+    warn "Контейнер remnanode не запущен"
+  fi
+  if [[ "$port" =~ ^[0-9]+$ ]] && is_node_port_listening "$port"; then
+    ok "TCP/${port} слушает"
+  elif [[ "$port" =~ ^[0-9]+$ ]]; then
+    warn "TCP/${port} не слушает — нода не принимает соединения панели"
+  fi
+  echo
+
+  echo -e "  ${WHITE}3. SECRET_KEY${NC}"
+  if file_key=$(get_env_secret_key 2>/dev/null); then
+    file_len=${#file_key}
+    secret_key_preview "$file_key"
+    if secret_key_valid "$file_key"; then
+      ok "Payload в .env декодируется (${file_len} символов)"
+    else
+      warn "Payload в .env битый или обрезан (длина ${file_len})"
+      echo -e "     ${GRAY}Частая причина: старый ввод по символу в Termius (read -n1).${NC}"
+    fi
+  else
+    warn "SECRET_KEY в .env нет — нода не с чем поднять mTLS"
+  fi
+  verify_remnanode_secret || true
+  echo
+
+  echo -e "  ${WHITE}4. Что сделать${NC}"
+  echo -e "     • В панели скопируйте SECRET_KEY иконкой (не руками с экрана)"
+  echo -e "     • Вставьте его здесь заново (пункт ниже)"
+  echo -e "     • Проверьте Node Port = ${port}"
+  echo
+  local ans=""
+  ask_yes_no "Вставить SECRET_KEY заново и пересоздать контейнер?" ans Y
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    update_remnanode_secret
+  fi
+}
+
+update_remnanode_secret() {
+  if ! is_remnanode_installed && [[ ! -f "$ENV_FILE" ]]; then
+    warn "Нода ещё не установлена — сначала пункт «Установить RemnaNode»"
+    return 1
+  fi
+  local port xtls K1="" _sk_ok="" _sk_confirm=""
+  port=$(get_node_port 2>/dev/null || true)
+  [[ "$port" =~ ^[0-9]+$ ]] || port="3000"
+  xtls=$(grep -E '^XTLS_API_PORT=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2 | tr -dc '0-9' || true)
+  [[ "$xtls" =~ ^[0-9]+$ ]] || xtls="61000"
+
+  echo
+  info "🔑 Вставьте актуальный SECRET_KEY из панели (иконка копирования)"
+  echo -e "  ${GRAY}NODE_PORT=${port}  XTLS_API_PORT=${xtls} — не меняются${NC}"
+  while true; do
+    ask_secret "SECRET_KEY" K1 || { warn "Отмена"; return 0; }
+    [[ -z "$K1" ]] && { warn "Пусто — вставьте ключ"; continue; }
+    if secret_key_valid "$K1"; then
+      _sk_ok=1
+    else
+      _sk_ok=0
+      warn "Ключ не похож на SECRET_KEY панели. Длина: ${#K1}"
+    fi
+    secret_key_preview "$K1"
+    if [[ "$_sk_ok" == "1" ]]; then
+      ask_yes_no "Записать ключ и пересоздать контейнер?" _sk_confirm Y
+      [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
+    else
+      ask_yes_no "Всё равно записать этот ключ?" _sk_confirm N
+      [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
+    fi
+  done
+
+  write_remnanode_env "$port" "$K1" "$xtls"
+  echo "$port" > "$DIR/.node_port"
+  ok ".env обновлён (${#K1} символов)"
+
+  if [[ -f "$COMPOSE" ]]; then
+    info "Пересоздаю контейнер remnanode…"
+    restart_remnanode_safe || {
+      warn "Перезапуск не удался — docker logs remnanode"
+      return 1
+    }
+    sleep 3
+    verify_remnanode_secret || true
+    if is_node_port_listening "$port"; then
+      ok "Нода слушает TCP/${port}"
+    else
+      warn "Порт ${port} пока не слушает — docker logs remnanode"
+    fi
+  else
+    warn "docker-compose.yml нет — ключ записан, но контейнер не пересоздан"
+  fi
+  echo
+  echo -e "  ${YELLOW}В панели:${NC} Node Port = ${WHITE}${port}${NC}, ключ тот же, что только что вставили."
 }
 
 ###############################################################################
@@ -4481,6 +4758,14 @@ node_status_screen() {
     cstats=$(docker stats --no-stream --format '{{.CPUPerc}} | {{.MemUsage}}' remnanode 2>/dev/null || echo "n/a")
     _tty_printf '     %-10s %s\n' "Контейнер:" "$cstats"
     _tty_printf '     %-10s %s\n' "RAM хоста:" "$(free -h | awk '/^Mem:/ {printf "%s / %s", $3, $2}')"
+    local _sk
+    if _sk=$(get_env_secret_key 2>/dev/null); then
+      if secret_key_valid "$_sk"; then
+        _tty_printf '     %-10s %bSECRET_KEY ок (%s симв.)%b\n' "mTLS:" "$GREEN" "${#_sk}" "$NC"
+      else
+        _tty_printf '     %-10s %bSECRET_KEY битый (%s) — пункт 20 / EPROTO%b\n' "mTLS:" "$YELLOW" "${#_sk}" "$NC"
+      fi
+    fi
   elif is_remnanode_installed; then
     _tty_printf '  %b❌ Статус ноды: ОСТАНОВЛЕНА%b\n' "$RED" "$NC"
     _tty_printf '  %bИспользуйте пункт 2 для запуска%b\n' "$GRAY" "$NC"
@@ -4525,11 +4810,12 @@ remnanode_menu() {
     _tty_echo "    ${WHITE}17)${NC} 🎭 Selfsteal"
     _tty_echo "    ${WHITE}18)${NC} 🏠 Открыть главное меню лаунчера"
     _tty_echo "    ${WHITE}19)${NC} 📡 Открыть порт ноды для Remnawave Panel"
+    _tty_echo "    ${WHITE}20)${NC} 🔑 SECRET_KEY / фикс EPROTO (handshake 40)"
     _tty_echo ""
     hline 56
     _tty_echo "    ${GRAY}0)${NC} 🚪 Выход"
     _tty_echo ""
-    ask_choice choice "👉 Выберите пункт [0-19]:"
+    ask_choice choice "👉 Выберите пункт [0-20]:"
 
     case "$choice" in
       1) install_remnanode; pause ;;
@@ -4608,6 +4894,7 @@ remnanode_menu() {
       17) install_selfsteal; pause ;;
       18) main_menu; return 0 ;;
       19) ports_open_panel; pause ;;
+      20) diagnose_remnanode_eproto; pause ;;
       0) exit 0 ;;
       *) ;;
     esac
@@ -4771,6 +5058,14 @@ case "${1:-}" in
   ufw|firewall)                _menu_soft_mode; setup_ufw ;;
   ports|port|open-port)        _menu_soft_mode; setup_ports ;;
   panel-port|open-panel-port)  _menu_soft_mode; ports_open_panel ;;
+  secret|secret-key|set-secret|eproto)
+    _menu_soft_mode
+    diagnose_remnanode_eproto
+    ;;
+  doctor|check|diagnose)
+    _menu_soft_mode
+    diagnose_remnanode_eproto
+    ;;
   tune|performance)            apply_performance_tuning ;;
   antiddos|ddos)               _menu_soft_mode; setup_antiddos ;;
   antiddos-on|ddos-on)         apply_antiddos 0 ;;
