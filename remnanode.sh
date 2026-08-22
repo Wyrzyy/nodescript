@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.26
+# Версия: 2026.8.27
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.8.26"
+_REMNANODE_VER_PIN="2026.8.27"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -41,11 +41,18 @@ SPEEDTEST_LOG="$SPEEDTEST_DIR/speedtest-history.log"
 CUSTOM_XRAY_DIR="$DIR/custom-xray"
 XRAY_VERSION_DEFAULT="v26.6.1"
 PANEL_IP_DEFAULT="141.98.7.57"
-# Панель 2.7.4 не поднимает mTLS с нодой 3.x. latest сейчас = 3.3.x → EPROTO alert 40.
+# Нода latest = 3.3.x и стыкуется только с панелью 3.3+.
+# Официальный тег панели: remnawave/backend:3 (не :2 — тот так и остаётся на 2.x).
 NODE_IMAGE_REPO="remnawave/node"
-NODE_IMAGE_PIN="2.7.0"
+NODE_IMAGE_PIN="latest"
 NODE_IMAGE_DEFAULT="${NODE_IMAGE_REPO}:${NODE_IMAGE_PIN}"
 NODE_IMAGE_FILE="$DIR/.node_image"
+PANEL_DIR="/opt/remnawave"
+PANEL_COMPOSE="$PANEL_DIR/docker-compose.yml"
+PANEL_ENV="$PANEL_DIR/.env"
+PANEL_IMAGE_REPO="remnawave/backend"
+PANEL_IMAGE_TAG="3"
+PANEL_IMAGE="${PANEL_IMAGE_REPO}:${PANEL_IMAGE_TAG}"
 WARP_PORT=9091
 LAUNCHER_PATH="/opt/remnanode/installer.sh"
 CLI_PATH="/usr/local/bin/remnanode"
@@ -2758,26 +2765,34 @@ node_image_tag() {
   printf '%s' "${img##*:}"
 }
 
-# latest / 3.x несовместимы с панелью 2.7.x (пустой TLS, EPROTO 40)
-node_image_incompatible_panel27() {
+# Нода 3.x / latest требует панель 3.3+
+node_image_is_v3() {
   local tag="$1"
-  [[ -z "$tag" || "$tag" == "latest" ]] && return 0
-  [[ "$tag" == 3* ]] && return 0
+  [[ -z "$tag" || "$tag" == "latest" || "$tag" == 3* ]] && return 0
   return 1
 }
+
+node_image_is_v2() {
+  local tag="$1"
+  [[ "$tag" == 2* ]] && return 0
+  return 1
+}
+
+# совместимость со старым именем
+node_image_incompatible_panel27() { node_image_is_v3 "$1"; }
 
 ask_node_image_tag() {
   local varname="$1" ch="" tag
   echo
-  info "Образ ноды должен совпадать с мажором панели. latest сейчас = 3.3.x."
-  echo -e "  ${WHITE}1)${NC}  Панель ${BOLD}2.7.x${NC}  →  ${CYAN}${NODE_IMAGE_REPO}:2.7.0${NC}  ${GRAY}[ваш случай]${NC}"
+  info "Образ ноды = мажор панели. Панель 3.x → latest. Панель 2.7.x → 2.7.0."
+  echo -e "  ${WHITE}1)${NC}  Панель 2.7.x  →  ${CYAN}${NODE_IMAGE_REPO}:2.7.0${NC}"
   echo -e "  ${WHITE}2)${NC}  Панель 2.8.x  →  ${CYAN}${NODE_IMAGE_REPO}:2.8.0${NC}"
-  echo -e "  ${WHITE}3)${NC}  Панель 3.x    →  ${CYAN}${NODE_IMAGE_REPO}:latest${NC}  ${GRAY}(только 3.3+)${NC}"
-  ask_choice ch "👉 Версия панели [1]:"
+  echo -e "  ${WHITE}3)${NC}  Панель ${BOLD}3.x${NC}    →  ${CYAN}${NODE_IMAGE_REPO}:latest${NC}  ${GRAY}[по умолчанию]${NC}"
+  ask_choice ch "👉 Версия панели [3]:"
   case "$ch" in
+    1) tag="2.7.0" ;;
     2) tag="2.8.0" ;;
-    3) tag="latest" ;;
-    *) tag="$NODE_IMAGE_PIN" ;;
+    *) tag="latest" ;;
   esac
   printf -v "$varname" '%s' "$tag"
 }
@@ -2799,7 +2814,7 @@ pin_remnanode_image() {
   local tag="${1:-$NODE_IMAGE_PIN}"
   local image="${NODE_IMAGE_REPO}:${tag}"
   [[ -f "$COMPOSE" ]] || { warn "docker-compose.yml не найден"; return 1; }
-  info "Ставлю образ ${image} (панель 2.7.x не умеет ноду 3.x)…"
+  info "Ставлю образ ${image}…"
   set_compose_node_image "$image" || return 1
   fix_remnanode_s6_init || true
   (cd "$DIR" && docker compose pull && docker compose up -d --force-recreate) || {
@@ -2810,29 +2825,19 @@ pin_remnanode_image() {
   return 0
 }
 
-# :latest из нашего старого compose → сразу 2.7.0. 3.x — спрашиваем.
-ensure_pinned_node_image() {
+# После апдейта панели до 3.x ноду 2.x можно (и нужно) поднять на latest.
+offer_node_latest_for_panel3() {
   [[ -f "$COMPOSE" ]] || return 0
   grep -qE 'container_name:[[:space:]]*remnanode|remnawave/node' "$COMPOSE" 2>/dev/null || return 0
-  local img tag run_img run_tag ans=""
+  local img tag ans=""
   img=$(get_compose_node_image 2>/dev/null || true)
   tag=$(node_image_tag "$img")
-  run_img=$(get_running_node_image)
-  run_tag=$(node_image_tag "$run_img")
-  if [[ "$tag" == "latest" || "$run_tag" == "latest" ]]; then
-    echo
-    warn "Образ remnawave/node:latest — сейчас это 3.3.x."
-    warn "Панель 2.7.4 не проходит mTLS (EPROTO / alert 40): порт открыт, сертификата нет."
-    pin_remnanode_image "$NODE_IMAGE_PIN" || return 1
-    return 0
-  fi
-  if node_image_incompatible_panel27 "$tag" || node_image_incompatible_panel27 "$run_tag"; then
-    echo
-    warn "Образ ${img:-$run_img} — линия 3.x. Панель 2.7.4 с ней не стыкуется."
-    ask_yes_no "Откатить на ${NODE_IMAGE_DEFAULT}?" ans Y
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-      pin_remnanode_image "$NODE_IMAGE_PIN" || return 1
-    fi
+  node_image_is_v2 "$tag" || return 0
+  echo
+  info "Нода на ${img}. Панель 3.x работает с latest; 2.x оставлять не обязательно."
+  ask_yes_no "Переключить ноду на ${NODE_IMAGE_DEFAULT}?" ans Y
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    pin_remnanode_image latest || return 1
   fi
   return 0
 }
@@ -3140,8 +3145,8 @@ EOF
   echo
   echo -e "  ${YELLOW}⚠  В панели Remnawave:${NC}"
   echo -e "    • Address = IP этой ноды, ${WHITE}Node Port = ${NODE_PORT}${NC}  ${GRAY}(не 443)${NC}"
-  echo -e "    • Панель 2.7.4 + нода 3.x/latest = EPROTO (порт открыт, сертификата нет)"
-  echo -e "    • Образ: ${CYAN}remnanode pin-image${NC}   ключ: ${CYAN}remnanode secret${NC}"
+  echo -e "    • Панель и нода одной линии: 3.x + latest. Сначала: ${CYAN}remnanode panel-update${NC} на сервере панели"
+  echo -e "    • Образ ноды: ${CYAN}remnanode pin-image latest${NC}   ключ: ${CYAN}remnanode secret${NC}"
   echo
   echo -e "  ${YELLOW}💡 Рекомендуется отдельно:${NC}"
   echo -e "    • 🛡️  UFW — ограничить NODE_PORT только IP панели"
@@ -3157,7 +3162,7 @@ diagnose_remnanode_eproto() {
   hline 56
   echo
   echo -e "  ${GRAY}write EPROTO … ssl/tls alert handshake failure … alert number 40${NC}"
-  echo -e "  ${GRAY}Пишет панель, рвётся TLS на ноде. Панель 2.7.4 трогать не нужно.${NC}"
+  echo -e "  ${GRAY}Пишет панель, рвётся TLS на ноде. Порядок: панель 3.x, затем нода latest.${NC}"
   echo
   local port="" file_key="" file_len=0 img="" tag="" run_img=""
   port=$(get_node_port 2>/dev/null || true)
@@ -3166,23 +3171,22 @@ diagnose_remnanode_eproto() {
   tag=$(node_image_tag "$img")
   run_img=$(get_running_node_image)
 
-  echo -e "  ${WHITE}0. Образ ноды (главная причина на новых серверах)${NC}"
+  echo -e "  ${WHITE}0. Образ ноды${NC}"
   echo -e "     compose: ${CYAN}${img:-—}${NC}"
   [[ -n "$run_img" ]] && echo -e "     контейнер: ${CYAN}${run_img}${NC}"
-  if node_image_incompatible_panel27 "$tag" || [[ "$(node_image_tag "$run_img")" == "latest" ]] \
-     || node_image_incompatible_panel27 "$(node_image_tag "$run_img")"; then
-    warn "latest/3.x несовместим с панелью 2.7.4: TCP/${port} открыт, своего сертификата нет."
-    echo -e "     ${GRAY}Рабочая нода 2.x на :3000 отдаёт cert и просит клиентский. 3.x — сразу alert 40.${NC}"
+  if node_image_is_v2 "$tag" || node_image_is_v2 "$(node_image_tag "$run_img")"; then
+    info "Нода линии 2.x. После panel-update переключите на latest."
     local pin_ans=""
-    ask_yes_no "Переключить на ${NODE_IMAGE_DEFAULT} и пересоздать?" pin_ans Y
+    ask_yes_no "Переключить ноду на ${NODE_IMAGE_DEFAULT} сейчас?" pin_ans Y
     if [[ "$pin_ans" =~ ^[Yy]$ ]]; then
-      pin_remnanode_image "$NODE_IMAGE_PIN" || true
+      pin_remnanode_image latest || true
       sleep 3
       img=$(get_compose_node_image 2>/dev/null || true)
       tag=$(node_image_tag "$img")
     fi
-  else
-    ok "Образ линии 2.x (${tag}) — подходит панели 2.7.4"
+  elif node_image_is_v3 "$tag"; then
+    ok "Образ линии 3.x (${tag}) — нужен панели 3.3+"
+    echo -e "     ${GRAY}Если панель ещё 2.7.4 — сначала remnanode panel-update на сервере панели.${NC}"
   fi
   echo
 
@@ -3204,9 +3208,9 @@ diagnose_remnanode_eproto() {
       local tls_rc=0
       probe_node_tls "$port" || tls_rc=$?
       case "$tls_rc" in
-        0) ok "TLS как у RemnaNode 2.x: есть сертификат, запрошен клиентский" ;;
+        0) ok "TLS: есть сертификат, запрошен клиентский (как у RemnaNode)" ;;
         3) warn "На :${port} чужой TLS (есть cert, но без запроса клиентского) — не нода" ;;
-        1) warn "На :${port} нет сертификата, handshake падает — так выглядит latest/3.x для панели 2.7.4" ;;
+        1) warn "На :${port} нет сертификата, handshake падает — нода 3.x vs панель 2.7 или битый ключ" ;;
       esac
     fi
   elif [[ "$port" =~ ^[0-9]+$ ]]; then
@@ -3297,6 +3301,185 @@ update_remnanode_secret() {
   fi
   echo
   echo -e "  ${YELLOW}В панели:${NC} Node Port = ${WHITE}${port}${NC}, ключ тот же, что только что вставили."
+}
+
+###############################################################################
+# ПАНЕЛЬ Remnawave — апдейт до линии 3.x (запускать НА СЕРВЕРЕ ПАНЕЛИ)
+###############################################################################
+panel_compose_path() {
+  local f
+  for f in "$PANEL_COMPOSE" /opt/remnawave/docker-compose.yml /opt/remnawave/docker-compose.yaml; do
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+panel_env_path() {
+  local dir compose envf
+  compose=$(panel_compose_path 2>/dev/null || true)
+  [[ -n "$compose" ]] && dir=$(dirname "$compose")
+  envf="${dir:-$PANEL_DIR}/.env"
+  [[ -f "$envf" ]] && { printf '%s' "$envf"; return 0; }
+  return 1
+}
+
+get_panel_backend_image() {
+  local compose="$1"
+  grep -E '^[[:space:]]*image:[[:space:]]*(ghcr\.io/)?remnawave/backend:' "$compose" 2>/dev/null \
+    | head -1 | sed -E 's/^[[:space:]]*image:[[:space:]]*//; s/["'\'']//g; s/[[:space:]]+$//'
+}
+
+_panel_env_get() {
+  local file="$1" key="$2"
+  grep -E "^${key}=" "$file" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/^["'\'']//' -e 's/["'\'']$//'
+}
+
+_panel_env_has() {
+  local file="$1" key="$2"
+  grep -qE "^${key}=" "$file" 2>/dev/null
+}
+
+# JWT_AUTH_SECRET → APP_SECRET (v3). Redis TCP, если сокета нет.
+migrate_panel_env_v3() {
+  local envf="$1"
+  [[ -f "$envf" ]] || return 1
+  local jwt front
+  if ! _panel_env_has "$envf" APP_SECRET; then
+    jwt=$(_panel_env_get "$envf" JWT_AUTH_SECRET)
+    if [[ -n "$jwt" ]]; then
+      printf '\n### Secrets ###\nAPP_SECRET=%s\n' "$jwt" >> "$envf"
+      ok "APP_SECRET скопирован из JWT_AUTH_SECRET"
+    else
+      warn "Нет JWT_AUTH_SECRET и APP_SECRET — сессии панели сбросятся, задайте APP_SECRET в .env"
+    fi
+  fi
+  if ! _panel_env_has "$envf" REDIS_SOCKET && ! _panel_env_has "$envf" REDIS_HOST; then
+    printf '\nREDIS_HOST=remnawave-redis\nREDIS_PORT=6379\n' >> "$envf"
+    ok "REDIS_HOST=remnawave-redis (TCP, без valkey-сокета)"
+  fi
+  if ! _panel_env_has "$envf" PANEL_DOMAIN; then
+    front=$(_panel_env_get "$envf" FRONT_END_DOMAIN)
+    if [[ -n "$front" && "$front" != "*" ]]; then
+      front="${front#https://}"; front="${front#http://}"; front="${front%%/*}"
+      printf '\nPANEL_DOMAIN=%s\n' "$front" >> "$envf"
+      ok "PANEL_DOMAIN=${front}"
+    fi
+  fi
+  return 0
+}
+
+_panel_backup() {
+  local compose="$1" envf="$2" dest
+  dest="${PANEL_DIR}/backups/panel-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$dest"
+  cp -a "$compose" "$dest/docker-compose.yml" 2>/dev/null || true
+  [[ -f "$envf" ]] && cp -a "$envf" "$dest/.env"
+  local pg_user pg_db
+  pg_user=$(_panel_env_get "$envf" POSTGRES_USER)
+  pg_db=$(_panel_env_get "$envf" POSTGRES_DB)
+  [[ -n "$pg_user" ]] || pg_user=postgres
+  [[ -n "$pg_db" ]] || pg_db=postgres
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnawave-db; then
+    info "Дамп PostgreSQL…"
+    if docker exec remnawave-db pg_dump -U "$pg_user" "$pg_db" > "$dest/db.sql" 2>/dev/null; then
+      ok "Бэкап БД: $dest/db.sql"
+    else
+      warn "pg_dump не удался — .env и compose всё равно сохранены в $dest"
+    fi
+  fi
+  ok "Бэкап панели: $dest"
+}
+
+# Сменить тег backend на :3 (официальная линия 3.x). Postgres не трогаем.
+_panel_pin_backend_3() {
+  local compose="$1"
+  local bak="${compose}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -a "$compose" "$bak"
+  sed -i -E \
+    's#(image:[[:space:]]*(ghcr\.io/)?remnawave/backend):(latest|[0-9][^[:space:]]*)#\1:3#' \
+    "$compose"
+  if grep -qE 'image:[[:space:]]*(ghcr\.io/)?remnawave/backend:3([[:space:]]|$)' "$compose"; then
+    ok "Образ панели: remnawave/backend:3"
+    return 0
+  fi
+  warn "Не нашёл image remnawave/backend в $compose — поправьте вручную"
+  return 1
+}
+
+update_remnawave_panel() {
+  show_header
+  echo -e "${WHITE}${BOLD}  🖥️  Обновление панели Remnawave → 3.x${NC}"
+  hline 56
+  echo
+  echo -e "  ${GRAY}Запускать на сервере ПАНЕЛИ (/opt/remnawave), не на ноде.${NC}"
+  echo -e "  ${GRAY}Тег backend:2 остаётся на 2.x. Последняя линия — backend:3.${NC}"
+  echo -e "  ${GRAY}Релиз: https://f.docs.rw/t/topic/354${NC}"
+  echo
+
+  local compose envf img dir
+  compose=$(panel_compose_path 2>/dev/null || true)
+  if [[ -z "$compose" ]]; then
+    warn "Не найден ${PANEL_COMPOSE}"
+    echo
+    echo -e "  Это сервер ноды? Тогда откройте ${WHITE}IP панели${NC} и выполните там:"
+    echo
+    echo -e "  ${CYAN}bash <(curl -Ls \"https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?\$(date +%s)\") panel-update${NC}"
+    echo
+    return 1
+  fi
+  envf=$(panel_env_path 2>/dev/null || true)
+  dir=$(dirname "$compose")
+  img=$(get_panel_backend_image "$compose")
+  echo -e "  Compose: ${CYAN}${compose}${NC}"
+  echo -e "  .env:    ${CYAN}${envf:-—}${NC}"
+  echo -e "  Сейчас:  ${CYAN}${img:-не найден}${NC}"
+  echo -e "  Цель:    ${CYAN}${PANEL_IMAGE}${NC}"
+  echo
+  echo -e "  ${YELLOW}Будет:${NC} бэкап .env/compose/БД → APP_SECRET → тег :3 → pull + recreate"
+  echo -e "  ${YELLOW}Не будет:${NC} апгрейд Postgres 17→18 (это отдельная миграция томов)"
+  echo
+  local ans=""
+  ask_yes_no "Обновить панель до remnawave/backend:3 сейчас?" ans Y
+  [[ "$ans" =~ ^[Yy]$ ]] || { warn "Отмена"; return 0; }
+
+  [[ -n "$envf" ]] || { warn ".env не найден рядом с compose"; return 1; }
+
+  _panel_backup "$compose" "$envf"
+  migrate_panel_env_v3 "$envf"
+  _panel_pin_backend_3 "$compose" || return 1
+
+  info "Скачиваю ${PANEL_IMAGE}…"
+  (cd "$dir" && docker compose pull remnawave) || {
+    warn "pull remnawave не удался — проверьте сеть / docker login"
+    return 1
+  }
+  info "Пересоздаю контейнер панели…"
+  (cd "$dir" && docker compose up -d --force-recreate remnawave) || {
+    warn "recreate не удался — docker logs remnawave"
+    docker logs --tail 40 remnawave 2>&1 | sed 's/^/    /' || true
+    return 1
+  }
+
+  if [[ -f "$dir/subscription/docker-compose.yml" ]]; then
+    info "Обновляю Subscription Page…"
+    (cd "$dir/subscription" && docker compose pull && docker compose up -d) || \
+      warn "subpage не обновилась — проверьте $dir/subscription"
+  elif [[ -d "$dir/subscription" && -f "$dir/docker-compose.yml" ]] \
+       && grep -q subscription "$dir/docker-compose.yml" 2>/dev/null; then
+    (cd "$dir" && docker compose pull && docker compose up -d) || true
+  fi
+
+  echo
+  local ver=""
+  ver=$(docker inspect --format '{{.Config.Image}} {{index .Config.Labels "org.opencontainers.image.version"}}' remnawave 2>/dev/null || true)
+  ok "Панель пересоздана"
+  [[ -n "$ver" ]] && echo -e "  Образ: ${CYAN}${ver}${NC}"
+  echo
+  echo -e "  ${YELLOW}Дальше на КАЖДОЙ ноде:${NC}"
+  echo -e "    ${CYAN}remnanode pin-image latest${NC}"
+  echo -e "  В панели: Nodes → Management → Force restart all nodes"
+  echo
+  info "Логи: docker logs -f remnawave"
 }
 
 ###############################################################################
@@ -4933,8 +5116,8 @@ node_status_screen() {
     _tty_printf '  %b🧩 Компоненты:%b\n' "$WHITE" "$NC"
     node_ver=$(docker inspect --format '{{.Config.Image}}' remnanode 2>/dev/null || echo "?")
     _tty_printf '     %-10s %b%s%b\n' "Образ:" "$CYAN" "$node_ver" "$NC"
-    if node_image_incompatible_panel27 "$(node_image_tag "$node_ver")"; then
-      _tty_printf '     %b⚠ latest/3.x + панель 2.7.4 = EPROTO — пункт 10 или remnanode pin-image%b\n' "$YELLOW" "$NC"
+    if node_image_is_v2 "$(node_image_tag "$node_ver")"; then
+      _tty_printf '     %bНода 2.x — после panel-update: пункт 10 → latest%b\n' "$YELLOW" "$NC"
     fi
     xray_ver=$(docker exec remnanode xray version 2>/dev/null | head -1 || echo "н/д")
     _tty_printf '     %-10s %s\n' "Xray:" "$xray_ver"
@@ -4968,7 +5151,6 @@ node_status_screen() {
 
 remnanode_menu() {
   RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
-  ensure_pinned_node_image || true
 
   while true; do
     PUBLIC_IP=$(get_public_ip)
@@ -4988,7 +5170,7 @@ remnanode_menu() {
     _tty_echo "    ${WHITE} 9)${NC} 📺 LIVE-мониторинг"
     _tty_echo ""
     _tty_printf '  %b⚙️  Обновления и конфигурация:%b\n' "$WHITE" "$NC"
-    _tty_echo "    ${WHITE}10)${NC} 🐳 Образ ноды (пин 2.7.0 / не latest)"
+    _tty_echo "    ${WHITE}10)${NC} 🐳 Образ ноды (latest / пин версии)"
     _tty_echo "    ${WHITE}11)${NC} 🔧 Фикс онлайна Hysteria2 / custom Xray"
     _tty_echo "    ${WHITE}12)${NC} 📝 Редактировать docker-compose.yml"
     _tty_echo "    ${WHITE}13)${NC} 🔐 Редактировать .env"
@@ -5053,7 +5235,7 @@ remnanode_menu() {
       10)
         [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
         echo
-        info "Панель 2.7.4 → только линия 2.x. latest = 3.3.x → EPROTO."
+        info "Панель 3.x → latest. Панель 2.7.x → 2.7.0."
         local img_tag=""
         ask_node_image_tag img_tag
         pin_remnanode_image "$img_tag" || true
@@ -5161,7 +5343,6 @@ live_panel() {
 main_menu() {
   # Чтобы команда remnanode была доступна сразу
   RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
-  ensure_pinned_node_image || true
 
   while true; do
     PUBLIC_IP=$(get_public_ip)
@@ -5185,6 +5366,7 @@ main_menu() {
     section "🎛️  Сервис"
     menu_item "📡" "12" "Нода"       "меню управления"    node_cli
     menu_item "🧪" "13" "Тесты"      "speed / ping / DNS"
+    menu_item "🖥️" "14" "Панель"     "обновить до 3.x"
     _tty_echo ""
     menu_item "🚪" "0"  "Выход"      ""
     _tty_echo ""
@@ -5204,6 +5386,7 @@ main_menu() {
       11) setup_antiddos; pause ;;
       12) remnanode_menu ;;
       13) tests_menu ;;
+      14) update_remnawave_panel; pause ;;
       0)  exit 0 ;;
       *)  ;;
     esac
@@ -5287,15 +5470,15 @@ case "${1:-}" in
     docker logs -f --tail 100 remnanode
     ;;
   update)
-    if [[ -f "$COMPOSE" ]] && node_image_incompatible_panel27 "$(node_image_tag "$(get_compose_node_image 2>/dev/null || true)")"; then
-      pin_remnanode_image "$NODE_IMAGE_PIN" || true
-    else
-      cd "$DIR" && docker compose pull && docker compose up -d
-    fi
+    cd "$DIR" && docker compose pull && docker compose up -d
     ;;
   pin-image|pin|node-image)
     _menu_soft_mode
-    pin_remnanode_image "${2:-$NODE_IMAGE_PIN}"
+    pin_remnanode_image "${2:-latest}"
+    ;;
+  panel-update|update-panel|upgrade-panel)
+    _menu_soft_mode
+    update_remnawave_panel
     ;;
   manage|node|panel)
     _menu_soft_mode
