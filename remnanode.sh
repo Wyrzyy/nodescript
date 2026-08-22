@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.25
+# Версия: 2026.8.26
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.8.25"
+_REMNANODE_VER_PIN="2026.8.26"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -41,6 +41,11 @@ SPEEDTEST_LOG="$SPEEDTEST_DIR/speedtest-history.log"
 CUSTOM_XRAY_DIR="$DIR/custom-xray"
 XRAY_VERSION_DEFAULT="v26.6.1"
 PANEL_IP_DEFAULT="141.98.7.57"
+# Панель 2.7.4 не поднимает mTLS с нодой 3.x. latest сейчас = 3.3.x → EPROTO alert 40.
+NODE_IMAGE_REPO="remnawave/node"
+NODE_IMAGE_PIN="2.7.0"
+NODE_IMAGE_DEFAULT="${NODE_IMAGE_REPO}:${NODE_IMAGE_PIN}"
+NODE_IMAGE_FILE="$DIR/.node_image"
 WARP_PORT=9091
 LAUNCHER_PATH="/opt/remnanode/installer.sh"
 CLI_PATH="/usr/local/bin/remnanode"
@@ -2730,6 +2735,124 @@ fix_remnanode_s6_init() {
   return 0
 }
 
+get_compose_node_image() {
+  [[ -f "$COMPOSE" ]] || return 1
+  local img
+  img=$(grep -E '^[[:space:]]*image:[[:space:]]*' "$COMPOSE" 2>/dev/null | head -1 \
+    | sed -E 's/^[[:space:]]*image:[[:space:]]*//; s/["'\'']//g; s/[[:space:]]+$//' || true)
+  [[ -n "$img" ]] || return 1
+  printf '%s' "$img"
+}
+
+get_running_node_image() {
+  docker inspect --format '{{.Config.Image}}' remnanode 2>/dev/null || true
+}
+
+node_image_tag() {
+  local img="${1:-}"
+  [[ -n "$img" ]] || { printf '%s' "latest"; return 0; }
+  if [[ "$img" != *:* ]]; then
+    printf '%s' "latest"
+    return 0
+  fi
+  printf '%s' "${img##*:}"
+}
+
+# latest / 3.x несовместимы с панелью 2.7.x (пустой TLS, EPROTO 40)
+node_image_incompatible_panel27() {
+  local tag="$1"
+  [[ -z "$tag" || "$tag" == "latest" ]] && return 0
+  [[ "$tag" == 3* ]] && return 0
+  return 1
+}
+
+ask_node_image_tag() {
+  local varname="$1" ch="" tag
+  echo
+  info "Образ ноды должен совпадать с мажором панели. latest сейчас = 3.3.x."
+  echo -e "  ${WHITE}1)${NC}  Панель ${BOLD}2.7.x${NC}  →  ${CYAN}${NODE_IMAGE_REPO}:2.7.0${NC}  ${GRAY}[ваш случай]${NC}"
+  echo -e "  ${WHITE}2)${NC}  Панель 2.8.x  →  ${CYAN}${NODE_IMAGE_REPO}:2.8.0${NC}"
+  echo -e "  ${WHITE}3)${NC}  Панель 3.x    →  ${CYAN}${NODE_IMAGE_REPO}:latest${NC}  ${GRAY}(только 3.3+)${NC}"
+  ask_choice ch "👉 Версия панели [1]:"
+  case "$ch" in
+    2) tag="2.8.0" ;;
+    3) tag="latest" ;;
+    *) tag="$NODE_IMAGE_PIN" ;;
+  esac
+  printf -v "$varname" '%s' "$tag"
+}
+
+set_compose_node_image() {
+  local image="$1"
+  [[ -f "$COMPOSE" ]] || return 1
+  if grep -qE '^[[:space:]]*image:[[:space:]]*' "$COMPOSE" 2>/dev/null; then
+    sed -i -E "s|^[[:space:]]*image:[[:space:]]*.+|    image: ${image}|" "$COMPOSE"
+  else
+    return 1
+  fi
+  printf '%s\n' "$image" > "$NODE_IMAGE_FILE" 2>/dev/null || true
+  return 0
+}
+
+# Переключить compose на пин и пересоздать контейнер.
+pin_remnanode_image() {
+  local tag="${1:-$NODE_IMAGE_PIN}"
+  local image="${NODE_IMAGE_REPO}:${tag}"
+  [[ -f "$COMPOSE" ]] || { warn "docker-compose.yml не найден"; return 1; }
+  info "Ставлю образ ${image} (панель 2.7.x не умеет ноду 3.x)…"
+  set_compose_node_image "$image" || return 1
+  fix_remnanode_s6_init || true
+  (cd "$DIR" && docker compose pull && docker compose up -d --force-recreate) || {
+    warn "Не удалось пересоздать контейнер на ${image}"
+    return 1
+  }
+  ok "Нода на образе ${image}"
+  return 0
+}
+
+# :latest из нашего старого compose → сразу 2.7.0. 3.x — спрашиваем.
+ensure_pinned_node_image() {
+  [[ -f "$COMPOSE" ]] || return 0
+  grep -qE 'container_name:[[:space:]]*remnanode|remnawave/node' "$COMPOSE" 2>/dev/null || return 0
+  local img tag run_img run_tag ans=""
+  img=$(get_compose_node_image 2>/dev/null || true)
+  tag=$(node_image_tag "$img")
+  run_img=$(get_running_node_image)
+  run_tag=$(node_image_tag "$run_img")
+  if [[ "$tag" == "latest" || "$run_tag" == "latest" ]]; then
+    echo
+    warn "Образ remnawave/node:latest — сейчас это 3.3.x."
+    warn "Панель 2.7.4 не проходит mTLS (EPROTO / alert 40): порт открыт, сертификата нет."
+    pin_remnanode_image "$NODE_IMAGE_PIN" || return 1
+    return 0
+  fi
+  if node_image_incompatible_panel27 "$tag" || node_image_incompatible_panel27 "$run_tag"; then
+    echo
+    warn "Образ ${img:-$run_img} — линия 3.x. Панель 2.7.4 с ней не стыкуется."
+    ask_yes_no "Откатить на ${NODE_IMAGE_DEFAULT}?" ans Y
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      pin_remnanode_image "$NODE_IMAGE_PIN" || return 1
+    fi
+  fi
+  return 0
+}
+
+# Локальный зонд: RemnaNode 2.x отдаёт свой сертификат и просит клиентский.
+# 3.x / чужой TLS на NODE_PORT — handshake падает без сертификата.
+probe_node_tls() {
+  local port="${1:-}" out
+  [[ "$port" =~ ^[0-9]+$ ]] || return 2
+  command -v openssl >/dev/null 2>&1 || return 2
+  out=$(echo | timeout 6 openssl s_client -connect "127.0.0.1:${port}" 2>&1 || true)
+  if printf '%s' "$out" | grep -q 'BEGIN CERTIFICATE'; then
+    if printf '%s' "$out" | grep -qiE 'Acceptable client certificate CA names|Client Certificate Types|Requested Signature Algorithms'; then
+      return 0
+    fi
+    return 3
+  fi
+  return 1
+}
+
 remnanode_logs_secret_error() {
   docker logs --tail 80 remnanode 2>&1 | grep -qiE \
     'Invalid SECRET_KEY|SECRET_KEY contains invalid|SECRET_KEY missing|SECRET_KEY payload'
@@ -2843,6 +2966,11 @@ install_remnanode() {
 
   ask "🔗 XTLS_API_PORT" XTLS_API_PORT "61000"
 
+  local NODE_IMAGE_TAG=""
+  ask_node_image_tag NODE_IMAGE_TAG
+  local NODE_IMAGE="${NODE_IMAGE_REPO}:${NODE_IMAGE_TAG}"
+  ok "Образ: ${NODE_IMAGE}"
+
   echo
   info "🔑 SECRET_KEY — из панели Remnawave → Nodes → нода → иконка копирования"
   echo -e "  ${GRAY}Одна вставка (Ctrl+Shift+V). Двойной ввод убран: оба раза одинаково обрезались.${NC}"
@@ -2890,7 +3018,7 @@ install_remnanode() {
   cat > "$COMPOSE" <<EOF
 services:
   remnanode:
-    image: remnawave/node:latest
+    image: ${NODE_IMAGE}
     container_name: remnanode
     hostname: remnanode
     network_mode: host
@@ -2926,6 +3054,7 @@ EOF
   # Сохраним IP панели для будущего UFW
   echo "$PANEL_IP" > "$DIR/.panel_ip"
   echo "$NODE_PORT" > "$DIR/.node_port"
+  echo "$NODE_IMAGE" > "$NODE_IMAGE_FILE"
 
   cd "$DIR"
   info "5️⃣/8  Скачивание образа (может занять несколько минут)…"
@@ -3005,13 +3134,14 @@ EOF
   echo -e "  🔌 NODE_PORT:   ${NODE_PORT}  ${GRAY}(firewall OPEN)${NC}"
   echo -e "  🔗 XTLS_API:    ${XTLS_API_PORT}"
   echo -e "  🔑 SECRET_KEY:  ${#K1} символов"
+  echo -e "  🐳 Образ:       ${NODE_IMAGE}"
   echo -e "  📡 Управление:  ${CYAN}remnanode${NC}"
   echo -e "  📋 Лог:         ${GRAY}${LOG}${NC}"
   echo
   echo -e "  ${YELLOW}⚠  В панели Remnawave:${NC}"
   echo -e "    • Address = IP этой ноды, ${WHITE}Node Port = ${NODE_PORT}${NC}  ${GRAY}(не 443)${NC}"
-  echo -e "    • EPROTO / SSL alert 40 = неверный SECRET_KEY или порт 443 вместо NODE_PORT"
-  echo -e "    • Сменить ключ: ${CYAN}remnanode secret${NC}"
+  echo -e "    • Панель 2.7.4 + нода 3.x/latest = EPROTO (порт открыт, сертификата нет)"
+  echo -e "    • Образ: ${CYAN}remnanode pin-image${NC}   ключ: ${CYAN}remnanode secret${NC}"
   echo
   echo -e "  ${YELLOW}💡 Рекомендуется отдельно:${NC}"
   echo -e "    • 🛡️  UFW — ограничить NODE_PORT только IP панели"
@@ -3027,11 +3157,34 @@ diagnose_remnanode_eproto() {
   hline 56
   echo
   echo -e "  ${GRAY}write EPROTO … ssl/tls alert handshake failure … alert number 40${NC}"
-  echo -e "  ${GRAY}Панель не смогла пройти mTLS к ноде. Это не «порт OPEN» в firewall.${NC}"
+  echo -e "  ${GRAY}Пишет панель, рвётся TLS на ноде. Панель 2.7.4 трогать не нужно.${NC}"
   echo
-  local port="" file_key="" file_len=0
+  local port="" file_key="" file_len=0 img="" tag="" run_img=""
   port=$(get_node_port 2>/dev/null || true)
   [[ -n "$port" ]] || port="—"
+  img=$(get_compose_node_image 2>/dev/null || true)
+  tag=$(node_image_tag "$img")
+  run_img=$(get_running_node_image)
+
+  echo -e "  ${WHITE}0. Образ ноды (главная причина на новых серверах)${NC}"
+  echo -e "     compose: ${CYAN}${img:-—}${NC}"
+  [[ -n "$run_img" ]] && echo -e "     контейнер: ${CYAN}${run_img}${NC}"
+  if node_image_incompatible_panel27 "$tag" || [[ "$(node_image_tag "$run_img")" == "latest" ]] \
+     || node_image_incompatible_panel27 "$(node_image_tag "$run_img")"; then
+    warn "latest/3.x несовместим с панелью 2.7.4: TCP/${port} открыт, своего сертификата нет."
+    echo -e "     ${GRAY}Рабочая нода 2.x на :3000 отдаёт cert и просит клиентский. 3.x — сразу alert 40.${NC}"
+    local pin_ans=""
+    ask_yes_no "Переключить на ${NODE_IMAGE_DEFAULT} и пересоздать?" pin_ans Y
+    if [[ "$pin_ans" =~ ^[Yy]$ ]]; then
+      pin_remnanode_image "$NODE_IMAGE_PIN" || true
+      sleep 3
+      img=$(get_compose_node_image 2>/dev/null || true)
+      tag=$(node_image_tag "$img")
+    fi
+  else
+    ok "Образ линии 2.x (${tag}) — подходит панели 2.7.4"
+  fi
+  echo
 
   echo -e "  ${WHITE}1. Порт в панели${NC}"
   echo -e "     NODE_PORT ноды: ${CYAN}${port}${NC}"
@@ -3039,7 +3192,7 @@ diagnose_remnanode_eproto() {
   echo -e "     443 — Selfsteal/Reality, там другой TLS → та же ошибка EPROTO."
   echo
 
-  echo -e "  ${WHITE}2. Контейнер и слушатель${NC}"
+  echo -e "  ${WHITE}2. Контейнер, слушатель и TLS${NC}"
   if is_remnanode_up; then
     ok "Контейнер remnanode запущен"
   else
@@ -3047,6 +3200,15 @@ diagnose_remnanode_eproto() {
   fi
   if [[ "$port" =~ ^[0-9]+$ ]] && is_node_port_listening "$port"; then
     ok "TCP/${port} слушает"
+    if command -v openssl >/dev/null 2>&1; then
+      local tls_rc=0
+      probe_node_tls "$port" || tls_rc=$?
+      case "$tls_rc" in
+        0) ok "TLS как у RemnaNode 2.x: есть сертификат, запрошен клиентский" ;;
+        3) warn "На :${port} чужой TLS (есть cert, но без запроса клиентского) — не нода" ;;
+        1) warn "На :${port} нет сертификата, handshake падает — так выглядит latest/3.x для панели 2.7.4" ;;
+      esac
+    fi
   elif [[ "$port" =~ ^[0-9]+$ ]]; then
     warn "TCP/${port} не слушает — нода не принимает соединения панели"
   fi
@@ -4771,6 +4933,9 @@ node_status_screen() {
     _tty_printf '  %b🧩 Компоненты:%b\n' "$WHITE" "$NC"
     node_ver=$(docker inspect --format '{{.Config.Image}}' remnanode 2>/dev/null || echo "?")
     _tty_printf '     %-10s %b%s%b\n' "Образ:" "$CYAN" "$node_ver" "$NC"
+    if node_image_incompatible_panel27 "$(node_image_tag "$node_ver")"; then
+      _tty_printf '     %b⚠ latest/3.x + панель 2.7.4 = EPROTO — пункт 10 или remnanode pin-image%b\n' "$YELLOW" "$NC"
+    fi
     xray_ver=$(docker exec remnanode xray version 2>/dev/null | head -1 || echo "н/д")
     _tty_printf '     %-10s %s\n' "Xray:" "$xray_ver"
     if grep -q 'custom-xray/xray' "$COMPOSE" 2>/dev/null; then
@@ -4803,6 +4968,7 @@ node_status_screen() {
 
 remnanode_menu() {
   RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
+  ensure_pinned_node_image || true
 
   while true; do
     PUBLIC_IP=$(get_public_ip)
@@ -4822,7 +4988,7 @@ remnanode_menu() {
     _tty_echo "    ${WHITE} 9)${NC} 📺 LIVE-мониторинг"
     _tty_echo ""
     _tty_printf '  %b⚙️  Обновления и конфигурация:%b\n' "$WHITE" "$NC"
-    _tty_echo "    ${WHITE}10)${NC} ⬆️  Обновить образ RemnaNode"
+    _tty_echo "    ${WHITE}10)${NC} 🐳 Образ ноды (пин 2.7.0 / не latest)"
     _tty_echo "    ${WHITE}11)${NC} 🔧 Фикс онлайна Hysteria2 / custom Xray"
     _tty_echo "    ${WHITE}12)${NC} 📝 Редактировать docker-compose.yml"
     _tty_echo "    ${WHITE}13)${NC} 🔐 Редактировать .env"
@@ -4886,8 +5052,12 @@ remnanode_menu() {
       9) live_panel ;;
       10)
         [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
-        cd "$DIR" && docker compose pull && docker compose up -d
-        ok "Обновлено"; pause
+        echo
+        info "Панель 2.7.4 → только линия 2.x. latest = 3.3.x → EPROTO."
+        local img_tag=""
+        ask_node_image_tag img_tag
+        pin_remnanode_image "$img_tag" || true
+        pause
         ;;
       11) fix_hysteria2_online; pause ;;
       12)
@@ -4991,6 +5161,7 @@ live_panel() {
 main_menu() {
   # Чтобы команда remnanode была доступна сразу
   RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
+  ensure_pinned_node_image || true
 
   while true; do
     PUBLIC_IP=$(get_public_ip)
@@ -5116,7 +5287,15 @@ case "${1:-}" in
     docker logs -f --tail 100 remnanode
     ;;
   update)
-    cd "$DIR" && docker compose pull && docker compose up -d
+    if [[ -f "$COMPOSE" ]] && node_image_incompatible_panel27 "$(node_image_tag "$(get_compose_node_image 2>/dev/null || true)")"; then
+      pin_remnanode_image "$NODE_IMAGE_PIN" || true
+    else
+      cd "$DIR" && docker compose pull && docker compose up -d
+    fi
+    ;;
+  pin-image|pin|node-image)
+    _menu_soft_mode
+    pin_remnanode_image "${2:-$NODE_IMAGE_PIN}"
     ;;
   manage|node|panel)
     _menu_soft_mode
