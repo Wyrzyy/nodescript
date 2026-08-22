@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.24
+# Версия: 2026.8.25
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.8.24"
+_REMNANODE_VER_PIN="2026.8.25"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -528,7 +528,9 @@ gh_download() {
   while IFS= read -r candidate; do
     [[ -z "$candidate" ]] && continue
     # anti-cache для raw.githubusercontent / зеркал
-    if [[ "$candidate" == *"raw.githubusercontent.com"* || "$candidate" == *"ghfast.top"* || "$candidate" == *"ghproxy.com"* ]]; then
+    if [[ "$candidate" == *"raw.githubusercontent.com"* || "$candidate" == *"ghfast.top"* \
+       || "$candidate" == *"ghproxy.com"* || "$candidate" == *"ghproxy.net"* \
+       || "$candidate" == *"cdn.jsdelivr.net"* ]]; then
       if [[ "$candidate" == *\?* ]]; then
         candidate="${candidate}&_=${bust}"
       else
@@ -2568,35 +2570,85 @@ EOF
 ###############################################################################
 # Установка CLI-панели (команда remnanode)
 ###############################################################################
+_parse_ver_pin() {
+  local f="${1:-}"
+  [[ -n "$f" && -f "$f" ]] || return 1
+  grep -E '^_REMNANODE_VER_PIN="[0-9]{4}\.' "$f" 2>/dev/null | head -1 \
+    | sed -E 's/^[^=]+=//; s/["'\'']//g; s/[[:space:]]//g'
+}
+
+# 0 если $1 строго новее $2 (2026.8.25 > 2026.8.23)
+_ver_newer() {
+  local a="$1" b="$2"
+  [[ -n "$a" ]] || return 1
+  [[ -z "$b" ]] && return 0
+  [[ "$a" == "$b" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "$b" "$a" | sort -V | tail -1)" == "$a" ]]
+}
+
+# Если на GitHub main новее этого процесса — записать в /opt и exec.
+# Иначе return 1 (остаёмся на текущем файле: свежая ветка / офлайн).
+_exec_if_github_newer() {
+  local tmp remote_ver
+  tmp=$(mktemp /tmp/remnanode-gh.XXXXXX.sh)
+  if ! gh_download "$LAUNCHER_RAW" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  remote_ver=$(_parse_ver_pin "$tmp" || true)
+  if ! _ver_newer "$remote_ver" "${_REMNANODE_VER_PIN:-}"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mkdir -p "$DIR"
+  cp -f "$tmp" "$LAUNCHER_PATH" 2>/dev/null || true
+  chmod +x "$tmp" "$LAUNCHER_PATH" 2>/dev/null || true
+  ln -sfn "$LAUNCHER_PATH" "$CLI_PATH" 2>/dev/null || true
+  info "Лаунчер с GitHub новее: v${_REMNANODE_VER_PIN} → v${remote_ver} — перезапуск…"
+  exec bash "$tmp" "$@"
+}
+
 install_self_cli() {
   local src="${BASH_SOURCE[0]:-$0}"
   local src_dir="" quiet="${RN_QUIET:-0}" force="${1:-}"
   src_dir=$(cd "$(dirname "$src")" 2>/dev/null && pwd || true)
   mkdir -p "$DIR"
 
-  # Всегда обновляем установленный лаунчер из текущего файла
-  if [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]]; then
-    cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
-  fi
-
-  # Версия установленной копии (только литерал YYYY.…, не ${…:-})
-  local inst_ver=""
+  local inst_ver="" remote_ver="" tmp=""
   if [[ -f "$LAUNCHER_PATH" ]]; then
-    inst_ver=$(grep -E '^_REMNANODE_VER(_PIN)?="[0-9]{4}\.' "$LAUNCHER_PATH" 2>/dev/null | head -1 \
-      | sed -E 's/^[^=]+=//; s/["'\'']//g' || true)
+    inst_ver=$(_parse_ver_pin "$LAUNCHER_PATH" || true)
   fi
 
-  # Устарело / нет файла / force — качаем свежий с GitHub (anti-cache)
-  if [[ "$force" == "force" ]] \
-     || [[ ! -f "$LAUNCHER_PATH" ]] \
-     || [[ -z "$inst_ver" ]] \
-     || [[ "$inst_ver" != "$_REMNANODE_VER_PIN" ]]; then
-    if [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]] \
-       && grep -qE "^_REMNANODE_VER_PIN=\"${_REMNANODE_VER_PIN}\"" "$src" 2>/dev/null; then
+  # force / @ install: сначала GitHub (антикэш), не слепая копия текущего файла.
+  # Иначе curl закэшированного main навсегда залипает на старой версии в /opt.
+  if [[ "$force" == "force" ]]; then
+    tmp=$(mktemp /tmp/remnanode-cli.XXXXXX.sh)
+    if gh_download "$LAUNCHER_RAW" "$tmp"; then
+      remote_ver=$(_parse_ver_pin "$tmp" || true)
+      if _ver_newer "$remote_ver" "${_REMNANODE_VER_PIN:-}" \
+         || _ver_newer "$remote_ver" "$inst_ver" \
+         || [[ -z "$inst_ver" ]]; then
+        cp -f "$tmp" "$LAUNCHER_PATH" 2>/dev/null || true
+      elif [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]]; then
+        cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
+      fi
+    elif [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]]; then
       cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
-    else
-      info "Обновляю лаунчер с GitHub → ${_REMNANODE_VER_PIN}…"
-      gh_download "$LAUNCHER_RAW" "$LAUNCHER_PATH" 2>/dev/null || true
+    fi
+    rm -f "$tmp"
+  else
+    if [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]]; then
+      cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
+    fi
+    inst_ver=$(_parse_ver_pin "$LAUNCHER_PATH" || true)
+    if [[ ! -f "$LAUNCHER_PATH" || -z "$inst_ver" || "$inst_ver" != "$_REMNANODE_VER_PIN" ]]; then
+      if [[ -f "$src" && "$src" != "/dev/stdin" && "$src" != /dev/fd/* ]] \
+         && grep -qE "^_REMNANODE_VER_PIN=\"${_REMNANODE_VER_PIN}\"" "$src" 2>/dev/null; then
+        cp -f "$src" "$LAUNCHER_PATH" 2>/dev/null || true
+      else
+        info "Обновляю лаунчер с GitHub → ${_REMNANODE_VER_PIN}…"
+        gh_download "$LAUNCHER_RAW" "$LAUNCHER_PATH" 2>/dev/null || true
+      fi
     fi
   fi
   chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
@@ -2614,34 +2666,6 @@ install_self_cli() {
   if [[ "$quiet" != "1" ]]; then
     ok "Команда управления: remnanode  (v$(launcher_version))"
   fi
-}
-
-# Если запущена старая копия из /opt — подтянуть свежую и перезапуститься
-_self_update_if_stale() {
-  [[ -f "$LAUNCHER_PATH" ]] || return 0
-  # уже свежий процесс (запущен не из старого installer)
-  local running="${BASH_SOURCE[0]:-$0}"
-  local run_ver pin
-  pin="${_REMNANODE_VER_PIN:-}"
-  [[ -n "$pin" ]] || return 0
-  run_ver=$(grep -E '^_REMNANODE_VER_PIN="[0-9]{4}\.' "$running" 2>/dev/null | head -1 \
-    | sed -E 's/^[^=]+=//; s/["'\'']//g' || true)
-  # если в этом файле уже есть актуальный pin — ок
-  [[ "$run_ver" == "$pin" ]] && return 0
-
-  # скачать свежий и exec
-  local tmp
-  tmp=$(mktemp /tmp/remnanode-upd.XXXXXX.sh)
-  if gh_download "$LAUNCHER_RAW" "$tmp"; then
-    if grep -qE "^_REMNANODE_VER_PIN=\"[0-9]{4}\." "$tmp" 2>/dev/null; then
-      cp -f "$tmp" "$LAUNCHER_PATH" 2>/dev/null || true
-      chmod +x "$tmp" "$LAUNCHER_PATH" 2>/dev/null || true
-      info "Найдена новая версия лаунчера — перезапуск…"
-      exec bash "$tmp" "$@"
-    fi
-  fi
-  rm -f "$tmp"
-  return 0
 }
 
 ###############################################################################
@@ -5035,11 +5059,13 @@ case "${1:-}" in
   # @ install / install — поставить CLI и открыть главное меню
   install|launcher|menu)
     _menu_soft_mode
+    _exec_if_github_newer "$@" || true
     RN_QUIET=0 install_self_cli force || true
     main_menu
     ;;
   self-update|update-self|update-launcher)
     _menu_soft_mode
+    _exec_if_github_newer self-update || true
     install_self_cli force
     ok "Лаунчер обновлён до v$(launcher_version)"
     info "Запуск: remnanode   или   bash $LAUNCHER_PATH"
@@ -5098,23 +5124,8 @@ case "${1:-}" in
     ;;
   *)
     _menu_soft_mode
-    # при обычном запуске remnanode — если копия в /opt устарела, обновим
-    if [[ "${BASH_SOURCE[0]:-$0}" == "$LAUNCHER_PATH" || "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null)" == "$LAUNCHER_PATH" ]]; then
-      _iv=""
-      _iv=$(grep -E '^_REMNANODE_VER_PIN="[0-9]{4}\.' "$LAUNCHER_PATH" 2>/dev/null | head -1 \
-        | sed -E 's/^[^=]+=//; s/["'\'']//g' || true)
-      if [[ -z "$_iv" || "$_iv" != "${_REMNANODE_VER_PIN:-}" ]]; then
-        _tmp=$(mktemp /tmp/remnanode-upd.XXXXXX.sh)
-        if gh_download "$LAUNCHER_RAW" "$_tmp" && grep -qE '^_REMNANODE_VER_PIN=' "$_tmp"; then
-          cp -f "$_tmp" "$LAUNCHER_PATH" 2>/dev/null || true
-          chmod +x "$LAUNCHER_PATH" "$_tmp" 2>/dev/null || true
-          ln -sfn "$LAUNCHER_PATH" "$CLI_PATH" 2>/dev/null || true
-          info "Лаунчер обновлён — перезапуск…"
-          exec bash "$_tmp" "$@"
-        fi
-        rm -f "$_tmp"
-      fi
-    fi
+    # remnanode / старый installer.sh — сверка с GitHub, не с самим собой
+    _exec_if_github_newer "$@" || true
     if [[ "$entry_name" == "remnanode" ]]; then
       remnanode_menu
     else
