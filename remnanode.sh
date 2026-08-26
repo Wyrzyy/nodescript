@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.27
+# Версия: 2026.8.28
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.8.27"
+_REMNANODE_VER_PIN="2026.8.28"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -148,9 +148,18 @@ _tty_read() {
 
 pause() {
   _tty_echo ""
-  _tty_printf "  ⏎  Нажмите Enter для продолжения..."
+  _tty_printf "  ⏎  Enter — назад / продолжить..."
   _tty_read >/dev/null
   _tty_echo ""
+}
+
+# Отмена ввода: q / b / назад
+_is_back() {
+  local s="${1:-}"
+  s="${s,,}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  [[ "$s" == "q" || "$s" == "b" || "$s" == "н" || "$s" == "назад" ]]
 }
 
 # Видимый вопрос → переменная. Всегда пишет prompt в /dev/tty.
@@ -347,6 +356,10 @@ ask_choice() {
   esac
   _tty_printf "  %b%s%b " "$WHITE" "$prompt" "$NC"
   _ans=$(_tty_read)
+  # q / назад в любом меню = пункт 0 (назад / выход из корня)
+  if _is_back "$_ans"; then
+    _ans="0"
+  fi
   printf -v "$varname" '%s' "$_ans"
 }
 
@@ -356,7 +369,11 @@ ask_yes_no() {
   if [[ "$default" =~ ^[Yy]$ ]]; then _hint="Y/n"; else _hint="y/N"; fi
   _tty_printf "  %b%s%b %b[%s]%b: " "$WHITE" "$prompt" "$NC" "$GRAY" "$_hint" "$NC"
   _ans=$(_tty_read)
-  if [[ -z "$_ans" ]]; then _ans="$default"; fi
+  if _is_back "$_ans"; then
+    _ans="n"
+  elif [[ -z "$_ans" ]]; then
+    _ans="$default"
+  fi
   printf -v "$varname" '%s' "$_ans"
 }
 
@@ -739,6 +756,68 @@ launcher_version() {
   printf '%s' "$v"
 }
 
+is_selfsteal_installed() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qiE 'selfsteal' && return 0
+  [[ -f /opt/caddy/docker-compose.yml ]] && return 0
+  [[ -f /opt/nginx-selfsteal/docker-compose.yml ]] && return 0
+  return 1
+}
+
+selfsteal_kind() {
+  if [[ -f /opt/caddy/docker-compose.yml || -f /opt/caddy/.env ]]; then
+    printf '%s' "Caddy"
+  elif [[ -f /opt/nginx-selfsteal/docker-compose.yml || -f /opt/nginx-selfsteal/.env ]]; then
+    printf '%s' "Nginx"
+  else
+    printf '%s' "Selfsteal"
+  fi
+}
+
+# Сохранить домен Caddy/Nginx после установки Selfsteal.
+persist_selfsteal_domain() {
+  local d="" f
+  for f in /opt/caddy/.env /opt/nginx-selfsteal/.env; do
+    [[ -f "$f" ]] || continue
+    d=$(grep -E '^SELF_STEAL_DOMAIN=' "$f" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'[:space:]")
+    [[ -n "$d" ]] && break
+  done
+  if [[ -z "$d" && -f /opt/caddy/Caddyfile ]]; then
+    d=$(awk '
+      /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]\s*\{/ { print $1; exit }
+      /^https?:\/\// { gsub(/^https?:\/\//,""); gsub(/[:{].*$/,""); print; exit }
+    ' /opt/caddy/Caddyfile 2>/dev/null || true)
+  fi
+  [[ -n "$d" && "$d" != "example.com" ]] || return 1
+  mkdir -p "$DIR"
+  printf '%s\n' "$d" > "$DIR/.selfsteal_domain"
+  printf '%s' "$d"
+}
+
+# Домен маскировки Caddy/Nginx — только если Selfsteal реально стоит.
+get_selfsteal_site() {
+  is_selfsteal_installed || return 1
+  local d="" f
+  [[ -f "$DIR/.selfsteal_domain" ]] && d=$(tr -d '[:space:]' <"$DIR/.selfsteal_domain" 2>/dev/null || true)
+  if [[ -z "$d" ]]; then
+    d=$(persist_selfsteal_domain 2>/dev/null || true)
+  fi
+  if [[ -z "$d" ]]; then
+    for f in /opt/caddy/.env /opt/nginx-selfsteal/.env; do
+      [[ -f "$f" ]] || continue
+      d=$(grep -E '^SELF_STEAL_DOMAIN=' "$f" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'[:space:]")
+      [[ -n "$d" ]] && break
+    done
+  fi
+  if [[ -z "$d" && -f /opt/caddy/Caddyfile ]]; then
+    d=$(awk '
+      /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]\s*\{/ { print $1; exit }
+      /^https?:\/\// { gsub(/^https?:\/\//,""); gsub(/[:{].*$/,""); print; exit }
+    ' /opt/caddy/Caddyfile 2>/dev/null || true)
+  fi
+  [[ -n "$d" && "$d" != "example.com" ]] || return 1
+  printf '%s' "$d"
+}
+
 show_header() {
   ui_clear
   local ver
@@ -777,6 +856,13 @@ show_header() {
     fi
     _tty_printf '  %b🔌 NODE_PORT:%b  %b%s%b  %b  %b\n' \
       "$WHITE" "$NC" "$CYAN" "$_np" "$NC" "$_listen_lbl" "$_fw_lbl"
+  fi
+  local _site="" _skind=""
+  _site=$(get_selfsteal_site 2>/dev/null || true)
+  if [[ -n "$_site" ]]; then
+    _skind=$(selfsteal_kind)
+    _tty_printf '  %b🎭 Selfsteal:%b  %b%s%b  %b(%s)%b\n' \
+      "$WHITE" "$NC" "$CYAN" "$_site" "$NC" "$GRAY" "$_skind" "$NC"
   fi
   _tty_echo ""
 }
@@ -1975,6 +2061,7 @@ show_antiddos_status() {
 }
 
 setup_antiddos() {
+  while true; do
   show_header
   echo -e "${WHITE}${BOLD}  🛡️  Анти-DDoS (L4 / SYN-флуд)${NC}"
   hline 56
@@ -2025,8 +2112,10 @@ setup_antiddos() {
       ;;
     6) disable_antiddos ;;
     0) return 0 ;;
-    *) ;;
+    *) continue ;;
   esac
+  pause
+  done
 }
 
 ###############################################################################
@@ -2325,6 +2414,7 @@ ports_clear_all() {
 }
 
 setup_ports() {
+  while true; do
   show_header
   echo -e "${WHITE}${BOLD}  🔓 Порты — открыть / закрыть${NC}"
   hline 56
@@ -2358,12 +2448,14 @@ setup_ports() {
       show_ports_status
       ;;
     2)
-      ask "Номер порта" port
+      ask "Номер порта (q — назад)" port
+      if _is_back "$port" || [[ "$port" == "0" ]]; then continue; fi
       [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
-        warn "Нужен порт 1–65535"; return 0
+        warn "Нужен порт 1–65535"; pause; continue
       }
       echo -e "  ${WHITE}Протокол:${NC}  1) TCP  2) UDP  3) TCP+UDP"
       ask "Выбор" proto "3"
+      if _is_back "$proto"; then continue; fi
       ports_open "$port" "$proto"
       echo
       if [[ "$proto" == "1" || "$proto" == "tcp" || "$proto" == "3" || "$proto" == "both" || -z "$proto" ]]; then
@@ -2374,12 +2466,14 @@ setup_ports() {
       show_ports_status
       ;;
     3)
-      ask "Номер порта" port
+      ask "Номер порта (q — назад)" port
+      if _is_back "$port" || [[ "$port" == "0" ]]; then continue; fi
       [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
-        warn "Нужен порт 1–65535"; return 0
+        warn "Нужен порт 1–65535"; pause; continue
       }
       echo -e "  ${WHITE}Протокол:${NC}  1) TCP  2) UDP  3) TCP+UDP"
       ask "Выбор" proto "3"
+      if _is_back "$proto"; then continue; fi
       ask_yes_no "Заблокировать вход (DROP), а не только убрать OPEN?" block N
       ports_close "$port" "$proto" "$block"
       echo
@@ -2397,8 +2491,10 @@ setup_ports() {
       [[ "$ans" =~ ^[Yy]$ ]] && ports_clear_all
       ;;
     0) return 0 ;;
-    *) ;;
+    *) continue ;;
   esac
+  pause
+  done
 }
 
 ###############################################################################
@@ -2957,32 +3053,42 @@ install_remnanode() {
   echo
 
   if is_remnanode_installed; then
-    remove_existing_remnanode || return 0
+    remove_existing_remnanode || { warn "Установка отменена — текущая нода не тронута."; return 0; }
   fi
 
   echo -e "  ${WHITE}${BOLD}📝 Параметры ноды${NC}"
   hline 40
+  echo -e "  ${GRAY}q — отмена и в меню${NC}"
   local PANEL_IP="" NODE_PORT="" XTLS_API_PORT=""
   ask "🌐 IP панели Remnawave" PANEL_IP "$PANEL_IP_DEFAULT"
-  [[ "$PANEL_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || err "Некорректный IP: $PANEL_IP"
+  if _is_back "$PANEL_IP"; then warn "Установка отменена."; return 0; fi
+  if [[ ! "$PANEL_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    warn "Некорректный IP: $PANEL_IP — установка отменена."
+    return 0
+  fi
 
   ask "🔌 NODE_PORT" NODE_PORT "3000"
-  [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || err "NODE_PORT должен быть числом"
+  if _is_back "$NODE_PORT"; then warn "Установка отменена."; return 0; fi
+  if [[ ! "$NODE_PORT" =~ ^[0-9]+$ ]]; then
+    warn "NODE_PORT должен быть числом — установка отменена."
+    return 0
+  fi
 
   ask "🔗 XTLS_API_PORT" XTLS_API_PORT "61000"
+  if _is_back "$XTLS_API_PORT"; then warn "Установка отменена."; return 0; fi
+  [[ "$XTLS_API_PORT" =~ ^[0-9]+$ ]] || XTLS_API_PORT="61000"
 
-  local NODE_IMAGE_TAG=""
-  ask_node_image_tag NODE_IMAGE_TAG
-  local NODE_IMAGE="${NODE_IMAGE_REPO}:${NODE_IMAGE_TAG}"
-  ok "Образ: ${NODE_IMAGE}"
+  local NODE_IMAGE="${NODE_IMAGE_DEFAULT}"
+  info "Образ: ${NODE_IMAGE}  ${GRAY}(всегда latest)${NC}"
 
   echo
   info "🔑 SECRET_KEY — из панели Remnawave → Nodes → нода → иконка копирования"
-  echo -e "  ${GRAY}Одна вставка (Ctrl+Shift+V). Двойной ввод убран: оба раза одинаково обрезались.${NC}"
+  echo -e "  ${GRAY}Одна вставка (Ctrl+Shift+V). q — отмена.${NC}"
   echo -e "  ${GRAY}В панели Node Port = этот NODE_PORT, не 443 (иначе EPROTO / handshake 40).${NC}"
   local K1="" _sk_ok="" _sk_confirm=""
   while true; do
-    ask_secret "SECRET_KEY" K1 || { warn "Отмена ввода ключа"; return 0; }
+    ask_secret "SECRET_KEY" K1 || { warn "Установка отменена — ключ не записан."; return 0; }
+    if _is_back "$K1"; then warn "Установка отменена."; return 0; fi
     [[ -z "$K1" ]] && { warn "Пусто — вставьте ключ из панели"; continue; }
     if secret_key_valid "$K1"; then
       _sk_ok=1
@@ -2994,9 +3100,11 @@ install_remnanode() {
     secret_key_preview "$K1"
     if [[ "$_sk_ok" == "1" ]]; then
       ask_yes_no "Ключ принят. Продолжить?" _sk_confirm Y
+      _is_back "$_sk_confirm" && { warn "Установка отменена."; return 0; }
       [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
     else
-      ask_yes_no "Всё равно сохранить этот ключ?" _sk_confirm N
+      ask_yes_no "Всё равно сохранить этот ключ? (q — отмена)" _sk_confirm N
+      _is_back "$_sk_confirm" && { warn "Установка отменена."; return 0; }
       [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
     fi
   done
@@ -3094,7 +3202,9 @@ EOF
   if ! is_remnanode_up; then
     echo -e "  ${RED}Логи контейнера:${NC}"
     docker logs --tail 40 remnanode 2>&1 | sed 's/^/    /' || true
-    err "Контейнер не запустился. Логи: docker logs remnanode"
+    warn "Контейнер не запустился. Установка не завершена — нода не считается установленной, если контейнер мёртв."
+    echo -e "  ${GRAY}Логи: docker logs remnanode${NC}"
+    return 0
   fi
   ok "Контейнер remnanode запущен"
   verify_remnanode_secret || true
@@ -3139,20 +3249,31 @@ EOF
   echo -e "  🔌 NODE_PORT:   ${NODE_PORT}  ${GRAY}(firewall OPEN)${NC}"
   echo -e "  🔗 XTLS_API:    ${XTLS_API_PORT}"
   echo -e "  🔑 SECRET_KEY:  ${#K1} символов"
-  echo -e "  🐳 Образ:       ${NODE_IMAGE}"
+  echo -e "  🐳 Образ:       ${NODE_IMAGE}  ${GRAY}(всегда latest)${NC}"
   echo -e "  📡 Управление:  ${CYAN}remnanode${NC}"
   echo -e "  📋 Лог:         ${GRAY}${LOG}${NC}"
   echo
   echo -e "  ${YELLOW}⚠  В панели Remnawave:${NC}"
   echo -e "    • Address = IP этой ноды, ${WHITE}Node Port = ${NODE_PORT}${NC}  ${GRAY}(не 443)${NC}"
-  echo -e "    • Панель и нода одной линии: 3.x + latest. Сначала: ${CYAN}remnanode panel-update${NC} на сервере панели"
-  echo -e "    • Образ ноды: ${CYAN}remnanode pin-image latest${NC}   ключ: ${CYAN}remnanode secret${NC}"
+  echo -e "    • Секрет и порт 1:1 с панелью. Ключ: ${CYAN}remnanode secret${NC}"
   echo
   echo -e "  ${YELLOW}💡 Рекомендуется отдельно:${NC}"
   echo -e "    • 🛡️  UFW — ограничить NODE_PORT только IP панели"
   echo -e "    • 💾 SWAP — если мало RAM"
   echo -e "    • ⚡ Hysteria2 — если нужен UDP-протокол"
   echo
+  echo -e "  ${WHITE}${BOLD}📋 Статус из логов ноды${NC}"
+  hline 40
+  sleep 2
+  docker logs remnanode --tail 40 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/    /' || true
+  echo
+  local _st _health
+  _st="$(docker inspect remnanode --format '{{.State.Status}}' 2>/dev/null || echo '?')"
+  echo -e "  ${GRAY}Контейнер:${NC} ${WHITE}${_st}${NC}"
+  _health="$(docker inspect remnanode --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' 2>/dev/null || true)"
+  [[ -n "$_health" ]] && echo -e "  ${GRAY}Health:${NC}    ${WHITE}${_health}${NC}"
+  echo
+  run_tspu_check auto || true
 }
 
 # Диагностика EPROTO / handshake 40 + смена SECRET_KEY без полной переустановки
@@ -3506,8 +3627,13 @@ install_selfsteal() {
   echo -e "  ${WHITE}🌐 Веб-сервер:${NC}"
   echo -e "    ${WHITE}1)${NC} 🟩 Caddy   ${GRAY}(проще, авто-SSL)${NC}"
   echo -e "    ${WHITE}2)${NC} 🟧 Nginx   ${GRAY}(Unix socket + acme.sh)${NC}"
+  echo -e "  ${GRAY}0 / q — назад без установки${NC}"
   echo
   ask "🌐 Выбор веб-сервера" ws_choice "1"
+  if _is_back "$ws_choice" || [[ "$ws_choice" == "0" ]]; then
+    warn "Установка Selfsteal отменена."
+    return 0
+  fi
 
   local ws_flag="--caddy"
   case "$ws_choice" in
@@ -3524,6 +3650,7 @@ install_selfsteal() {
   local rc=$?
   set -e
   if [[ $rc -eq 0 ]]; then
+    persist_selfsteal_domain >/dev/null 2>&1 || true
     echo
     echo -e "${GREEN}${BOLD}"
     echo "  ╔════════════════════════════════════════════════════╗"
@@ -3533,6 +3660,9 @@ install_selfsteal() {
     echo -e "  Управление:  ${CYAN}selfsteal${NC}"
     echo -e "  Шаблоны:     ${CYAN}selfsteal template${NC}"
     echo -e "  Логи:        ${CYAN}selfsteal logs${NC}"
+    local _ssd=""
+    _ssd=$(get_selfsteal_site 2>/dev/null || true)
+    [[ -n "$_ssd" ]] && echo -e "  Сайт:        ${CYAN}${_ssd}${NC}  ${GRAY}($(selfsteal_kind))${NC}"
     echo
   else
     warn "Установка Selfsteal завершилась с кодом $rc"
@@ -3694,7 +3824,12 @@ install_hysteria2() {
   local domain="${1:-}" saved=""
   [[ -f "$H2_DOMAIN_FILE" ]] && saved=$(tr -d '[:space:]' <"$H2_DOMAIN_FILE" 2>/dev/null || true)
   if [[ -z "$domain" ]]; then
+    echo -e "  ${GRAY}q — назад без установки${NC}"
     ask "🌐 Домен для этой ноды" domain "$saved"
+    if _is_back "$domain" || [[ "$domain" == "0" ]]; then
+      warn "Установка Hysteria2 отменена."
+      return 0
+    fi
   fi
   domain=$(printf '%s' "$domain" | tr -d '[:space:]' | tr 'A-Z' 'a-z')
   domain="${domain#http://}"
@@ -3876,6 +4011,7 @@ install_hysteria2_legacy() {
 # Фикс онлайна Hysteria2 — custom Xray (@markrouting)
 ###############################################################################
 fix_hysteria2_online() {
+  while true; do
   show_header
   echo -e "${WHITE}${BOLD}  🔧 Фикс онлайна Hysteria2 (custom Xray)${NC}"
   hline 56
@@ -3902,16 +4038,21 @@ fix_hysteria2_online() {
         warn "Контейнер remnanode не запущен"
       fi
       ;;
-    *) return 0 ;;
+    0) return 0 ;;
+    *) continue ;;
   esac
+  pause
+  done
 }
 
 apply_custom_xray_patch() {
   if ! [[ -f "$COMPOSE" ]]; then
-    err "Remnanode не установлен"
+    warn "Remnanode не установлен"
+    return 1
   fi
 
-  ask "📦 Версия Xray" XV "$XRAY_VERSION_DEFAULT"
+  ask "📦 Версия Xray (q — назад)" XV "$XRAY_VERSION_DEFAULT"
+  if _is_back "$XV"; then return 0; fi
   [[ "$XV" == v* ]] || XV="v${XV}"
 
   local arch_zip="Xray-linux-64.zip"
@@ -4148,6 +4289,7 @@ SYSTEMD
 # Telegram MTProto — mtproto.zig / mtbuddy
 ###############################################################################
 install_mtproto() {
+  while true; do
   show_header
   echo -e "${WHITE}${BOLD}  ✈️  Прокси Telegram (mtproto.zig)${NC}"
   hline 56
@@ -4176,37 +4318,44 @@ install_mtproto() {
           warn "mtbuddy не найден в PATH — перелогиньтесь или проверьте /usr/local/bin"
         fi
       else
-        err "Bootstrap mtproto.zig не удался"
+        warn "Bootstrap mtproto.zig не удался"
       fi
       ;;
     2)
       if ! command -v mtbuddy >/dev/null 2>&1; then
         info "Сначала ставим mtbuddy…"
-        RN_RUSSIFY=mtproto gh_pipe_bash "$MTPROTO_BOOTSTRAP_RAW" || err "Bootstrap не удался"
+        RN_RUSSIFY=mtproto gh_pipe_bash "$MTPROTO_BOOTSTRAP_RAW" || { warn "Bootstrap не удался"; pause; continue; }
       fi
-      ask "🔌 Порт" mp_port "443"
+      ask "🔌 Порт (q — назад)" mp_port "443"
+      if _is_back "$mp_port"; then continue; fi
       ask "🌐 Домен-маскировка (например rutube.ru)" mp_domain
-      [[ -z "$mp_domain" ]] && { warn "Домен обязателен"; return 0; }
+      if _is_back "$mp_domain" || [[ "$mp_domain" == "0" ]]; then continue; fi
+      [[ -z "$mp_domain" ]] && { warn "Домен обязателен"; pause; continue; }
       ask "👤 Имя пользователя" mp_user "user"
+      if _is_back "$mp_user"; then continue; fi
       echo
       mtbuddy install --port "$mp_port" --domain "$mp_domain" --user "$mp_user" --yes || warn "Установка вернула ошибку"
       ;;
     3)
-      command -v mtbuddy >/dev/null 2>&1 || { warn "mtbuddy не установлен"; return 0; }
+      command -v mtbuddy >/dev/null 2>&1 || { warn "mtbuddy не установлен"; pause; continue; }
       mtbuddy --interactive || true
       ;;
     4)
       systemctl status mtproto-proxy --no-pager 2>/dev/null || warn "Сервис mtproto-proxy не найден"
       command -v mtbuddy >/dev/null 2>&1 && mtbuddy status 2>/dev/null || true
       ;;
-    *) return 0 ;;
+    0) return 0 ;;
+    *) continue ;;
   esac
+  pause
+  done
 }
 
 ###############################################################################
 # SWAP — отдельная кнопка с навигацией
 ###############################################################################
 setup_swap() {
+  while true; do
   show_header
   echo -e "${WHITE}${BOLD}  💾 Управление SWAP${NC}"
   hline 56
@@ -4239,8 +4388,9 @@ setup_swap() {
     2) size_gb=2 ;;
     3) size_gb=4 ;;
     4)
-      ask "📏 Размер в ГБ" size_gb "1"
-      [[ "$size_gb" =~ ^[0-9]+$ ]] || { warn "Нужно число"; return 0; }
+      ask "📏 Размер в ГБ (q — назад)" size_gb "1"
+      if _is_back "$size_gb"; then continue; fi
+      [[ "$size_gb" =~ ^[0-9]+$ ]] || { warn "Нужно число"; pause; continue; }
       ;;
     5)
       swapoff /swapfile 2>/dev/null || true
@@ -4248,10 +4398,12 @@ setup_swap() {
       rm -f /swapfile
       ok "SWAP удалён"
       free -h
-      return 0
+      pause
+      continue
       ;;
-    6) free -h; return 0 ;;
-    *) return 0 ;;
+    6) free -h; pause; continue ;;
+    0) return 0 ;;
+    *) continue ;;
   esac
 
   info "Создаём SWAP ${size_gb}G…"
@@ -4279,12 +4431,15 @@ EOF
   free -h
   echo
   info "В строке Swap должно быть ~${size_gb}.0Gi — защита от OOM."
+  pause
+  done
 }
 
 ###############################################################################
 # UFW — отдельный пункт (не вместе с нодой)
 ###############################################################################
 setup_ufw() {
+  while true; do
   show_header
   echo -e "${WHITE}${BOLD}  🛡️  Защита UFW и порты${NC}"
   hline 56
@@ -4386,8 +4541,11 @@ EOF
       systemctl restart fail2ban
       ok "Fail2Ban настроен для SSH"
       ;;
-    *) return 0 ;;
+    0) return 0 ;;
+    *) continue ;;
   esac
+  pause
+  done
 }
 
 ###############################################################################
@@ -4707,6 +4865,7 @@ run_ports_check() {
 }
 
 run_speedtest_menu() {
+  while true; do
   ui_clear
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
@@ -4732,7 +4891,7 @@ run_speedtest_menu() {
   local t0 t1
   case "$ch" in
     1)
-      ensure_ookla_speedtest || { warn "Ookla недоступен — попробуйте пункт 3"; return; }
+      ensure_ookla_speedtest || { warn "Ookla недоступен — попробуйте пункт 3"; pause; continue; }
       speedtest_capture "Ookla полный" bash -c '
         t0=$(date +%s.%N)
         echo "  Старт: $(date "+%F %T")"
@@ -4743,7 +4902,7 @@ run_speedtest_menu() {
       '
       ;;
     2)
-      ensure_ookla_speedtest || { warn "Ookla недоступен"; return; }
+      ensure_ookla_speedtest || { warn "Ookla недоступен"; pause; continue; }
       speedtest_capture "Ookla ping/jitter" bash -c '
         if speedtest --accept-license --accept-gdpr -f json 2>/dev/null | jq -r "
             \"  Ping:    \\(.ping.latency) ms\",
@@ -4820,8 +4979,11 @@ run_speedtest_menu() {
       ;;
     5) show_speedtest_last ;;
     6) show_speedtest_history ;;
-    *) return ;;
+    0) return 0 ;;
+    *) continue ;;
   esac
+  pause
+  done
 }
 
 ###############################################################################
@@ -4833,7 +4995,7 @@ _CH_RESULT_JSON=""
 
 _ch_get() {
   # $1 = путь+query. Возврат тела ответа (JSON) в stdout.
-  curl -fsSL -H 'Accept: application/json' --connect-timeout 8 --max-time 20 "${_CH_API}$1" 2>/dev/null
+  curl -fsSL -H 'Accept: application/json' --connect-timeout 6 --max-time 14 "${_CH_API}$1" 2>/dev/null
 }
 
 # Статус узла из _CH_RESULT_JSON: печатает "OK|время" / "FAIL|причина" / "PENDING|—"
@@ -4851,7 +5013,14 @@ _ch_status_of() {
 }
 
 run_tspu_check() {
-  ui_clear
+  local auto=0
+  [[ "${1:-}" == "auto" ]] && auto=1
+
+  if [[ "$auto" != "1" ]]; then
+    ui_clear
+  else
+    echo
+  fi
   echo -e "${CYAN}${BOLD}"
   echo "  ╔════════════════════════════════════════════════════╗"
   echo "  ║      🇷🇺 БЛОКИРОВКА ИЗ РФ (ТСПУ / РКН)             ║"
@@ -4868,64 +5037,116 @@ run_tspu_check() {
   fi
   command -v jq >/dev/null 2>&1 || { warn "jq недоступен — проверка невозможна"; return 1; }
 
-  # Хост и порт для проверки
   local host port def_ip node_port def_port
   def_ip=$(get_public_ip 2>/dev/null || true)
-  [[ "$def_ip" == "неизвестен" ]] && def_ip=""
+  [[ "$def_ip" == "неизвестен" ]] && def_ip="${PUBLIC_IP:-}"
   node_port=$(get_node_port 2>/dev/null || echo "")
-  ask "IP/домен для проверки" host "${def_ip}"
-  [[ -z "$host" ]] && { warn "Не указан хост"; return 1; }
-  def_port="443"
-  [[ -n "$node_port" ]] && def_port="$node_port"
-  echo -e "  ${GRAY}Обычно проверяют клиентский порт: 443 (Reality) или NODE_PORT.${NC}"
-  ask "Порт" port "$def_port"
-  [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { warn "Порт 1–65535"; return 1; }
 
-  info "Получаю список узлов check-host.net…"
+  if [[ "$auto" == "1" ]]; then
+    host="${def_ip}"
+    [[ -z "$host" ]] && { warn "Публичный IP неизвестен — проверку РКН пропускаю"; return 0; }
+    # Для блока по IP смотрим 443 (Reality/Caddy). Если не слушает — NODE_PORT.
+    if is_node_port_listening 443 2>/dev/null; then
+      port=443
+    elif [[ "$node_port" =~ ^[0-9]+$ ]]; then
+      port="$node_port"
+    else
+      port=443
+    fi
+    info "Автопроверка ${host}:${port} из нескольких городов РФ…"
+  else
+    echo -e "  ${GRAY}q — назад без проверки${NC}"
+    ask "IP/домен для проверки" host "${def_ip}"
+    if _is_back "$host" || [[ "$host" == "0" ]]; then warn "Проверка отменена."; return 0; fi
+    [[ -z "$host" ]] && { warn "Не указан хост"; return 0; }
+    def_port="443"
+    if is_node_port_listening 443 2>/dev/null; then
+      def_port="443"
+    elif [[ -n "$node_port" ]]; then
+      def_port="$node_port"
+    fi
+    echo -e "  ${GRAY}443 = клиентский Reality/Caddy (блок IP). NODE_PORT = только панель.${NC}"
+    ask "Порт" port "$def_port"
+    if _is_back "$port" || [[ "$port" == "0" && "$def_port" != "0" ]]; then warn "Проверка отменена."; return 0; fi
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { warn "Порт 1–65535"; return 0; }
+  fi
+
+  info "Список узлов check-host.net…"
   local nodes_json
   nodes_json=$(_ch_get "/nodes/hosts")
   [[ -z "$nodes_json" ]] && { warn "check-host.net недоступен (сеть/файрвол)"; return 1; }
 
-  # РФ-узлы: уникальные по ASN (=разные операторы), до 6 штук
+  # РФ: один узел на город (не только Москва/СПб), приоритет крупных городов.
   local -A NODE_LABEL=()
   local -a ru_nodes=() ctrl_nodes=()
-  local seen_asn=" "
   local k city asn country cc
   while IFS=$'\t' read -r k city asn; do
     [[ -z "$k" ]] && continue
-    [[ "$seen_asn" == *" $asn "* ]] && continue
-    seen_asn+="$asn "
     ru_nodes+=("$k")
-    NODE_LABEL["$k"]="РФ · ${city:-?} (${asn:-?})"
-    (( ${#ru_nodes[@]} >= 6 )) && break
+    NODE_LABEL["$k"]="${city:-?} (${asn:-?})"
+    (( ${#ru_nodes[@]} >= 10 )) && break
   done < <(echo "$nodes_json" | jq -r '
-    .nodes | to_entries[]
-    | select(.value.location[0]=="ru")
+    def norm: ascii_downcase;
+    def rank:
+      (. | norm) as $n
+      | if   ($n | test("moscow|москв")) then 0
+        elif ($n | test("petersburg|питер|санкт")) then 1
+        elif ($n | test("novosibirsk|новосиб")) then 2
+        elif ($n | test("yekaterin|ekaterin|екатерин")) then 3
+        elif ($n | test("kazan|казан")) then 4
+        elif ($n | test("krasnodar|краснодар")) then 5
+        elif ($n | test("rostov|ростов")) then 6
+        elif ($n | test("samara|самар")) then 7
+        elif ($n | test("nizhny|nizhniy|нижн")) then 8
+        elif ($n | test("kaliningrad|калининград")) then 9
+        elif ($n | test("vladivostok|владивосток")) then 10
+        elif ($n | test("krasnoyarsk|красноярск")) then 11
+        elif ($n | test("voronezh|воронеж")) then 12
+        elif ($n | test("perm|перм")) then 13
+        elif ($n | test("ufa|уфа")) then 14
+        elif ($n | test("chelyabinsk|челябинск")) then 15
+        elif ($n | test("omsk|омск")) then 16
+        elif ($n | test("volgograd|волгоград")) then 17
+        elif ($n | test("tyumen|тюмен")) then 18
+        elif ($n | test("irkutsk|иркутск")) then 19
+        elif ($n | test("khabarovsk|хабаровск")) then 20
+        elif ($n | test("sochi|сочи")) then 21
+        else 80 end;
+    .nodes
+    | to_entries
+    | map(select(.value.location[0]=="ru"))
+    | group_by((.value.location[2] // "?") | ascii_downcase)
+    | map(.[0])
+    | sort_by((.value.location[2] // "?") | rank)
+    | .[]
     | "\(.key)\t\(.value.location[2] // "?")\t\(.value.asn // "?")"' 2>/dev/null)
 
-  # Если РФ-узлов с уникальным ASN мало — добираем любыми РФ-узлами
-  if (( ${#ru_nodes[@]} < 3 )); then
+  if (( ${#ru_nodes[@]} < 4 )); then
     while IFS=$'\t' read -r k city asn; do
       [[ -z "$k" ]] && continue
       [[ -n "${NODE_LABEL[$k]:-}" ]] && continue
       ru_nodes+=("$k")
-      NODE_LABEL["$k"]="РФ · ${city:-?} (${asn:-?})"
-      (( ${#ru_nodes[@]} >= 6 )) && break
+      NODE_LABEL["$k"]="${city:-?} (${asn:-?})"
+      (( ${#ru_nodes[@]} >= 10 )) && break
     done < <(echo "$nodes_json" | jq -r '
       .nodes | to_entries[]
       | select(.value.location[0]=="ru")
       | "\(.key)\t\(.value.location[2] // "?")\t\(.value.asn // "?")"' 2>/dev/null)
   fi
 
-  # Контрольные узлы вне РФ (2 шт.: de/nl/fi/us) — чтобы отличить бан от «сервер лежит»
+  # Контроль вне РФ (разные страны) — отличить бан от «порт закрыт везде»
+  local seen_cc=" "
   while IFS=$'\t' read -r k country cc; do
     [[ -z "$k" ]] && continue
+    [[ "$seen_cc" == *" $cc "* ]] && continue
+    seen_cc+="$cc "
     ctrl_nodes+=("$k")
-    NODE_LABEL["$k"]="${country:-?} · контроль"
-    (( ${#ctrl_nodes[@]} >= 2 )) && break
+    NODE_LABEL["$k"]="${country:-$cc} · контроль"
+    (( ${#ctrl_nodes[@]} >= 3 )) && break
   done < <(echo "$nodes_json" | jq -r '
     .nodes | to_entries[]
-    | select(.value.location[0] as $c | ($c=="de" or $c=="nl" or $c=="fi" or $c=="us"))
+    | select(.value.location[0] as $c
+        | ($c=="de" or $c=="nl" or $c=="fi" or $c=="pl" or $c=="cz" or $c=="us" or $c=="gb"))
     | "\(.key)\t\(.value.location[1] // "?")\t\(.value.location[0])"' 2>/dev/null)
 
   if (( ${#ru_nodes[@]} == 0 )); then
@@ -4938,17 +5159,17 @@ run_tspu_check() {
     params+="&node=${n}"
   done
 
-  info "TCP-проверка ${host}:${port} — РФ-узлов: ${#ru_nodes[@]}, контрольных: ${#ctrl_nodes[@]}…"
+  info "TCP ${host}:${port} — городов РФ: ${#ru_nodes[@]}, контроль: ${#ctrl_nodes[@]}…"
   local req rid permalink
   req=$(_ch_get "/check-tcp?host=${host}:${port}${params}")
   rid=$(echo "$req" | jq -r '.request_id // empty' 2>/dev/null)
   permalink=$(echo "$req" | jq -r '.permanent_link // empty' 2>/dev/null)
   [[ -z "$rid" ]] && { warn "check-host.net не принял запрос (лимит/сеть) — повторите позже"; return 1; }
 
-  # Опрос результата: до ~28с, пока не пропадут PENDING
+  # Быстрый опрос: ~1+8 с вместо ~28 с
   local tries=0 pending=1 v
-  while (( tries < 14 )); do
-    sleep 2
+  sleep 1
+  while (( tries < 8 )); do
     _CH_RESULT_JSON=$(_ch_get "/check-result/${rid}")
     if [[ -n "$_CH_RESULT_JSON" ]]; then
       pending=0
@@ -4959,18 +5180,19 @@ run_tspu_check() {
       (( pending == 0 )) && break
     fi
     tries=$((tries + 1))
+    sleep 1
   done
 
   local st detail label ru_ok=0 ru_fail=0 ctrl_ok=0 ctrl_fail=0
   echo
-  echo -e "  ${WHITE}Результаты по РФ-операторам:${NC}"
+  echo -e "  ${WHITE}Города РФ:${NC}"
   for n in "${ru_nodes[@]}"; do
     IFS='|' read -r st detail < <(_ch_status_of "$n")
     label="${NODE_LABEL[$n]:-$n}"
     case "$st" in
-      OK)   printf "    ${GREEN}✅ %-26s доступен${NC} ${GRAY}(%ss)${NC}\n" "$label" "${detail:-?}"; ru_ok=$((ru_ok + 1)) ;;
-      FAIL) printf "    ${RED}⛔ %-26s НЕ доступен${NC} — %s\n" "$label" "$detail"; ru_fail=$((ru_fail + 1)) ;;
-      *)    printf "    ${GRAY}… %-26s (не успел)${NC}\n" "$label" ;;
+      OK)   printf "    ${GREEN}✅ %-28s доступен${NC} ${GRAY}(%ss)${NC}\n" "$label" "${detail:-?}"; ru_ok=$((ru_ok + 1)) ;;
+      FAIL) printf "    ${RED}⛔ %-28s НЕ доступен${NC} — %s\n" "$label" "$detail"; ru_fail=$((ru_fail + 1)) ;;
+      *)    printf "    ${GRAY}… %-28s (не успел)${NC}\n" "$label" ;;
     esac
   done
 
@@ -4981,9 +5203,9 @@ run_tspu_check() {
       IFS='|' read -r st detail < <(_ch_status_of "$n")
       label="${NODE_LABEL[$n]:-$n}"
       case "$st" in
-        OK)   printf "    ${GREEN}✅ %-26s доступен${NC} ${GRAY}(%ss)${NC}\n" "$label" "${detail:-?}"; ctrl_ok=$((ctrl_ok + 1)) ;;
-        FAIL) printf "    ${RED}⛔ %-26s НЕ доступен${NC} — %s\n" "$label" "$detail"; ctrl_fail=$((ctrl_fail + 1)) ;;
-        *)    printf "    ${GRAY}… %-26s (не успел)${NC}\n" "$label" ;;
+        OK)   printf "    ${GREEN}✅ %-28s доступен${NC} ${GRAY}(%ss)${NC}\n" "$label" "${detail:-?}"; ctrl_ok=$((ctrl_ok + 1)) ;;
+        FAIL) printf "    ${RED}⛔ %-28s НЕ доступен${NC} — %s\n" "$label" "$detail"; ctrl_fail=$((ctrl_fail + 1)) ;;
+        *)    printf "    ${GRAY}… %-28s (не успел)${NC}\n" "$label" ;;
       esac
     done
   fi
@@ -4997,19 +5219,18 @@ run_tspu_check() {
   elif (( total_ru == 0 )); then
     warn "РФ-узлы не дали ответа — повторите позже."
   elif (( ru_fail == 0 )); then
-    ok "Из РФ порт ${port} доступен со всех проверенных операторов — блокировки нет."
+    ok "Из РФ порт ${port} доступен со всех проверенных городов — блокировки нет."
   elif (( ru_ok == 0 )); then
     echo -e "    ${RED}${BOLD}⛔ Похоже на блокировку ТСПУ/РКН.${NC}"
-    echo -e "    ${GRAY}Из РФ порт недоступен со всех операторов, а контрольные узлы подключились.${NC}"
+    echo -e "    ${GRAY}Из РФ порт недоступен из всех городов, а контрольные узлы подключились.${NC}"
   else
-    echo -e "    ${YELLOW}⚠️  Частичная недоступность из РФ: ${ru_ok}/${total_ru} операторов ОК.${NC}"
+    echo -e "    ${YELLOW}⚠️  Частичная недоступность из РФ: ${ru_ok}/${total_ru} городов ОК.${NC}"
     echo -e "    ${GRAY}Возможна выборочная фильтрация у части операторов или временная нестабильность.${NC}"
   fi
 
   echo
-  echo -e "  ${GRAY}Проверка TCP-доступности IP:порт (блок по IP/порту).${NC}"
-  echo -e "  ${GRAY}DPI-блок по SNI/протоколу так не виден — TCP может проходить, а TLS резаться.${NC}"
-  echo -e "  ${GRAY}Узлы check-host — дата-центры; у мобильных/домашних ISP ТСПУ может вести себя иначе.${NC}"
+  echo -e "  ${GRAY}TCP IP:порт (блок по IP/порту). DPI по SNI так не виден.${NC}"
+  echo -e "  ${GRAY}Узлы check-host — дата-центры; домашний/мобильный ISP может отличаться.${NC}"
   [[ -n "$permalink" ]] && echo -e "  ${GRAY}Полный отчёт: ${permalink}${NC}"
   echo
 }
@@ -5029,7 +5250,7 @@ tests_menu() {
     echo -e "  ${WHITE}5)${NC} 🌐 Информация об IP"
     echo -e "  ${WHITE}6)${NC} 🖥️  Система / CPU / диск"
     echo -e "  ${WHITE}7)${NC} 🔌 Порты и контейнеры"
-    echo -e "  ${WHITE}8)${NC} 🇷🇺 Блокировка из РФ    ${GRAY}— ТСПУ/РКН, разные операторы${NC}"
+    echo -e "  ${WHITE}8)${NC} 🇷🇺 Блокировка из РФ    ${GRAY}— ТСПУ/РКН, города РФ${NC}"
     echo -e "  ${WHITE}9)${NC} 🏁 Полный прогон       ${GRAY}— speed + ping + DNS…${NC}"
     echo
     echo -e "  ${GRAY}0)${NC} 🔙 Назад"
@@ -5037,7 +5258,7 @@ tests_menu() {
     ask_choice choice
 
     case "$choice" in
-      1) run_speedtest_menu; pause ;;
+      1) run_speedtest_menu ;;
       2) show_speedtest_last; pause ;;
       3) run_latency_test; pause ;;
       4) run_dns_test; pause ;;
@@ -5081,8 +5302,8 @@ system_menu() {
     echo
     ask_choice ch
     case "$ch" in
-      1) setup_swap; pause ;;
-      2) setup_ufw; pause ;;
+      1) setup_swap ;;
+      2) setup_ufw ;;
       3) apply_performance_tuning; pause ;;
       4) ensure_packages; pause ;;
       0) return 0 ;;
@@ -5117,7 +5338,7 @@ node_status_screen() {
     node_ver=$(docker inspect --format '{{.Config.Image}}' remnanode 2>/dev/null || echo "?")
     _tty_printf '     %-10s %b%s%b\n' "Образ:" "$CYAN" "$node_ver" "$NC"
     if node_image_is_v2 "$(node_image_tag "$node_ver")"; then
-      _tty_printf '     %bНода 2.x — после panel-update: пункт 10 → latest%b\n' "$YELLOW" "$NC"
+      _tty_printf '     %bНода 2.x — пункт 14 обновит образ до latest%b\n' "$YELLOW" "$NC"
     fi
     xray_ver=$(docker exec remnanode xray version 2>/dev/null | head -1 || echo "н/д")
     _tty_printf '     %-10s %s\n' "Xray:" "$xray_ver"
@@ -5135,7 +5356,7 @@ node_status_screen() {
       if secret_key_valid "$_sk"; then
         _tty_printf '     %-10s %bSECRET_KEY ок (%s симв.)%b\n' "mTLS:" "$GREEN" "${#_sk}" "$NC"
       else
-        _tty_printf '     %-10s %bSECRET_KEY битый (%s) — пункт 20 / EPROTO%b\n' "mTLS:" "$YELLOW" "${#_sk}" "$NC"
+        _tty_printf '     %-10s %bSECRET_KEY битый (%s) — пункт 10 / EPROTO%b\n' "mTLS:" "$YELLOW" "${#_sk}" "$NC"
       fi
     fi
   elif is_remnanode_installed; then
@@ -5163,31 +5384,23 @@ remnanode_menu() {
     _tty_echo "    ${WHITE} 4)${NC} 🔄 Перезапустить"
     _tty_echo "    ${WHITE} 5)${NC} 🗑️  Удалить RemnaNode"
     _tty_echo ""
-    _tty_printf '  %b📊 Мониторинг и логи:%b\n' "$WHITE" "$NC"
+    _tty_printf '  %b📊 Мониторинг:%b\n' "$WHITE" "$NC"
     _tty_echo "    ${WHITE} 6)${NC} 📌 Статус (docker ps / compose)"
-    _tty_echo "    ${WHITE} 7)${NC} 📋 Логи контейнера"
-    _tty_echo "    ${WHITE} 8)${NC} 📈 Docker stats"
-    _tty_echo "    ${WHITE} 9)${NC} 📺 LIVE-мониторинг"
+    _tty_echo "    ${WHITE} 7)${NC} 📋 Логи (снимок)"
+    _tty_echo "    ${WHITE} 8)${NC} 📈 Docker stats (снимок)"
+    _tty_echo "    ${WHITE} 9)${NC} 📺 Снимок системы"
     _tty_echo ""
-    _tty_printf '  %b⚙️  Обновления и конфигурация:%b\n' "$WHITE" "$NC"
-    _tty_echo "    ${WHITE}10)${NC} 🐳 Образ ноды (latest / пин версии)"
-    _tty_echo "    ${WHITE}11)${NC} 🔧 Фикс онлайна Hysteria2 / custom Xray"
+    _tty_printf '  %b⚙️  Конфигурация ноды:%b\n' "$WHITE" "$NC"
+    _tty_echo "    ${WHITE}10)${NC} 🔑 SECRET_KEY / фикс EPROTO (handshake 40)"
+    _tty_echo "    ${WHITE}11)${NC} 📡 Открыть порт ноды для панели"
     _tty_echo "    ${WHITE}12)${NC} 📝 Редактировать docker-compose.yml"
     _tty_echo "    ${WHITE}13)${NC} 🔐 Редактировать .env"
-    _tty_echo "    ${WHITE}14)${NC} 🔌 Показать порты"
-    _tty_echo "    ${WHITE}15)${NC} ⚙️  Тюнинг производительности"
-    _tty_echo ""
-    _tty_printf '  %b✨ Дополнительно:%b\n' "$WHITE" "$NC"
-    _tty_echo "    ${WHITE}16)${NC} ⚡ Настройка Hysteria2"
-    _tty_echo "    ${WHITE}17)${NC} 🎭 Selfsteal"
-    _tty_echo "    ${WHITE}18)${NC} 🏠 Открыть главное меню лаунчера"
-    _tty_echo "    ${WHITE}19)${NC} 📡 Открыть порт ноды для Remnawave Panel"
-    _tty_echo "    ${WHITE}20)${NC} 🔑 SECRET_KEY / фикс EPROTO (handshake 40)"
+    _tty_echo "    ${WHITE}14)${NC} 🐳 Обновить образ (pull latest)"
     _tty_echo ""
     hline 56
-    _tty_echo "    ${GRAY}0)${NC} 🚪 Выход"
+    _tty_echo "    ${GRAY}0)${NC} 🔙 Назад"
     _tty_echo ""
-    ask_choice choice "👉 Выберите пункт [0-20]:"
+    ask_choice choice "👉 Выберите пункт [0-14]:"
 
     case "$choice" in
       1) install_remnanode; pause ;;
@@ -5226,22 +5439,23 @@ remnanode_menu() {
         pause
         ;;
       7)
-        docker logs -f --tail 100 remnanode || true
-        ;;
-      8)
-        docker stats remnanode || true
-        ;;
-      9) live_panel ;;
-      10)
-        [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
         echo
-        info "Панель 3.x → latest. Панель 2.7.x → 2.7.0."
-        local img_tag=""
-        ask_node_image_tag img_tag
-        pin_remnanode_image "$img_tag" || true
+        echo -e "  ${WHITE}Последние логи remnanode (снимок, не follow):${NC}"
+        if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx remnanode; then
+          docker logs --tail 80 remnanode 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/    /'
+        else
+          warn "Контейнер remnanode не найден"
+        fi
         pause
         ;;
-      11) fix_hysteria2_online; pause ;;
+      8)
+        echo
+        docker stats --no-stream remnanode 2>&1 || warn "Нет контейнера remnanode"
+        pause
+        ;;
+      9) live_panel ;;
+      10) diagnose_remnanode_eproto; pause ;;
+      11) ports_open_panel; pause ;;
       12)
         ${EDITOR:-nano} "$COMPOSE"
         ask_yes_no "🔄 Перезапустить ноду?" ans N
@@ -5255,48 +5469,28 @@ remnanode_menu() {
         pause
         ;;
       14)
-        echo
-        info "Слушающие порты:"
-        ss -tulnp 2>/dev/null | head -40 | sed 's/^/  /'
-        echo
-        if [[ -f "$ENV_FILE" ]]; then
-          echo -e "  ${WHITE}.env:${NC}"
-          grep -E 'PORT|SECRET' "$ENV_FILE" | sed 's/SECRET_KEY=.*/SECRET_KEY=***/' | sed 's/^/    /'
-        fi
+        [[ -f "$COMPOSE" ]] || { warn "Не установлено"; pause; continue; }
+        pin_remnanode_image latest || true
         pause
         ;;
-      15) apply_performance_tuning; pause ;;
-      16) install_hysteria2; pause ;;
-      17) install_selfsteal; pause ;;
-      18) main_menu; return 0 ;;
-      19) ports_open_panel; pause ;;
-      20) diagnose_remnanode_eproto; pause ;;
-      0) exit 0 ;;
+      0) return 0 ;;
       *) ;;
     esac
   done
 }
 
 live_panel() {
-  local _live_stop=0
-  trap '_live_stop=1' INT
-  while (( _live_stop == 0 )); do
+  local ch="" IFACE RX1 TX1 RX2 TX2 CSTATS TOTAL EST
+  while true; do
     ui_clear
-    echo -e "${BLUE}${BOLD}  📺 LIVE PANEL${NC}  ${GRAY}(Ctrl+C — в меню)${NC}"
+    echo -e "${BLUE}${BOLD}  📺 Снимок системы${NC}  ${GRAY}(не бесконечный live)${NC}"
     hline 56
-    UPTIME=$(uptime -p 2>/dev/null | sed 's/^up //')
-    LOAD=$(awk '{print $1", "$2", "$3}' /proc/loadavg)
-    CPU_USAGE=$(top -bn1 | awk '/Cpu\(s\)/ {printf "%.1f", 100 - $8}')
-    MEM=$(free -m | awk '/^Mem:/ {printf "%s / %s MB (%.0f%%)", $3, $2, $3*100/$2}')
-    SWAP=$(free -m | awk '/^Swap:/ {if($2>0) printf "%s / %s MB", $3, $2; else print "—"}')
-    DISK=$(df -h / | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}')
-
-    printf "  Uptime:  %s\n" "$UPTIME"
-    printf "  Load:    %s\n" "$LOAD"
-    printf "  CPU:     %s%%\n" "$CPU_USAGE"
-    printf "  RAM:     %s\n" "$MEM"
-    printf "  Swap:    %s\n" "$SWAP"
-    printf "  Disk:    %s\n" "$DISK"
+    printf "  Uptime:  %s\n" "$(uptime -p 2>/dev/null | sed 's/^up //')"
+    printf "  Load:    %s\n" "$(awk '{print $1", "$2", "$3}' /proc/loadavg)"
+    printf "  CPU:     %s%%\n" "$(top -bn1 | awk '/Cpu\(s\)/ {printf "%.1f", 100 - $8}')"
+    printf "  RAM:     %s\n" "$(free -m | awk '/^Mem:/ {printf "%s / %s MB (%.0f%%)", $3, $2, $3*100/$2}')"
+    printf "  Swap:    %s\n" "$(free -m | awk '/^Swap:/ {if($2>0) printf "%s / %s MB", $3, $2; else print "—"}')"
+    printf "  Disk:    %s\n" "$(df -h / | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}')"
 
     if is_remnanode_up; then
       CSTATS=$(docker stats --no-stream --format '{{.CPUPerc}} | {{.MemUsage}}' remnanode 2>/dev/null)
@@ -5320,21 +5514,30 @@ live_panel() {
 
     IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
     if [[ -n "$IFACE" ]]; then
-      RX1=$(cat /sys/class/net/$IFACE/statistics/rx_bytes)
-      TX1=$(cat /sys/class/net/$IFACE/statistics/tx_bytes)
+      RX1=$(cat /sys/class/net/$IFACE/statistics/rx_bytes 2>/dev/null || echo 0)
+      TX1=$(cat /sys/class/net/$IFACE/statistics/tx_bytes 2>/dev/null || echo 0)
       sleep 1
-      (( _live_stop == 1 )) && break
-      RX2=$(cat /sys/class/net/$IFACE/statistics/rx_bytes)
-      TX2=$(cat /sys/class/net/$IFACE/statistics/tx_bytes)
+      RX2=$(cat /sys/class/net/$IFACE/statistics/rx_bytes 2>/dev/null || echo 0)
+      TX2=$(cat /sys/class/net/$IFACE/statistics/tx_bytes 2>/dev/null || echo 0)
       printf "\n  %-6s  RX: %6s KB/s   TX: %6s KB/s\n" "$IFACE" "$(( (RX2-RX1)/1024 ))" "$(( (TX2-TX1)/1024 ))"
-    else
-      sleep 1
     fi
-    (( _live_stop == 1 )) && break
-    sleep 1
+
+    if is_remnanode_up; then
+      echo
+      echo -e "${YELLOW}── 📋 Логи ноды (хвост) ──${NC}"
+      docker logs remnanode --tail 12 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/    /'
+    fi
+
+    echo
+    hline 56
+    echo -e "  ${WHITE}r)${NC} обновить снимок    ${GRAY}0 / Enter — назад${NC}"
+    echo
+    ask_choice ch "👉"
+    case "$ch" in
+      r|R|у|У) continue ;;
+      *) return 0 ;;
+    esac
   done
-  trap - INT
-  return 0
 }
 
 ###############################################################################
@@ -5366,7 +5569,7 @@ main_menu() {
     section "🎛️  Сервис"
     menu_item "📡" "12" "Нода"       "меню управления"    node_cli
     menu_item "🧪" "13" "Тесты"      "speed / ping / DNS"
-    menu_item "🖥️" "14" "Панель"     "обновить до 3.x"
+    menu_item "🇷🇺" "14" "РКН"        "блок IP из РФ / ТСПУ"
     _tty_echo ""
     menu_item "🚪" "0"  "Выход"      ""
     _tty_echo ""
@@ -5376,17 +5579,17 @@ main_menu() {
       1)  install_remnanode; pause ;;
       2)  install_selfsteal; pause ;;
       3)  install_hysteria2; pause ;;
-      4)  fix_hysteria2_online; pause ;;
+      4)  fix_hysteria2_online ;;
       5)  install_warp; pause ;;
-      6)  install_mtproto; pause ;;
-      7)  setup_swap; pause ;;
-      8)  setup_ufw; pause ;;
-      9)  setup_ports; pause ;;
+      6)  install_mtproto ;;
+      7)  setup_swap ;;
+      8)  setup_ufw ;;
+      9)  setup_ports ;;
       10) apply_performance_tuning; pause ;;
-      11) setup_antiddos; pause ;;
+      11) setup_antiddos ;;
       12) remnanode_menu ;;
       13) tests_menu ;;
-      14) update_remnawave_panel; pause ;;
+      14) run_tspu_check; pause ;;
       0)  exit 0 ;;
       *)  ;;
     esac
@@ -5467,6 +5670,9 @@ case "${1:-}" in
     [[ -f "$COMPOSE" ]] && (cd "$DIR" && docker compose ps) || true
     ;;
   logs)
+    docker logs --tail 80 remnanode 2>&1 || true
+    ;;
+  logs-f|logs-follow)
     docker logs -f --tail 100 remnanode
     ;;
   update)
@@ -5483,6 +5689,7 @@ case "${1:-}" in
   manage|node|panel)
     _menu_soft_mode
     remnanode_menu
+    main_menu
     ;;
   *)
     _menu_soft_mode
@@ -5490,6 +5697,7 @@ case "${1:-}" in
     _exec_if_github_newer "$@" || true
     if [[ "$entry_name" == "remnanode" ]]; then
       remnanode_menu
+      main_menu
     else
       main_menu
     fi
