@@ -864,6 +864,19 @@ show_header() {
     _tty_printf '  %b🎭 Selfsteal:%b  %b%s%b  %b(%s)%b\n' \
       "$WHITE" "$NC" "$CYAN" "$_site" "$NC" "$GRAY" "$_skind" "$NC"
   fi
+  # WARP: показываем только если установлен (подтверждение «работает ли» при запуске)
+  if command -v warp-cli >/dev/null 2>&1; then
+    local _wlbl
+    if warp_is_connected && warp_port_listening; then
+      _wlbl="${GREEN}[подключён]${NC}"
+    elif warp_is_connected; then
+      _wlbl="${YELLOW}[connected, порт ${WARP_PORT}?]${NC}"
+    else
+      _wlbl="${RED}[offline]${NC}"
+    fi
+    _tty_printf '  %b☁️  WARP:%b      %bSOCKS5 127.0.0.1:%s%b  %b\n' \
+      "$WHITE" "$NC" "$CYAN" "$WARP_PORT" "$NC" "$_wlbl"
+  fi
   _tty_echo ""
 }
 
@@ -3043,6 +3056,65 @@ remove_existing_remnanode() {
   return 0
 }
 
+# Сбор параметров ноды в RN_* (интерактивно). 0 — ок, 1 — отмена/ошибка ввода.
+# Разделён с установкой, чтобы «Самое нужное» спросило всё заранее.
+_rn_collect_params() {
+  echo -e "  ${WHITE}${BOLD}📝 Параметры ноды${NC}"
+  hline 40
+  echo -e "  ${GRAY}q — отмена и в меню${NC}"
+  RN_PANEL_IP=""; RN_NODE_PORT=""; RN_XTLS=""; RN_SECRET=""
+  ask "🌐 IP панели Remnawave" RN_PANEL_IP "$PANEL_IP_DEFAULT"
+  if _is_back "$RN_PANEL_IP"; then warn "Установка отменена."; return 1; fi
+  if [[ ! "$RN_PANEL_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    warn "Некорректный IP: $RN_PANEL_IP — установка отменена."
+    return 1
+  fi
+
+  ask "🔌 NODE_PORT" RN_NODE_PORT "3000"
+  if _is_back "$RN_NODE_PORT"; then warn "Установка отменена."; return 1; fi
+  if [[ ! "$RN_NODE_PORT" =~ ^[0-9]+$ ]]; then
+    warn "NODE_PORT должен быть числом — установка отменена."
+    return 1
+  fi
+
+  ask "🔗 XTLS_API_PORT" RN_XTLS "61000"
+  if _is_back "$RN_XTLS"; then warn "Установка отменена."; return 1; fi
+  [[ "$RN_XTLS" =~ ^[0-9]+$ ]] || RN_XTLS="61000"
+
+  info "Образ: ${NODE_IMAGE_DEFAULT}  ${GRAY}(всегда latest)${NC}"
+
+  echo
+  info "🔑 SECRET_KEY — из панели Remnawave → Nodes → нода → иконка копирования"
+  echo -e "  ${GRAY}Одна вставка (Ctrl+Shift+V). q — отмена.${NC}"
+  echo -e "  ${GRAY}В панели Node Port = этот NODE_PORT, не 443 (иначе EPROTO / handshake 40).${NC}"
+  local _sk_ok="" _sk_confirm=""
+  while true; do
+    ask_secret "SECRET_KEY" RN_SECRET || { warn "Установка отменена — ключ не записан."; return 1; }
+    if _is_back "$RN_SECRET"; then warn "Установка отменена."; return 1; fi
+    [[ -z "$RN_SECRET" ]] && { warn "Пусто — вставьте ключ из панели"; continue; }
+    if secret_key_valid "$RN_SECRET"; then
+      _sk_ok=1
+    else
+      _sk_ok=0
+      warn "Ключ не похож на SECRET_KEY панели (base64 JSON с сертификатами mTLS)."
+      warn "Скопируйте ключ иконкой в карточке ноды. Сейчас длина: ${#RN_SECRET}"
+    fi
+    secret_key_preview "$RN_SECRET"
+    if [[ "$_sk_ok" == "1" ]]; then
+      ask_yes_no "Ключ принят. Продолжить?" _sk_confirm Y
+      _is_back "$_sk_confirm" && { warn "Установка отменена."; return 1; }
+      [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
+    else
+      ask_yes_no "Всё равно сохранить этот ключ? (q — отмена)" _sk_confirm N
+      _is_back "$_sk_confirm" && { warn "Установка отменена."; return 1; }
+      [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
+    fi
+  done
+  ok "Ключ принят (${#RN_SECRET} символов)"
+  echo
+  return 0
+}
+
 install_remnanode() {
   show_header
   echo -e "${WHITE}${BOLD}  🚀 Установка Remnanode${NC}"
@@ -3056,60 +3128,14 @@ install_remnanode() {
     remove_existing_remnanode || { warn "Установка отменена — текущая нода не тронута."; return 0; }
   fi
 
-  echo -e "  ${WHITE}${BOLD}📝 Параметры ноды${NC}"
-  hline 40
-  echo -e "  ${GRAY}q — отмена и в меню${NC}"
-  local PANEL_IP="" NODE_PORT="" XTLS_API_PORT=""
-  ask "🌐 IP панели Remnawave" PANEL_IP "$PANEL_IP_DEFAULT"
-  if _is_back "$PANEL_IP"; then warn "Установка отменена."; return 0; fi
-  if [[ ! "$PANEL_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-    warn "Некорректный IP: $PANEL_IP — установка отменена."
-    return 0
-  fi
+  _rn_collect_params || return 0
+  _rn_do_install
+}
 
-  ask "🔌 NODE_PORT" NODE_PORT "3000"
-  if _is_back "$NODE_PORT"; then warn "Установка отменена."; return 0; fi
-  if [[ ! "$NODE_PORT" =~ ^[0-9]+$ ]]; then
-    warn "NODE_PORT должен быть числом — установка отменена."
-    return 0
-  fi
-
-  ask "🔗 XTLS_API_PORT" XTLS_API_PORT "61000"
-  if _is_back "$XTLS_API_PORT"; then warn "Установка отменена."; return 0; fi
-  [[ "$XTLS_API_PORT" =~ ^[0-9]+$ ]] || XTLS_API_PORT="61000"
-
+# Установка ноды из уже собранных RN_* (без вопросов). Шаги 0–8 + сводка.
+_rn_do_install() {
+  local PANEL_IP="$RN_PANEL_IP" NODE_PORT="$RN_NODE_PORT" XTLS_API_PORT="$RN_XTLS" K1="$RN_SECRET"
   local NODE_IMAGE="${NODE_IMAGE_DEFAULT}"
-  info "Образ: ${NODE_IMAGE}  ${GRAY}(всегда latest)${NC}"
-
-  echo
-  info "🔑 SECRET_KEY — из панели Remnawave → Nodes → нода → иконка копирования"
-  echo -e "  ${GRAY}Одна вставка (Ctrl+Shift+V). q — отмена.${NC}"
-  echo -e "  ${GRAY}В панели Node Port = этот NODE_PORT, не 443 (иначе EPROTO / handshake 40).${NC}"
-  local K1="" _sk_ok="" _sk_confirm=""
-  while true; do
-    ask_secret "SECRET_KEY" K1 || { warn "Установка отменена — ключ не записан."; return 0; }
-    if _is_back "$K1"; then warn "Установка отменена."; return 0; fi
-    [[ -z "$K1" ]] && { warn "Пусто — вставьте ключ из панели"; continue; }
-    if secret_key_valid "$K1"; then
-      _sk_ok=1
-    else
-      _sk_ok=0
-      warn "Ключ не похож на SECRET_KEY панели (base64 JSON с сертификатами mTLS)."
-      warn "Скопируйте ключ иконкой в карточке ноды. Сейчас длина: ${#K1}"
-    fi
-    secret_key_preview "$K1"
-    if [[ "$_sk_ok" == "1" ]]; then
-      ask_yes_no "Ключ принят. Продолжить?" _sk_confirm Y
-      _is_back "$_sk_confirm" && { warn "Установка отменена."; return 0; }
-      [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
-    else
-      ask_yes_no "Всё равно сохранить этот ключ? (q — отмена)" _sk_confirm N
-      _is_back "$_sk_confirm" && { warn "Установка отменена."; return 0; }
-      [[ "$_sk_confirm" =~ ^[Yy]$ ]] && break
-    fi
-  done
-  ok "Ключ принят (${#K1} символов)"
-  echo
 
   echo -e "  ${WHITE}${BOLD}⚙️  Установка (шаги 0–8, со статусом)${NC}"
   hline 40
@@ -3670,6 +3696,143 @@ install_selfsteal() {
 }
 
 ###############################################################################
+# ⭐ САМОЕ НУЖНОЕ — Remnanode + Selfsteal + WARP одним заходом
+# Все вопросы задаются ЗАРАНЕЕ, затем установка идёт без участия.
+###############################################################################
+install_essentials() {
+  show_header
+  echo -e "${WHITE}${BOLD}  ⭐ Самое нужное — Remnanode + Selfsteal + WARP${NC}"
+  hline 56
+  echo
+  info "Один заход: ответьте на вопросы сейчас — дальше можно отойти."
+  echo -e "  ${GRAY}Порядок: 1) Remnanode  2) Selfsteal (Caddy, авто-SSL)  3) WARP${NC}"
+  echo -e "  ${GRAY}Заранее подготовьте: IP панели, SECRET_KEY из панели, домен Selfsteal.${NC}"
+  echo -e "  ${YELLOW}⚠ Домен Selfsteal должен A-записью указывать на этот сервер (для SSL).${NC}"
+  echo -e "  ${GRAY}q — отмена и возврат в меню на любом вопросе.${NC}"
+  echo
+
+  # Предочистка существующей ноды — спрашиваем сейчас, не в процессе
+  if is_remnanode_installed; then
+    remove_existing_remnanode || { warn "Отменено — ничего не тронуто."; return 0; }
+  fi
+
+  # ───────── СБОР ВСЕХ ДАННЫХ ЗАРАНЕЕ ─────────
+  echo -e "  ${WHITE}${BOLD}▌ Шаг 1 из 2 · Данные ноды${NC}"
+  _rn_collect_params || { warn "Отменено."; return 0; }
+
+  echo -e "  ${WHITE}${BOLD}▌ Шаг 2 из 2 · Данные Selfsteal${NC}"
+  hline 40
+  local ESS_DOMAIN="" ESS_WS="caddy" ESS_PORT="9443" _wsc="" _warp_yn=""
+  while [[ -z "$ESS_DOMAIN" ]]; do
+    ask "🌐 Домен маскировки (Reality serverNames)" ESS_DOMAIN ""
+    if _is_back "$ESS_DOMAIN"; then warn "Отменено."; return 0; fi
+    if [[ ! "$ESS_DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
+      warn "Домен не похож на FQDN (пример: reality.example.com)"; ESS_DOMAIN=""
+    fi
+  done
+  echo -e "  ${GRAY}Веб-сервер:  1) Caddy — проще, авто-SSL (реком.)   2) Nginx — acme.sh${NC}"
+  ask "🌐 Веб-сервер" _wsc "1"
+  if _is_back "$_wsc"; then warn "Отменено."; return 0; fi
+  [[ "$_wsc" == "2" ]] && ESS_WS="nginx"
+  ask "🔌 HTTPS-порт Selfsteal (= Reality dest)" ESS_PORT "9443"
+  if _is_back "$ESS_PORT"; then warn "Отменено."; return 0; fi
+  [[ "$ESS_PORT" =~ ^[0-9]+$ ]] || ESS_PORT="9443"
+  if [[ "$ESS_WS" == "nginx" ]]; then
+    warn "Nginx: для SSL нужен рабочий DNS и свободный порт 80/8443 (acme.sh). Caddy проще."
+  fi
+  if command -v warp-cli >/dev/null 2>&1; then
+    info "WARP уже установлен — будет проверено подключение (без переустановки)."
+    _warp_yn="y"
+  else
+    ask_yes_no "☁️  Ставить WARP (SOCKS5 для ChatGPT/Spotify)?" _warp_yn Y
+    _is_back "$_warp_yn" && _warp_yn="n"
+  fi
+
+  # ───────── СВОДКА + ОДИН финальный confirm ─────────
+  local _xver; _xver=$([[ "$ESS_WS" == "nginx" ]] && echo 1 || echo 0)
+  echo
+  echo -e "  ${WHITE}${BOLD}📋 Проверьте — дальше вопросов не будет${NC}"
+  hline 40
+  echo -e "  🖥️  Панель IP:    ${CYAN}${RN_PANEL_IP}${NC}"
+  echo -e "  🔌 NODE_PORT:    ${CYAN}${RN_NODE_PORT}${NC}    🔗 XTLS_API: ${RN_XTLS}"
+  echo -e "  🔑 SECRET_KEY:   ${#RN_SECRET} символов"
+  echo -e "  🎭 Selfsteal:    ${CYAN}${ESS_DOMAIN}${NC}  ${GRAY}(${ESS_WS}, порт ${ESS_PORT}, xver ${_xver})${NC}"
+  echo -e "  ☁️  WARP:         $([[ "$_warp_yn" =~ ^[Yy]$ ]] && echo "да (127.0.0.1:${WARP_PORT})" || echo "пропустить")"
+  echo
+  local _go=""
+  ask_yes_no "Поставить всё сейчас?" _go Y
+  if _is_back "$_go" || [[ ! "$_go" =~ ^[Yy]$ ]]; then warn "Отменено."; return 0; fi
+
+  # ───────── УСТАНОВКА БЕЗ УЧАСТИЯ ─────────
+  local _t0=$SECONDS
+  echo
+  echo -e "  ${CYAN}${BOLD}▶ 1/3 · Remnanode${NC}"; hline 40
+  _rn_do_install
+
+  echo
+  echo -e "  ${CYAN}${BOLD}▶ 2/3 · Selfsteal${NC}"; hline 40
+  if ! command -v docker >/dev/null 2>&1; then ensure_packages; install_docker; fi
+  RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
+  local ess_ws_flag="--caddy"; [[ "$ESS_WS" == "nginx" ]] && ess_ws_flag="--nginx"
+  local ss_rc=0
+  set +e
+  run_selfsteal @ "$ess_ws_flag" --force --domain "$ESS_DOMAIN" --port "$ESS_PORT" install
+  ss_rc=$?
+  set -e
+  if [[ $ss_rc -eq 0 ]]; then
+    persist_selfsteal_domain >/dev/null 2>&1 || true
+    ok "Selfsteal установлен (${ESS_DOMAIN})"
+  else
+    warn "Selfsteal завершился с кодом $ss_rc — проверьте: selfsteal logs"
+  fi
+
+  echo
+  echo -e "  ${CYAN}${BOLD}▶ 3/3 · WARP${NC}"; hline 40
+  if [[ "$_warp_yn" =~ ^[Yy]$ ]]; then
+    if command -v warp-cli >/dev/null 2>&1; then
+      info "WARP уже стоял — проверяю подключение…"
+      _WARP_CHECKED=0; warp_ensure_running
+      if warp_is_connected && warp_port_listening; then ok "WARP на связи (127.0.0.1:${WARP_PORT})"; else warn "WARP не поднялся — warp-cli status"; fi
+    else
+      install_warp
+    fi
+  else
+    info "WARP пропущен (можно поставить позже: пункт меню WARP)."
+  fi
+
+  # ───────── ИТОГ + ТРЕБУЕМЫЕ ДЕЙСТВИЯ В ПАНЕЛИ ─────────
+  local _el=$((SECONDS - _t0))
+  echo
+  echo -e "${GREEN}${BOLD}"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║        ✅  САМОЕ НУЖНОЕ УСТАНОВЛЕНО                ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+  echo -e "  ⏱️  Заняло:     ${_el}с"
+  echo -e "  🚀 Нода:       порт ${CYAN}${RN_NODE_PORT}${NC}  ${GRAY}(панель ${RN_PANEL_IP})${NC}"
+  echo -e "  🎭 Selfsteal:  ${CYAN}${ESS_DOMAIN}${NC}  ${GRAY}(${ESS_WS}, dest 127.0.0.1:${ESS_PORT})${NC}"
+  [[ "$_warp_yn" =~ ^[Yy]$ ]] && echo -e "  ☁️  WARP:       ${CYAN}SOCKS5 127.0.0.1:${WARP_PORT}${NC}"
+  echo -e "  📡 Управление: ${CYAN}remnanode${NC} · ${CYAN}selfsteal${NC}"
+  echo
+  echo -e "  ${YELLOW}${BOLD}⚠ ТРЕБУЕТСЯ ДЕЙСТВИЕ В ПАНЕЛИ REMNAWAVE${NC}"
+  hline 48
+  echo -e "  ${WHITE}1) Node (карточка ноды):${NC}"
+  echo -e "       Address = IP этого сервера (${CYAN}${PUBLIC_IP}${NC})"
+  echo -e "       Node Port = ${WHITE}${RN_NODE_PORT}${NC}  ${GRAY}(НЕ 443 — иначе EPROTO/handshake 40)${NC}"
+  echo -e "  ${WHITE}2) Xray Reality (inbound):${NC}"
+  echo -e "       realitySettings.serverNames = [\"${WHITE}${ESS_DOMAIN}${NC}\"]"
+  echo -e "       realitySettings.dest = \"${WHITE}127.0.0.1:${ESS_PORT}${NC}\""
+  echo -e "       xver = ${WHITE}${_xver}${NC}  ${GRAY}($([[ "$ESS_WS" == nginx ]] && echo 'Nginx proxy_protocol' || echo 'Caddy, без proxy_protocol'))${NC}"
+  if [[ "$_warp_yn" =~ ^[Yy]$ ]]; then
+    echo -e "  ${WHITE}3) (опц.) WARP как outbound:${NC} добавьте SOCKS5 outbound"
+    echo -e "       ${GRAY}protocol=socks, address=127.0.0.1, port=${WARP_PORT} + routing rule${NC}"
+  fi
+  echo -e "  ${GRAY}Без этих правок в панели нода/Reality работать не будут.${NC}"
+  echo
+  run_tspu_check auto || true
+}
+
+###############################################################################
 # HYSTERIA2 — через h2-script (без установки ноды из того скрипта)
 ###############################################################################
 ###############################################################################
@@ -4142,6 +4305,50 @@ rollback_custom_xray_patch() {
 ###############################################################################
 # WARP
 ###############################################################################
+# WARP подключён? Проверка без сетевых запросов (локальный IPC warp-cli).
+# Внимание: строка "Disconnected" содержит подстроку "connected" — проверяем оба.
+warp_is_connected() {
+  command -v warp-cli >/dev/null 2>&1 || return 1
+  local s
+  s=$(warp-cli status 2>/dev/null || warp-cli --accept-tos status 2>/dev/null || true)
+  [[ -z "$s" ]] && return 1
+  grep -qiE 'connected' <<<"$s" && ! grep -qiE 'disconnected|connecting|unable' <<<"$s"
+}
+
+# SOCKS5-порт WARP слушает? (идиом как в остальном скрипте: ss -tlnp)
+warp_port_listening() {
+  ss -tlnp 2>/dev/null | grep -qE "[.:]${WARP_PORT}\b"
+}
+
+# Автоподнятие WARP при запуске лаунчера. Идемпотентно, 1 раз за процесс.
+# Пользователю не нужен фоновый демон: повторный запуск скрипта чинит WARP.
+# Молча, если всё ок; итог виден в строке WARP шапки.
+_WARP_CHECKED=0
+warp_ensure_running() {
+  [[ "$_WARP_CHECKED" == "1" ]] && return 0
+  _WARP_CHECKED=1
+  command -v warp-cli >/dev/null 2>&1 || return 0   # не установлен — выходим тихо
+  # демон warp-svc должен жить
+  if ! systemctl is-active --quiet warp-svc 2>/dev/null; then
+    systemctl start warp-svc >/dev/null 2>&1 || true
+    sleep 1
+  fi
+  if warp_is_connected && warp_port_listening; then
+    return 0   # всё ок — молча, статус покажет шапка
+  fi
+  # чиним: /32-фикс сети, режим proxy, порт, connect
+  [[ -x /usr/local/bin/warp-fix-network.sh ]] && /usr/local/bin/warp-fix-network.sh >/dev/null 2>&1 || true
+  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
+  warp-cli --accept-tos proxy port "$WARP_PORT" >/dev/null 2>&1 || true
+  warp-cli --accept-tos connect >/dev/null 2>&1 || true
+  local i
+  for i in 1 2 3; do
+    warp_is_connected && warp_port_listening && break
+    sleep 1
+  done
+  return 0
+}
+
 install_warp() {
   show_header
   echo -e "${WHITE}${BOLD}  ☁️  Cloudflare WARP (SOCKS5)${NC}"
@@ -5372,6 +5579,7 @@ node_status_screen() {
 
 remnanode_menu() {
   RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
+  warp_ensure_running
 
   while true; do
     PUBLIC_IP=$(get_public_ip)
@@ -5546,10 +5754,16 @@ live_panel() {
 main_menu() {
   # Чтобы команда remnanode была доступна сразу
   RN_QUIET=1 install_self_cli >/dev/null 2>&1 || true
+  # Если WARP установлен — тихо убедиться, что он поднят (1 раз за запуск)
+  warp_ensure_running
 
   while true; do
     PUBLIC_IP=$(get_public_ip)
     show_header
+
+    _tty_echo ""
+    _tty_printf '  %b⭐ A)  Самое нужное%b  %b— нода + Selfsteal + WARP за один заход%b\n' \
+      "${GREEN}${BOLD}" "$NC" "$GRAY" "$NC"
 
     section "📦  Установка"
     menu_item "🚀" "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
@@ -5576,6 +5790,7 @@ main_menu() {
     ask_choice choice "👉"
 
     case "$choice" in
+      a|A|а|А|all|все) install_essentials; pause ;;
       1)  install_remnanode; pause ;;
       2)  install_selfsteal; pause ;;
       3)  install_hysteria2; pause ;;
@@ -5627,6 +5842,10 @@ case "${1:-}" in
     ok "Лаунчер обновлён до v$(launcher_version)"
     info "Запуск: remnanode   или   bash $LAUNCHER_PATH"
     ;;
+  essentials|all|setup|quick|самое-нужное)
+    _menu_soft_mode
+    install_essentials
+    ;;
   install-remnanode)           install_remnanode ;;
   install-selfsteal)           install_selfsteal ;;
   install-hysteria2|hysteria2|h2)
@@ -5636,6 +5855,7 @@ case "${1:-}" in
   hysteria2-legacy|h2-legacy)  install_hysteria2_legacy ;;
   fix-hysteria|fix-online)    fix_hysteria2_online ;;
   install-warp)                install_warp ;;
+  warp-check|warp-up|warp-fix) _menu_soft_mode; _WARP_CHECKED=0; warp_ensure_running; warp_is_connected && ok "WARP подключён (127.0.0.1:${WARP_PORT})" || warn "WARP не поднят — warp-cli status" ;;
   install-mtproto|mtproto)     install_mtproto ;;
   swap)                        _menu_soft_mode; setup_swap ;;
   ufw|firewall)                _menu_soft_mode; setup_ufw ;;
