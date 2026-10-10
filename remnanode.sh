@@ -866,13 +866,13 @@ show_header() {
   fi
   # WARP: показываем только если установлен (подтверждение «работает ли» при запуске)
   if command -v warp-cli >/dev/null 2>&1; then
-    local _wlbl
-    if warp_is_connected && warp_port_listening; then
-      _wlbl="${GREEN}[подключён]${NC}"
-    elif warp_is_connected; then
-      _wlbl="${YELLOW}[connected, порт ${WARP_PORT}?]${NC}"
-    else
-      _wlbl="${RED}[offline]${NC}"
+    # считаем статус один раз за редрав (без двойного форка warp-cli)
+    local _wlbl _wc=0 _wp=0
+    warp_is_connected && _wc=1
+    (( _wc == 1 )) && warp_port_listening && _wp=1
+    if   (( _wc == 1 && _wp == 1 )); then _wlbl="${GREEN}[подключён]${NC}"
+    elif (( _wc == 1 ));            then _wlbl="${YELLOW}[connected, порт ${WARP_PORT}?]${NC}"
+    else                                 _wlbl="${RED}[offline]${NC}"
     fi
     _tty_printf '  %b☁️  WARP:%b      %bSOCKS5 127.0.0.1:%s%b  %b\n' \
       "$WHITE" "$NC" "$CYAN" "$WARP_PORT" "$NC" "$_wlbl"
@@ -3299,7 +3299,9 @@ EOF
   _health="$(docker inspect remnanode --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' 2>/dev/null || true)"
   [[ -n "$_health" ]] && echo -e "  ${GRAY}Health:${NC}    ${WHITE}${_health}${NC}"
   echo
-  run_tspu_check auto || true
+  # В «Самое нужное» проверку РКН делаем один раз в конце (после Selfsteal на 443),
+  # а не здесь (443 ещё не слушает → проверился бы NODE_PORT и дал бы ложный вердикт).
+  [[ "${RN_SKIP_TSPU:-}" == "1" ]] || run_tspu_check auto || true
 }
 
 # Диагностика EPROTO / handshake 40 + смена SECRET_KEY без полной переустановки
@@ -3746,6 +3748,7 @@ install_essentials() {
   else
     ask_yes_no "☁️  Ставить WARP (SOCKS5 для ChatGPT/Spotify)?" _warp_yn Y
     _is_back "$_warp_yn" && _warp_yn="n"
+    case "${_warp_yn,,}" in y|yes|д|да) _warp_yn="y" ;; *) _warp_yn="n" ;; esac
   fi
 
   # ───────── СВОДКА + ОДИН финальный confirm ─────────
@@ -3761,13 +3764,15 @@ install_essentials() {
   echo
   local _go=""
   ask_yes_no "Поставить всё сейчас?" _go Y
-  if _is_back "$_go" || [[ ! "$_go" =~ ^[Yy]$ ]]; then warn "Отменено."; return 0; fi
+  if _is_back "$_go" || [[ ! "${_go,,}" =~ ^(y|yes|д|да)$ ]]; then warn "Отменено."; return 0; fi
 
   # ───────── УСТАНОВКА БЕЗ УЧАСТИЯ ─────────
   local _t0=$SECONDS
   echo
   echo -e "  ${CYAN}${BOLD}▶ 1/3 · Remnanode${NC}"; hline 40
+  RN_SKIP_TSPU=1
   _rn_do_install
+  unset RN_SKIP_TSPU
 
   echo
   echo -e "  ${CYAN}${BOLD}▶ 2/3 · Selfsteal${NC}"; hline 40
@@ -3778,7 +3783,7 @@ install_essentials() {
   set +e
   run_selfsteal @ "$ess_ws_flag" --force --domain "$ESS_DOMAIN" --port "$ESS_PORT" install
   ss_rc=$?
-  set -e
+  set +e   # остаёмся в мягком режиме меню (run_selfsteal сам включает set -e внутри)
   if [[ $ss_rc -eq 0 ]]; then
     persist_selfsteal_domain >/dev/null 2>&1 || true
     ok "Selfsteal установлен (${ESS_DOMAIN})"
@@ -5591,9 +5596,9 @@ run_tspu_check() {
 
   ####################### ИСТОЧНИК 2: globalping (не в авто) #######################
   if (( gp_up == 1 )) && [[ "$auto" != "1" ]]; then
-    sources_used+=("globalping")
     local gpf; gpf=$(mktemp "${TMPDIR:-/tmp}/rn-gp.XXXXXX" 2>/dev/null || echo "")
     if [[ -n "$gpf" ]]; then
+      sources_used+=("globalping")
       # Проба A (reachability IP:443) из РФ (до 8 проб) + 1 контроль
       local body_a
       body_a=$(jq -nc --arg t "$host" --argjson p "$port" '
@@ -5670,9 +5675,9 @@ run_tspu_check() {
               opasn="${pair#*=}"; [[ "$opasn" == "$asn_res" ]] && { opname="${pair%=*}"; break; }
             done
             if [[ "$st_res" == "finished" && "$tcp_res" != "null" && -n "$tcp_res" ]]; then
-              printf "    ${GREEN}✅ %-14s${NC} ${GRAY}AS%s · доступен${NC}\n" "$opname" "$asn_res"
+              printf "    ${GREEN}✅ %s${NC} ${GRAY}AS%s · доступен${NC}\n" "$(pad_right "$opname" 12)" "$asn_res"
             else
-              printf "    ${RED}⛔ %-14s${NC} ${GRAY}AS%s · не подключился${NC}\n" "$opname" "$asn_res"
+              printf "    ${RED}⛔ %s${NC} ${GRAY}AS%s · не подключился${NC}\n" "$(pad_right "$opname" 12)" "$asn_res"
             fi
           done < <(jq -r '.results[]? | "\(.probe.asn // 0)\t\(.result.status // "?")\t\(.result.timings.tcp // "null")"' "$gpf" 2>/dev/null)
         fi
@@ -5865,6 +5870,7 @@ remnanode_menu() {
   warp_ensure_running
 
   while true; do
+    set +e   # мягкий режим: утечка errexit из любого пункта не должна ронять меню
     PUBLIC_IP=$(get_public_ip)
     node_status_screen
 
@@ -6041,6 +6047,7 @@ main_menu() {
   warp_ensure_running
 
   while true; do
+    set +e   # мягкий режим: утечка errexit из любого пункта не должна ронять меню
     PUBLIC_IP=$(get_public_ip)
     show_header
 
