@@ -5219,6 +5219,91 @@ _ch_status_of() {
       else "FAIL|нет ответа" end' 2>/dev/null
 }
 
+# ── check-host: парсер /check-http (HTTPS/SNI по домену маскировки) ──
+# per-node результат: [[flag,time,statusText,httpCode,ip]] ; при фейле [null]/[[0,…]].
+# flag==1 && httpCode!=null ⇒ TLS/SNI прошёл (даже 403 = handshake ок, домен не режут).
+_ch_http_status_of() {
+  local n="$1"
+  echo "$_CH_RESULT_JSON" | jq -r --arg n "$n" '
+    .[$n] as $v
+    | if $v == null then "PENDING|—|—"
+      elif ($v|type)=="array" and ($v|length>0) then
+        ($v[0]) as $r
+        | if   ($r|type)=="array" and ($r|length>=1) and (($r[0] // 0)==1)
+            then "OK|\(($r[1] // 0)|tostring)|\($r[3] // "?")"
+          elif ($r|type)=="array"
+            then "FAIL|\($r[2] // "обрыв TLS")|—"
+          else "FAIL|нет ответа|—" end
+      else "FAIL|нет ответа|—" end' 2>/dev/null
+}
+
+# ── globalping (api.globalping.io) — независимый 2-й источник + пооператорно по ASN ──
+_GP_API="https://api.globalping.io/v1"
+_GP_PROBES_FILE=""
+# Операторы РФ → ASN (первый + резервные). Доступ строго с :- (set -u).
+declare -A _OP_ASN=(
+  ["МТС"]="8359 25513"
+  ["Билайн"]="3216 16345"
+  ["Мегафон"]="31133 31205 25159"
+  ["Tele2"]="15378 12958 41330"
+  ["Ростелеком"]="12389 42610"
+)
+_OP_ORDER=("МТС" "Билайн" "Мегафон" "Tele2" "Ростелеком")
+
+# curl к globalping с опц. токеном (env GP_TOKEN). Без -f — нужно читать http_code.
+_gp_curl() {
+  local -a auth=()
+  [[ -n "${GP_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer ${GP_TOKEN}")
+  curl -sS --connect-timeout 6 --max-time 15 "${auth[@]}" "$@"
+}
+
+# POST тело $1 → поллинг → финальный JSON в файл $2. 0 если дошли до finished/частично.
+_gp_measure() {
+  local body="$1" out="$2" code id st i post
+  post="${out}.post"
+  code=$(_gp_curl -X POST "${_GP_API}/measurements" -H 'Content-Type: application/json' \
+          -d "$body" -o "$post" -w '%{http_code}' 2>/dev/null || echo 000)
+  if [[ "$code" != "202" ]]; then rm -f "$post"; return 1; fi
+  id=$(jq -r '.id // empty' "$post" 2>/dev/null); rm -f "$post"
+  [[ -n "$id" ]] || return 1
+  for i in $(seq 1 24); do
+    sleep 0.6
+    code=$(_gp_curl "${_GP_API}/measurements/${id}" -o "$out" -w '%{http_code}' 2>/dev/null || echo 000)
+    [[ "$code" == "200" ]] || continue
+    st=$(jq -r '.status // empty' "$out" 2>/dev/null)
+    [[ "$st" == "finished" ]] && return 0
+  done
+  [[ -s "$out" ]] && return 0 || return 1
+}
+
+# Загрузить список проб globalping. 0 если есть хоть одна RU-проба.
+_gp_load_probes() {
+  _GP_PROBES_FILE=$(mktemp "${TMPDIR:-/tmp}/rn-gp-probes.XXXXXX" 2>/dev/null) || return 1
+  local code
+  code=$(_gp_curl "${_GP_API}/probes" -o "$_GP_PROBES_FILE" -w '%{http_code}' 2>/dev/null || echo 000)
+  [[ "$code" == "200" ]] && jq -e 'type=="array" and (any(.[]; .location.country=="RU"))' "$_GP_PROBES_FILE" >/dev/null 2>&1
+}
+# Есть ли онлайн-проба РФ с данным ASN? $1 = число.
+_gp_asn_has_probe() {
+  [[ -n "$_GP_PROBES_FILE" && -f "$_GP_PROBES_FILE" ]] || return 1
+  jq -e --argjson a "$1" 'any(.[]; .location.country=="RU" and .location.asn==$a)' \
+    "$_GP_PROBES_FILE" >/dev/null 2>&1
+}
+
+# Метка «AS…  Оператор» для IP (ipinfo при токене → bgp.tools whois → пусто). Косметика.
+_asn_label() {
+  local ip="$1" out=""
+  if [[ -n "${IPINFO_TOKEN:-}" ]]; then
+    out=$(curl -fsS --max-time 6 "https://ipinfo.io/${ip}/json?token=${IPINFO_TOKEN}" 2>/dev/null \
+          | jq -r '.org // empty' 2>/dev/null || true)
+  fi
+  if [[ -z "$out" ]] && command -v whois >/dev/null 2>&1; then
+    out=$(whois -h bgp.tools " -v ${ip}" 2>/dev/null \
+          | awk -F'|' 'NR==2{gsub(/^[ \t]+|[ \t]+$/,"",$1);gsub(/^[ \t]+|[ \t]+$/,"",$7);print "AS"$1" "$7}' 2>/dev/null || true)
+  fi
+  printf '%s' "$out"
+}
+
 run_tspu_check() {
   local auto=0
   [[ "${1:-}" == "auto" ]] && auto=1
@@ -5244,15 +5329,15 @@ run_tspu_check() {
   fi
   command -v jq >/dev/null 2>&1 || { warn "jq недоступен — проверка невозможна"; return 1; }
 
-  local host port def_ip node_port def_port
+  local host port def_ip node_port def_port sni_domain=""
   def_ip=$(get_public_ip 2>/dev/null || true)
   [[ "$def_ip" == "неизвестен" ]] && def_ip="${PUBLIC_IP:-}"
   node_port=$(get_node_port 2>/dev/null || echo "")
+  sni_domain=$(get_selfsteal_site 2>/dev/null || true)
 
   if [[ "$auto" == "1" ]]; then
     host="${def_ip}"
     [[ -z "$host" ]] && { warn "Публичный IP неизвестен — проверку РКН пропускаю"; return 0; }
-    # Для блока по IP смотрим 443 (Reality/Caddy). Если не слушает — NODE_PORT.
     if is_node_port_listening 443 2>/dev/null; then
       port=443
     elif [[ "$node_port" =~ ^[0-9]+$ ]]; then
@@ -5260,7 +5345,7 @@ run_tspu_check() {
     else
       port=443
     fi
-    info "Автопроверка ${host}:${port} из нескольких городов РФ…"
+    info "Автопроверка ${host}:${port} из городов РФ…"
   else
     echo -e "  ${GRAY}q — назад без проверки${NC}"
     ask "IP/домен для проверки" host "${def_ip}"
@@ -5276,169 +5361,367 @@ run_tspu_check() {
     ask "Порт" port "$def_port"
     if _is_back "$port" || [[ "$port" == "0" && "$def_port" != "0" ]]; then warn "Проверка отменена."; return 0; fi
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { warn "Порт 1–65535"; return 0; }
+    if [[ -z "$sni_domain" ]]; then
+      echo -e "  ${GRAY}Домен маскировки (Reality serverNames) для HTTPS/SNI-проверки. Пусто = пропустить.${NC}"
+      ask "Домен (SNI)" sni_domain ""
+      _is_back "$sni_domain" && sni_domain=""
+    fi
   fi
 
-  info "Список узлов check-host.net…"
-  local nodes_json
-  nodes_json=$(_ch_get "/nodes/hosts")
-  [[ -z "$nodes_json" ]] && { warn "check-host.net недоступен (сеть/файрвол)"; return 1; }
+  # Метка хостера/ASN (как «TIMEWEB AS9123») — best-effort, не в авто.
+  local host_asn=""
+  if [[ "$auto" != "1" && "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    host_asn=$(_asn_label "$host" 2>/dev/null || true)
+  fi
 
-  # РФ: один узел на город (не только Москва/СПб), приоритет крупных городов.
-  local -A NODE_LABEL=()
-  local -a ru_nodes=() ctrl_nodes=()
-  local k city asn country cc
-  while IFS=$'\t' read -r k city asn; do
-    [[ -z "$k" ]] && continue
-    ru_nodes+=("$k")
-    NODE_LABEL["$k"]="${city:-?} (${asn:-?})"
-    (( ${#ru_nodes[@]} >= 10 )) && break
-  done < <(echo "$nodes_json" | jq -r '
-    def norm: ascii_downcase;
-    def rank:
-      (. | norm) as $n
-      | if   ($n | test("moscow|москв")) then 0
-        elif ($n | test("petersburg|питер|санкт")) then 1
-        elif ($n | test("novosibirsk|новосиб")) then 2
-        elif ($n | test("yekaterin|ekaterin|екатерин")) then 3
-        elif ($n | test("kazan|казан")) then 4
-        elif ($n | test("krasnodar|краснодар")) then 5
-        elif ($n | test("rostov|ростов")) then 6
-        elif ($n | test("samara|самар")) then 7
-        elif ($n | test("nizhny|nizhniy|нижн")) then 8
-        elif ($n | test("kaliningrad|калининград")) then 9
-        elif ($n | test("vladivostok|владивосток")) then 10
-        elif ($n | test("krasnoyarsk|красноярск")) then 11
-        elif ($n | test("voronezh|воронеж")) then 12
-        elif ($n | test("perm|перм")) then 13
-        elif ($n | test("ufa|уфа")) then 14
-        elif ($n | test("chelyabinsk|челябинск")) then 15
-        elif ($n | test("omsk|омск")) then 16
-        elif ($n | test("volgograd|волгоград")) then 17
-        elif ($n | test("tyumen|тюмен")) then 18
-        elif ($n | test("irkutsk|иркутск")) then 19
-        elif ($n | test("khabarovsk|хабаровск")) then 20
-        elif ($n | test("sochi|сочи")) then 21
-        else 80 end;
-    .nodes
-    | to_entries
-    | map(select(.value.location[0]=="ru"))
-    | group_by((.value.location[2] // "?") | ascii_downcase)
-    | map(.[0])
-    | sort_by((.value.location[2] // "?") | rank)
-    | .[]
-    | "\(.key)\t\(.value.location[2] // "?")\t\(.value.asn // "?")"' 2>/dev/null)
+  # ── Доступность источников (graceful degradation) ──
+  local ch_up=0 gp_up=0 nodes_json=""
+  nodes_json=$(_ch_get "/nodes/hosts" 2>/dev/null || true)
+  [[ -n "$nodes_json" ]] && echo "$nodes_json" | jq -e '.nodes' >/dev/null 2>&1 && ch_up=1
+  if [[ "$auto" != "1" ]]; then
+    _gp_load_probes && gp_up=1
+  fi
 
-  if (( ${#ru_nodes[@]} < 4 )); then
+  if (( ch_up == 0 && gp_up == 0 )); then
+    warn "Внешние сервисы проверки недоступны (сеть/лимит/блок egress)."
+    if [[ -n "$sni_domain" ]] && command -v openssl >/dev/null 2>&1; then
+      info "Локальная TLS-проба (без РФ-vantage): ${sni_domain}:${port}"
+      if echo | timeout 8 openssl s_client -connect "${host}:${port}" -servername "$sni_domain" -brief >/dev/null 2>&1; then
+        ok "TLS-handshake локально проходит (это НЕ проверка из РФ)."
+      else
+        warn "TLS-handshake локально не прошёл — проверьте сервис/сертификат."
+      fi
+    fi
+    echo -e "  ${GRAY}Повторите позже из меню: remnanode rkn${NC}"
+    [[ -n "$_GP_PROBES_FILE" ]] && rm -f "$_GP_PROBES_FILE"
+    return 0
+  fi
+
+  [[ -n "$host_asn" ]] && echo -e "  ${WHITE}Хост:${NC} ${CYAN}${host}${NC}  ${GRAY}${host_asn}${NC}"
+  [[ -n "$sni_domain" ]] && echo -e "  ${WHITE}SNI-домен:${NC} ${CYAN}${sni_domain}${NC}"
+
+  local -a sources_used=()
+  # Счётчики вердикта (consensus)
+  local tcp_ru_ok=0 tcp_ru_fail=0 tcp_ctrl_ok=0 tcp_ctrl_fail=0
+  local sni_ru_ok=0 sni_ru_fail=0 sni_ctrl_ok=0 sni_ctrl_fail=0
+
+  ####################### ИСТОЧНИК 1: check-host.net #######################
+  if (( ch_up == 1 )); then
+    sources_used+=("check-host")
+    local -A NODE_LABEL=()
+    local -a ru_nodes=() ctrl_nodes=()
+    local k city asn country cc
+    # РФ: один узел на город, приоритет крупным, до 16 городов (лимита на node= нет).
     while IFS=$'\t' read -r k city asn; do
       [[ -z "$k" ]] && continue
-      [[ -n "${NODE_LABEL[$k]:-}" ]] && continue
       ru_nodes+=("$k")
       NODE_LABEL["$k"]="${city:-?} (${asn:-?})"
-      (( ${#ru_nodes[@]} >= 10 )) && break
+      (( ${#ru_nodes[@]} >= 16 )) && break
+    done < <(echo "$nodes_json" | jq -r '
+      def norm: ascii_downcase;
+      def rank:
+        (. | norm) as $n
+        | if   ($n | test("moscow|москв")) then 0
+          elif ($n | test("petersburg|питер|санкт")) then 1
+          elif ($n | test("novosibirsk|новосиб")) then 2
+          elif ($n | test("yekaterin|ekaterin|екатерин")) then 3
+          elif ($n | test("kazan|казан")) then 4
+          elif ($n | test("krasnodar|краснодар")) then 5
+          elif ($n | test("rostov|ростов")) then 6
+          elif ($n | test("samara|самар")) then 7
+          elif ($n | test("nizhny|nizhniy|нижн")) then 8
+          elif ($n | test("kaliningrad|калининград")) then 9
+          elif ($n | test("vladivostok|владивосток")) then 10
+          elif ($n | test("krasnoyarsk|красноярск")) then 11
+          elif ($n | test("voronezh|воронеж")) then 12
+          elif ($n | test("perm|перм")) then 13
+          elif ($n | test("ufa|уфа")) then 14
+          elif ($n | test("chelyabinsk|челябинск")) then 15
+          elif ($n | test("omsk|омск")) then 16
+          elif ($n | test("volgograd|волгоград")) then 17
+          elif ($n | test("tyumen|тюмен")) then 18
+          elif ($n | test("irkutsk|иркутск")) then 19
+          elif ($n | test("khabarovsk|хабаровск")) then 20
+          elif ($n | test("sochi|сочи")) then 21
+          elif ($n | test("tomsk|томск")) then 22
+          elif ($n | test("barnaul|барнаул")) then 23
+          elif ($n | test("saratov|саратов")) then 24
+          elif ($n | test("izhevsk|ижевск")) then 25
+          elif ($n | test("yaroslavl|ярославл")) then 26
+          elif ($n | test("makhachkala|махачкал")) then 27
+          else 90 end;
+      .nodes
+      | to_entries
+      | map(select(.value.location[0]=="ru"))
+      | group_by((.value.location[2] // "?") | ascii_downcase)
+      | map(.[0])
+      | sort_by((.value.location[2] // "?") | rank)
+      | .[]
+      | "\(.key)\t\(.value.location[2] // "?")\t\(.value.asn // "?")"' 2>/dev/null)
+
+    if (( ${#ru_nodes[@]} < 6 )); then
+      while IFS=$'\t' read -r k city asn; do
+        [[ -z "$k" ]] && continue
+        [[ -n "${NODE_LABEL[$k]:-}" ]] && continue
+        ru_nodes+=("$k")
+        NODE_LABEL["$k"]="${city:-?} (${asn:-?})"
+        (( ${#ru_nodes[@]} >= 16 )) && break
+      done < <(echo "$nodes_json" | jq -r '
+        .nodes | to_entries[]
+        | select(.value.location[0]=="ru")
+        | "\(.key)\t\(.value.location[2] // "?")\t\(.value.asn // "?")"' 2>/dev/null)
+    fi
+
+    # Контроль вне РФ (разные страны)
+    local seen_cc=" "
+    while IFS=$'\t' read -r k country cc; do
+      [[ -z "$k" ]] && continue
+      [[ "$seen_cc" == *" $cc "* ]] && continue
+      seen_cc+="$cc "
+      ctrl_nodes+=("$k")
+      NODE_LABEL["$k"]="${country:-$cc} · контроль"
+      (( ${#ctrl_nodes[@]} >= 3 )) && break
     done < <(echo "$nodes_json" | jq -r '
       .nodes | to_entries[]
-      | select(.value.location[0]=="ru")
-      | "\(.key)\t\(.value.location[2] // "?")\t\(.value.asn // "?")"' 2>/dev/null)
-  fi
+      | select(.value.location[0] as $c
+          | ($c=="de" or $c=="nl" or $c=="fi" or $c=="pl" or $c=="cz" or $c=="us" or $c=="gb"))
+      | "\(.key)\t\(.value.location[1] // "?")\t\(.value.location[0])"' 2>/dev/null)
 
-  # Контроль вне РФ (разные страны) — отличить бан от «порт закрыт везде»
-  local seen_cc=" "
-  while IFS=$'\t' read -r k country cc; do
-    [[ -z "$k" ]] && continue
-    [[ "$seen_cc" == *" $cc "* ]] && continue
-    seen_cc+="$cc "
-    ctrl_nodes+=("$k")
-    NODE_LABEL["$k"]="${country:-$cc} · контроль"
-    (( ${#ctrl_nodes[@]} >= 3 )) && break
-  done < <(echo "$nodes_json" | jq -r '
-    .nodes | to_entries[]
-    | select(.value.location[0] as $c
-        | ($c=="de" or $c=="nl" or $c=="fi" or $c=="pl" or $c=="cz" or $c=="us" or $c=="gb"))
-    | "\(.key)\t\(.value.location[1] // "?")\t\(.value.location[0])"' 2>/dev/null)
+    if (( ${#ru_nodes[@]} == 0 )); then
+      warn "check-host: нет РФ-узлов сейчас."
+    else
+      local params="" n
+      for n in "${ru_nodes[@]}" "${ctrl_nodes[@]}"; do params+="&node=${n}"; done
 
-  if (( ${#ru_nodes[@]} == 0 )); then
-    warn "Сейчас нет доступных РФ-узлов у check-host.net — повторите позже"
-    return 1
-  fi
+      # ── Проба A: TCP IP:порт ──
+      info "check-host · TCP ${host}:${port} — городов РФ: ${#ru_nodes[@]}, контроль: ${#ctrl_nodes[@]}…"
+      local req rid permalink
+      req=$(_ch_get "/check-tcp?host=${host}:${port}${params}")
+      rid=$(echo "$req" | jq -r '.request_id // empty' 2>/dev/null)
+      permalink=$(echo "$req" | jq -r '.permanent_link // empty' 2>/dev/null)
+      if [[ -n "$rid" ]]; then
+        local tries=0 pending=1 v
+        sleep 1
+        while (( tries < 8 )); do
+          _CH_RESULT_JSON=$(_ch_get "/check-result/${rid}")
+          if [[ -n "$_CH_RESULT_JSON" ]]; then
+            pending=0
+            for n in "${ru_nodes[@]}" "${ctrl_nodes[@]}"; do
+              v=$(echo "$_CH_RESULT_JSON" | jq -r --arg n "$n" '.[$n] // "null"' 2>/dev/null)
+              [[ "$v" == "null" || -z "$v" ]] && { pending=1; break; }
+            done
+            (( pending == 0 )) && break
+          fi
+          tries=$((tries + 1)); sleep 1
+        done
+        local st detail label
+        echo
+        echo -e "  ${WHITE}TCP ${port} по городам РФ:${NC}"
+        for n in "${ru_nodes[@]}"; do
+          IFS='|' read -r st detail < <(_ch_status_of "$n")
+          label="${NODE_LABEL[$n]:-$n}"
+          case "$st" in
+            OK)   printf "    ${GREEN}✅ %-26s доступен${NC} ${GRAY}(%ss)${NC}\n" "$label" "${detail:-?}"; tcp_ru_ok=$((tcp_ru_ok+1)) ;;
+            FAIL) printf "    ${RED}⛔ %-26s НЕ доступен${NC} — %s\n" "$label" "$detail"; tcp_ru_fail=$((tcp_ru_fail+1)) ;;
+            *)    printf "    ${GRAY}… %-26s (не успел)${NC}\n" "$label" ;;
+          esac
+        done
+        if (( ${#ctrl_nodes[@]} > 0 )); then
+          echo -e "  ${WHITE}Контроль вне РФ (TCP):${NC}"
+          for n in "${ctrl_nodes[@]}"; do
+            IFS='|' read -r st detail < <(_ch_status_of "$n")
+            label="${NODE_LABEL[$n]:-$n}"
+            case "$st" in
+              OK)   printf "    ${GREEN}✅ %-26s доступен${NC}\n" "$label"; tcp_ctrl_ok=$((tcp_ctrl_ok+1)) ;;
+              FAIL) printf "    ${RED}⛔ %-26s НЕ доступен${NC}\n" "$label"; tcp_ctrl_fail=$((tcp_ctrl_fail+1)) ;;
+            esac
+          done
+        fi
+      else
+        warn "check-host не принял TCP-запрос (лимит/сеть)."
+      fi
 
-  local params="" n
-  for n in "${ru_nodes[@]}" "${ctrl_nodes[@]}"; do
-    params+="&node=${n}"
-  done
-
-  info "TCP ${host}:${port} — городов РФ: ${#ru_nodes[@]}, контроль: ${#ctrl_nodes[@]}…"
-  local req rid permalink
-  req=$(_ch_get "/check-tcp?host=${host}:${port}${params}")
-  rid=$(echo "$req" | jq -r '.request_id // empty' 2>/dev/null)
-  permalink=$(echo "$req" | jq -r '.permanent_link // empty' 2>/dev/null)
-  [[ -z "$rid" ]] && { warn "check-host.net не принял запрос (лимит/сеть) — повторите позже"; return 1; }
-
-  # Быстрый опрос: ~1+8 с вместо ~28 с
-  local tries=0 pending=1 v
-  sleep 1
-  while (( tries < 8 )); do
-    _CH_RESULT_JSON=$(_ch_get "/check-result/${rid}")
-    if [[ -n "$_CH_RESULT_JSON" ]]; then
-      pending=0
-      for n in "${ru_nodes[@]}" "${ctrl_nodes[@]}"; do
-        v=$(echo "$_CH_RESULT_JSON" | jq -r --arg n "$n" '.[$n] // "null"' 2>/dev/null)
-        [[ "$v" == "null" || -z "$v" ]] && { pending=1; break; }
-      done
-      (( pending == 0 )) && break
+      # ── Проба B: HTTPS/SNI по домену (не в авто) ──
+      if [[ "$auto" != "1" && -n "$sni_domain" ]]; then
+        info "check-host · HTTPS/SNI https://${sni_domain} …"
+        local hreq hrid
+        hreq=$(_ch_get "/check-http?host=https://${sni_domain}${params}")
+        hrid=$(echo "$hreq" | jq -r '.request_id // empty' 2>/dev/null)
+        if [[ -n "$hrid" ]]; then
+          local htries=0 hpending=1
+          sleep 1
+          while (( htries < 8 )); do
+            _CH_RESULT_JSON=$(_ch_get "/check-result/${hrid}")
+            if [[ -n "$_CH_RESULT_JSON" ]]; then
+              hpending=0
+              for n in "${ru_nodes[@]}" "${ctrl_nodes[@]}"; do
+                v=$(echo "$_CH_RESULT_JSON" | jq -r --arg n "$n" '.[$n] // "null"' 2>/dev/null)
+                [[ "$v" == "null" || -z "$v" ]] && { hpending=1; break; }
+              done
+              (( hpending == 0 )) && break
+            fi
+            htries=$((htries+1)); sleep 1
+          done
+          local hst hdet hcode
+          echo
+          echo -e "  ${WHITE}HTTPS/SNI ${sni_domain} по РФ:${NC}"
+          for n in "${ru_nodes[@]}"; do
+            IFS='|' read -r hst hdet hcode < <(_ch_http_status_of "$n")
+            label="${NODE_LABEL[$n]:-$n}"
+            case "$hst" in
+              OK)   printf "    ${GREEN}✅ %-26s TLS ок${NC} ${GRAY}(код %s)${NC}\n" "$label" "${hcode:-?}"; sni_ru_ok=$((sni_ru_ok+1)) ;;
+              FAIL) printf "    ${RED}⛔ %-26s TLS оборван${NC} — %s\n" "$label" "$hdet"; sni_ru_fail=$((sni_ru_fail+1)) ;;
+              *)    printf "    ${GRAY}… %-26s (не успел)${NC}\n" "$label" ;;
+            esac
+          done
+          for n in "${ctrl_nodes[@]}"; do
+            IFS='|' read -r hst hdet hcode < <(_ch_http_status_of "$n")
+            case "$hst" in
+              OK)   sni_ctrl_ok=$((sni_ctrl_ok+1)) ;;
+              FAIL) sni_ctrl_fail=$((sni_ctrl_fail+1)) ;;
+            esac
+          done
+        else
+          warn "check-host не принял HTTPS-запрос (лимит/сеть)."
+        fi
+      fi
+      [[ -n "${permalink:-}" ]] && echo -e "  ${GRAY}Отчёт check-host: ${permalink}${NC}"
     fi
-    tries=$((tries + 1))
-    sleep 1
-  done
-
-  local st detail label ru_ok=0 ru_fail=0 ctrl_ok=0 ctrl_fail=0
-  echo
-  echo -e "  ${WHITE}Города РФ:${NC}"
-  for n in "${ru_nodes[@]}"; do
-    IFS='|' read -r st detail < <(_ch_status_of "$n")
-    label="${NODE_LABEL[$n]:-$n}"
-    case "$st" in
-      OK)   printf "    ${GREEN}✅ %-28s доступен${NC} ${GRAY}(%ss)${NC}\n" "$label" "${detail:-?}"; ru_ok=$((ru_ok + 1)) ;;
-      FAIL) printf "    ${RED}⛔ %-28s НЕ доступен${NC} — %s\n" "$label" "$detail"; ru_fail=$((ru_fail + 1)) ;;
-      *)    printf "    ${GRAY}… %-28s (не успел)${NC}\n" "$label" ;;
-    esac
-  done
-
-  if (( ${#ctrl_nodes[@]} > 0 )); then
-    echo
-    echo -e "  ${WHITE}Контроль (вне РФ):${NC}"
-    for n in "${ctrl_nodes[@]}"; do
-      IFS='|' read -r st detail < <(_ch_status_of "$n")
-      label="${NODE_LABEL[$n]:-$n}"
-      case "$st" in
-        OK)   printf "    ${GREEN}✅ %-28s доступен${NC} ${GRAY}(%ss)${NC}\n" "$label" "${detail:-?}"; ctrl_ok=$((ctrl_ok + 1)) ;;
-        FAIL) printf "    ${RED}⛔ %-28s НЕ доступен${NC} — %s\n" "$label" "$detail"; ctrl_fail=$((ctrl_fail + 1)) ;;
-        *)    printf "    ${GRAY}… %-28s (не успел)${NC}\n" "$label" ;;
-      esac
-    done
   fi
 
-  local total_ru=$(( ru_ok + ru_fail ))
+  ####################### ИСТОЧНИК 2: globalping (не в авто) #######################
+  if (( gp_up == 1 )) && [[ "$auto" != "1" ]]; then
+    sources_used+=("globalping")
+    local gpf; gpf=$(mktemp "${TMPDIR:-/tmp}/rn-gp.XXXXXX" 2>/dev/null || echo "")
+    if [[ -n "$gpf" ]]; then
+      # Проба A (reachability IP:443) из РФ (до 8 проб) + 1 контроль
+      local body_a
+      body_a=$(jq -nc --arg t "$host" --argjson p "$port" '
+        {type:"http",target:$t,
+         locations:[{country:"RU",limit:8},{country:"DE",limit:1}],
+         measurementOptions:{protocol:"HTTPS",port:$p,request:{method:"HEAD"}}}' 2>/dev/null)
+      echo
+      if _gp_measure "$body_a" "$gpf"; then
+        echo -e "  ${WHITE}globalping · доступность ${host}:${port}:${NC}"
+        local line cc cityg asng tcpv tlsv stg
+        while IFS=$'\t' read -r cc cityg asng stg tcpv tlsv; do
+          [[ -z "$cc" ]] && continue
+          if [[ "$stg" == "finished" && "$tcpv" != "null" && -n "$tcpv" ]]; then
+            printf "    ${GREEN}✅ %-20s${NC} ${GRAY}%s/AS%s tcp=%sms tls=%s${NC}\n" "$cityg" "$cc" "$asng" "$tcpv" "${tlsv}"
+            [[ "$cc" == "RU" ]] && tcp_ru_ok=$((tcp_ru_ok+1)) || tcp_ctrl_ok=$((tcp_ctrl_ok+1))
+          else
+            printf "    ${RED}⛔ %-20s${NC} ${GRAY}%s/AS%s не подключился${NC}\n" "$cityg" "$cc" "$asng"
+            [[ "$cc" == "RU" ]] && tcp_ru_fail=$((tcp_ru_fail+1)) || tcp_ctrl_fail=$((tcp_ctrl_fail+1))
+          fi
+        done < <(jq -r '.results[]? | "\(.probe.country // "?")\t\(.probe.city // "?")\t\(.probe.asn // 0)\t\(.result.status // "?")\t\(.result.timings.tcp // "null")\t\(.result.tls.authorized // "null")"' "$gpf" 2>/dev/null)
+      fi
+
+      # Проба B (SNI домена) из РФ
+      if [[ -n "$sni_domain" ]]; then
+        local body_b
+        body_b=$(jq -nc --arg t "$sni_domain" '
+          {type:"http",target:$t,
+           locations:[{country:"RU",limit:6},{country:"DE",limit:1}],
+           measurementOptions:{protocol:"HTTPS",port:443,request:{method:"HEAD"}}}' 2>/dev/null)
+        if _gp_measure "$body_b" "$gpf"; then
+          echo -e "  ${WHITE}globalping · HTTPS/SNI ${sni_domain}:${NC}"
+          local cc2 city2 asn2 st2 tls2 code2
+          while IFS=$'\t' read -r cc2 city2 asn2 st2 tls2 code2; do
+            [[ -z "$cc2" ]] && continue
+            if [[ "$st2" == "finished" && "$tls2" != "null" && -n "$tls2" ]]; then
+              printf "    ${GREEN}✅ %-20s${NC} ${GRAY}%s TLS ок (код %s)${NC}\n" "$city2" "$cc2" "${code2}"
+              [[ "$cc2" == "RU" ]] && sni_ru_ok=$((sni_ru_ok+1)) || sni_ctrl_ok=$((sni_ctrl_ok+1))
+            else
+              printf "    ${RED}⛔ %-20s${NC} ${GRAY}%s TLS оборван${NC}\n" "$city2" "$cc2"
+              [[ "$cc2" == "RU" ]] && sni_ru_fail=$((sni_ru_fail+1)) || sni_ctrl_fail=$((sni_ctrl_fail+1))
+            fi
+          done < <(jq -r '.results[]? | "\(.probe.country // "?")\t\(.probe.city // "?")\t\(.probe.asn // 0)\t\(.result.status // "?")\t\(.result.tls.authorized // "null")\t\(.result.statusCode // "null")"' "$gpf" 2>/dev/null)
+        fi
+      fi
+
+      # Пооператорная матрица (best-effort: только ASN с живыми пробами)
+      local -a op_locs=() op_have=()
+      local op a got
+      for op in "${_OP_ORDER[@]}"; do
+        got=""
+        for a in ${_OP_ASN[$op]:-}; do
+          if _gp_asn_has_probe "$a"; then got="$a"; break; fi
+        done
+        if [[ -n "$got" ]]; then
+          op_locs+=("{\"country\":\"RU\",\"asn\":${got},\"limit\":1}")
+          op_have+=("${op}=${got}")
+        fi
+      done
+      echo
+      echo -e "  ${WHITE}Пооператорно (globalping, где есть пробы):${NC}"
+      if (( ${#op_locs[@]} > 0 )); then
+        local locs_json; locs_json=$(printf '%s,' "${op_locs[@]}"); locs_json="[${locs_json%,}]"
+        local body_op
+        body_op=$(jq -nc --arg t "$host" --argjson p "$port" --argjson L "$locs_json" '
+          {type:"http",target:$t,locations:$L,
+           measurementOptions:{protocol:"HTTPS",port:$p,request:{method:"HEAD"}}}' 2>/dev/null)
+        if _gp_measure "$body_op" "$gpf"; then
+          # asn→оператор
+          local asn_res st_res tcp_res pair opname opasn
+          while IFS=$'\t' read -r asn_res st_res tcp_res; do
+            [[ -z "$asn_res" ]] && continue
+            opname="AS${asn_res}"
+            for pair in "${op_have[@]}"; do
+              opasn="${pair#*=}"; [[ "$opasn" == "$asn_res" ]] && { opname="${pair%=*}"; break; }
+            done
+            if [[ "$st_res" == "finished" && "$tcp_res" != "null" && -n "$tcp_res" ]]; then
+              printf "    ${GREEN}✅ %-14s${NC} ${GRAY}AS%s · доступен${NC}\n" "$opname" "$asn_res"
+            else
+              printf "    ${RED}⛔ %-14s${NC} ${GRAY}AS%s · не подключился${NC}\n" "$opname" "$asn_res"
+            fi
+          done < <(jq -r '.results[]? | "\(.probe.asn // 0)\t\(.result.status // "?")\t\(.result.timings.tcp // "null")"' "$gpf" 2>/dev/null)
+        fi
+      fi
+      # Операторы без проб
+      local miss=""
+      for op in "${_OP_ORDER[@]}"; do
+        if ! printf '%s\n' "${op_have[@]:-}" | grep -q "^${op}="; then miss+="${op} "; fi
+      done
+      [[ -n "$miss" ]] && echo -e "    ${GRAY}нет живых проб: ${miss}${NC}"
+      echo -e "    ${GRAY}мобильные операторы в free-API покрыты частично; полная матрица — RIPE Atlas (ключ).${NC}"
+      rm -f "$gpf" "$gpf.post" 2>/dev/null
+    fi
+  fi
+  [[ -n "$_GP_PROBES_FILE" ]] && rm -f "$_GP_PROBES_FILE" 2>/dev/null
+
+  ####################### ВЕРДИКТ #######################
+  local total_ru=$(( tcp_ru_ok + tcp_ru_fail ))
+  local sni_total=$(( sni_ru_ok + sni_ru_fail ))
+  local ctrl_tcp=$(( tcp_ctrl_ok + tcp_ctrl_fail ))
   echo
-  echo -e "  ${WHITE}Итог:${NC}"
-  if (( ${#ctrl_nodes[@]} > 0 && ctrl_ok == 0 )); then
-    warn "Контрольные узлы (вне РФ) тоже не подключились."
-    echo -e "    ${GRAY}Это НЕ ТСПУ: порт ${port} недоступен глобально. Проверьте, что сервис слушает и открыт в firewall.${NC}"
-  elif (( total_ru == 0 )); then
+  echo -e "  ${WHITE}${BOLD}Вердикт:${NC}"
+  if (( total_ru == 0 )); then
     warn "РФ-узлы не дали ответа — повторите позже."
-  elif (( ru_fail == 0 )); then
-    ok "Из РФ порт ${port} доступен со всех проверенных городов — блокировки нет."
-  elif (( ru_ok == 0 )); then
-    echo -e "    ${RED}${BOLD}⛔ Похоже на блокировку ТСПУ/РКН.${NC}"
-    echo -e "    ${GRAY}Из РФ порт недоступен из всех городов, а контрольные узлы подключились.${NC}"
+  elif (( ctrl_tcp > 0 && tcp_ctrl_ok == 0 )); then
+    warn "Контроль вне РФ тоже не подключился — это НЕ ТСПУ."
+    echo -e "    ${GRAY}Порт ${port} недоступен глобально: проверьте, что сервис слушает и открыт в firewall.${NC}  ${GRAY}[VPS]${NC}"
+  elif (( tcp_ru_ok == 0 )); then
+    echo -e "    ${RED}${BOLD}⛔ БЛОК ПО IP/ПОРТУ.${NC} Из РФ порт недоступен везде, контроль — ОК."
+    echo -e "    ${WHITE}Действие:${NC} сменить IP (новый VPS/миграция). ${GRAY}[VPS]${NC}"
+    echo -e "    ${YELLOW}⚠ Затем обновить Address ноды в панели Remnawave (+ DNS selfsteal-домена). [панель]${NC}"
+  elif (( sni_total > 0 && sni_ru_ok == 0 && (sni_ctrl_ok > 0 || sni_ctrl_fail == 0) )); then
+    echo -e "    ${RED}${BOLD}⛔ БЛОК ПО SNI/ДОМЕНУ маскировки.${NC} IP доступен, но TLS с этим доменом рвётся из РФ."
+    echo -e "    ${WHITE}Действие:${NC} сменить dest/serverNames на живой популярный RU-домен."
+    echo -e "    ${YELLOW}⚠ Это правка Reality-inbound В ПАНЕЛИ Remnawave + рассылка новых подписок. [панель][клиент]${NC}"
+  elif (( tcp_ru_fail == 0 && (sni_total == 0 || sni_ru_fail == 0) )); then
+    local _clean_lbl="IP"; (( sni_total > 0 )) && _clean_lbl="IP и SNI"
+    ok "${_clean_lbl} чистые: из РФ доступно со всех проверенных точек."
+    echo -e "    ${GRAY}⚠ Это не гарантия работы ноды: active-probing и блок по uTLS-fingerprint снаружи НЕ видны.${NC}"
+    echo -e "    ${GRAY}Если клиенты жалуются при чистых IP/SNI — менять uTLS fingerprint/порт. [клиент][панель]${NC}"
   else
-    echo -e "    ${YELLOW}⚠️  Частичная недоступность из РФ: ${ru_ok}/${total_ru} городов ОК.${NC}"
-    echo -e "    ${GRAY}Возможна выборочная фильтрация у части операторов или временная нестабильность.${NC}"
+    echo -e "    ${YELLOW}⚠️ Выборочная фильтрация/нестабильность:${NC} TCP РФ ${tcp_ru_ok}/${total_ru} ОК$([[ $sni_total -gt 0 ]] && echo ", SNI ${sni_ru_ok}/${sni_total} ОК")."
+    echo -e "    ${GRAY}Часть операторов/городов режет или временная нестабильность — см. таблицы выше.${NC}"
   fi
 
   echo
-  echo -e "  ${GRAY}TCP IP:порт (блок по IP/порту). DPI по SNI так не виден.${NC}"
-  echo -e "  ${GRAY}Узлы check-host — дата-центры; домашний/мобильный ISP может отличаться.${NC}"
-  [[ -n "$permalink" ]] && echo -e "  ${GRAY}Полный отчёт: ${permalink}${NC}"
+  local srcs="${sources_used[*]:-—}"
+  echo -e "  ${GRAY}Проверено источников: ${srcs// /, }${NC}"
+  echo -e "  ${GRAY}check-host/globalping — в осн. дата-центры; домашний/мобильный ISP может отличаться.${NC}"
   echo
 }
 
