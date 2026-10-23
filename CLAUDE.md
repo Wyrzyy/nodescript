@@ -111,6 +111,10 @@ Reality `serverNames`/`dest`/`xver`, `SECRET_KEY`, outbound, образ) — О�
 - **Зеркала GitHub**: доступ из РФ к raw.githubusercontent часто закрыт → ghproxy/ghfast/jsdelivr + антикэш `?_=ts`.
 
 ## Соглашения по коду
+- **⚠️ ПОДНИМАТЬ `_REMNANODE_VER_PIN` (строка 18) при КАЖДОМ пушe в main** (и комментарий «# Версия:»).
+  Иначе `remnanode self-update` и авто-обновление (`_exec_if_github_newer`) считают, что обновлять нечего,
+  и правки не доезжают (сравнение через `sort -V`, формат `YYYY.M.D[.N]`, равные версии = не обновляется).
+  Запуск через `bash <(curl …?_=ts)` тянет свежак в обход версии, но на self-update полагаться без бампа нельзя.
 - `set -Eeuo pipefail` глобально. В меню — «мягкий режим» `_menu_soft_mode` (`set +e; trap - ERR`),
   чтобы ошибка команды не убивала UI. `err()` делает `exit 1` (фатально даже в мягком режиме).
 - Ввод: `ask`/`ask_secret`/`ask_yes_no`/`ask_choice` + `_is_back` для «назад». Отмена = `return 0/1`, не exit.

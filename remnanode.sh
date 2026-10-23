@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.10.23
+# Версия: 2026.10.23.1
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.10.23"
+_REMNANODE_VER_PIN="2026.10.23.1"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
