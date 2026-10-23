@@ -934,15 +934,10 @@ service_status_text() {
       fi
       ;;
     warp)
-      if command -v warp-cli >/dev/null 2>&1; then
-        local _ws=""
-        _ws=$(warp-cli --accept-tos status 2>/dev/null || true)
-        if echo "$_ws" | grep -qiE 'connected|Status[[:space:]]*[:=]?[[:space:]]*Connected'; then
-          if ss -tlnp 2>/dev/null | grep -qE ":${WARP_PORT}\\b"; then
-            echo "подключён"
-          else
-            echo "установлен"
-          fi
+      # метод-агностично: офиц. cloudflare-warp ИЛИ wgcf+wireproxy
+      if _warp_installed; then
+        if warp_port_listening; then
+          echo "подключён"
         else
           echo "установлен"
         fi
