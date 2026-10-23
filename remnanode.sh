@@ -54,6 +54,12 @@ PANEL_IMAGE_REPO="remnawave/backend"
 PANEL_IMAGE_TAG="3"
 PANEL_IMAGE="${PANEL_IMAGE_REPO}:${PANEL_IMAGE_TAG}"
 WARP_PORT=9091
+# Альтернативный метод WARP (wgcf + wireproxy, userspace → SOCKS5 на том же порту)
+WGCF_DIR="/etc/wireproxy"
+WGCF_BIN="/usr/local/bin/wgcf"
+WIREPROXY_BIN="/usr/local/bin/wireproxy"
+WIREPROXY_SVC="warp-wireproxy"
+WGCF_PIN_VER="v2.2.22"
 LAUNCHER_PATH="/opt/remnanode/installer.sh"
 CLI_PATH="/usr/local/bin/remnanode"
 
@@ -865,7 +871,7 @@ show_header() {
       "$WHITE" "$NC" "$CYAN" "$_site" "$NC" "$GRAY" "$_skind" "$NC"
   fi
   # WARP: показываем только если установлен (подтверждение «работает ли» при запуске)
-  if command -v warp-cli >/dev/null 2>&1; then
+  if _warp_installed; then
     # считаем статус один раз за редрав (без двойного форка warp-cli)
     local _wlbl _wc=0 _wp=0
     warp_is_connected && _wc=1
@@ -3742,7 +3748,7 @@ install_essentials() {
   if [[ "$ESS_WS" == "nginx" ]]; then
     warn "Nginx: для SSL нужен рабочий DNS и свободный порт 80/8443 (acme.sh). Caddy проще."
   fi
-  if command -v warp-cli >/dev/null 2>&1; then
+  if _warp_installed; then
     info "WARP уже установлен — будет проверено подключение (без переустановки)."
     _warp_yn="y"
   else
@@ -3794,10 +3800,10 @@ install_essentials() {
   echo
   echo -e "  ${CYAN}${BOLD}▶ 3/3 · WARP${NC}"; hline 40
   if [[ "$_warp_yn" =~ ^[Yy]$ ]]; then
-    if command -v warp-cli >/dev/null 2>&1; then
+    if _warp_installed; then
       info "WARP уже стоял — проверяю подключение…"
       _WARP_CHECKED=0; warp_ensure_running
-      if warp_is_connected && warp_port_listening; then ok "WARP на связи (127.0.0.1:${WARP_PORT})"; else warn "WARP не поднялся — warp-cli status"; fi
+      if warp_port_listening; then ok "WARP на связи (127.0.0.1:${WARP_PORT})"; else warn "WARP не поднялся — проверьте статус WARP"; fi
     else
       install_warp
     fi
@@ -4312,12 +4318,28 @@ rollback_custom_xray_patch() {
 ###############################################################################
 # WARP подключён? Проверка без сетевых запросов (локальный IPC warp-cli).
 # Внимание: строка "Disconnected" содержит подстроку "connected" — проверяем оба.
+# WARP установлен любым методом? (официальный cloudflare-warp ИЛИ wgcf+wireproxy)
+_warp_installed() {
+  command -v warp-cli >/dev/null 2>&1 && return 0
+  [[ -f "/etc/systemd/system/${WIREPROXY_SVC}.service" ]] && return 0
+  return 1
+}
+# Метод = альтернативный (wgcf+wireproxy)?
+_warp_is_wireproxy() { [[ -f "/etc/systemd/system/${WIREPROXY_SVC}.service" ]]; }
+
 warp_is_connected() {
-  command -v warp-cli >/dev/null 2>&1 || return 1
-  local s
-  s=$(warp-cli status 2>/dev/null || warp-cli --accept-tos status 2>/dev/null || true)
-  [[ -z "$s" ]] && return 1
-  grep -qiE 'connected' <<<"$s" && ! grep -qiE 'disconnected|connecting|unable' <<<"$s"
+  if command -v warp-cli >/dev/null 2>&1; then
+    local s
+    s=$(warp-cli status 2>/dev/null || warp-cli --accept-tos status 2>/dev/null || true)
+    [[ -z "$s" ]] && return 1
+    grep -qiE 'connected' <<<"$s" && ! grep -qiE 'disconnected|connecting|unable' <<<"$s"
+    return
+  fi
+  if _warp_is_wireproxy; then
+    systemctl is-active --quiet "${WIREPROXY_SVC}" 2>/dev/null
+    return
+  fi
+  return 1
 }
 
 # SOCKS5-порт WARP слушает? (идиом как в остальном скрипте: ss -tlnp)
@@ -4327,30 +4349,134 @@ warp_port_listening() {
 
 # Автоподнятие WARP при запуске лаунчера. Идемпотентно, 1 раз за процесс.
 # Пользователю не нужен фоновый демон: повторный запуск скрипта чинит WARP.
-# Молча, если всё ок; итог виден в строке WARP шапки.
+# Молча, если всё ок; итог виден в строке WARP шапки. Работает для обоих методов.
 _WARP_CHECKED=0
 warp_ensure_running() {
   [[ "$_WARP_CHECKED" == "1" ]] && return 0
   _WARP_CHECKED=1
-  command -v warp-cli >/dev/null 2>&1 || return 0   # не установлен — выходим тихо
-  # демон warp-svc должен жить
-  if ! systemctl is-active --quiet warp-svc 2>/dev/null; then
-    systemctl start warp-svc >/dev/null 2>&1 || true
-    sleep 1
+  if command -v warp-cli >/dev/null 2>&1; then
+    # демон warp-svc должен жить
+    if ! systemctl is-active --quiet warp-svc 2>/dev/null; then
+      systemctl start warp-svc >/dev/null 2>&1 || true
+      sleep 1
+    fi
+    if warp_is_connected && warp_port_listening; then
+      return 0
+    fi
+    [[ -x /usr/local/bin/warp-fix-network.sh ]] && /usr/local/bin/warp-fix-network.sh >/dev/null 2>&1 || true
+    warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
+    warp-cli --accept-tos proxy port "$WARP_PORT" >/dev/null 2>&1 || true
+    warp-cli --accept-tos connect >/dev/null 2>&1 || true
+    local i
+    for i in 1 2 3; do warp_is_connected && warp_port_listening && break; sleep 1; done
+    return 0
   fi
-  if warp_is_connected && warp_port_listening; then
-    return 0   # всё ок — молча, статус покажет шапка
+  if _warp_is_wireproxy; then
+    if ! systemctl is-active --quiet "${WIREPROXY_SVC}" 2>/dev/null; then
+      systemctl start "${WIREPROXY_SVC}" >/dev/null 2>&1 || true
+      sleep 1
+    fi
+    warp_port_listening && return 0
+    systemctl restart "${WIREPROXY_SVC}" >/dev/null 2>&1 || true
+    local i
+    for i in 1 2 3; do warp_port_listening && break; sleep 1; done
+    return 0
   fi
-  # чиним: /32-фикс сети, режим proxy, порт, connect
-  [[ -x /usr/local/bin/warp-fix-network.sh ]] && /usr/local/bin/warp-fix-network.sh >/dev/null 2>&1 || true
-  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
-  warp-cli --accept-tos proxy port "$WARP_PORT" >/dev/null 2>&1 || true
-  warp-cli --accept-tos connect >/dev/null 2>&1 || true
-  local i
-  for i in 1 2 3; do
-    warp_is_connected && warp_port_listening && break
-    sleep 1
-  done
+  return 0
+}
+
+# Альтернативная установка WARP: wgcf + wireproxy (userspace WireGuard → SOCKS5).
+# Без пакета cloudflare-warp и kernel-модулей. Тот же SOCKS5 127.0.0.1:$WARP_PORT,
+# поэтому outbound в панели/Xray менять НЕ нужно. Возврат 0 успех / 1 неуспех.
+install_warp_wgcf() {
+  info "Альтернативный метод WARP: wgcf + wireproxy (тот же SOCKS5 :${WARP_PORT})."
+  command -v curl >/dev/null 2>&1 || { warn "Нужен curl"; return 1; }
+  command -v jq   >/dev/null 2>&1 || { apt_wait_locks 30 || true; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq >/dev/null 2>&1 || true; }
+  command -v tar  >/dev/null 2>&1 || { apt_wait_locks 30 || true; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tar >/dev/null 2>&1 || true; }
+
+  local arch="$ARCH"
+  case "$arch" in amd64|arm64) ;; *) warn "Арх '$arch' — пробую amd64"; arch="amd64" ;; esac
+  mkdir -p "$WGCF_DIR"
+
+  # 1) wgcf (последняя версия через GitHub API, иначе пин)
+  info "Скачиваю wgcf…"
+  local wgcf_url=""
+  wgcf_url=$(curl -fsSL --max-time 12 "https://api.github.com/repos/ViRb3/wgcf/releases/latest" 2>/dev/null \
+    | jq -r --arg a "linux_${arch}" '.assets[]?|.browser_download_url|select(endswith($a))' 2>/dev/null | head -1)
+  [[ -z "$wgcf_url" ]] && wgcf_url="https://github.com/ViRb3/wgcf/releases/download/${WGCF_PIN_VER}/wgcf_${WGCF_PIN_VER#v}_linux_${arch}"
+  if ! gh_download "$wgcf_url" "$WGCF_BIN"; then warn "Не удалось скачать wgcf ($wgcf_url)"; return 1; fi
+  chmod +x "$WGCF_BIN"
+
+  # 2) wireproxy (имя ассета без версии → latest/download)
+  info "Скачиваю wireproxy…"
+  local wp_tgz wp_tmp wp_found
+  wp_tgz=$(mktemp "${TMPDIR:-/tmp}/rn-wp.XXXXXX.tar.gz")
+  if ! gh_download "https://github.com/whyvl/wireproxy/releases/latest/download/wireproxy_linux_${arch}.tar.gz" "$wp_tgz"; then
+    rm -f "$wp_tgz"; warn "Не удалось скачать wireproxy"; return 1
+  fi
+  wp_tmp=$(mktemp -d "${TMPDIR:-/tmp}/rn-wpx.XXXXXX")
+  tar -xzf "$wp_tgz" -C "$wp_tmp" 2>/dev/null || { rm -rf "$wp_tmp" "$wp_tgz"; warn "wireproxy: распаковка не удалась"; return 1; }
+  wp_found=$(find "$wp_tmp" -type f -name wireproxy 2>/dev/null | head -1)
+  [[ -z "$wp_found" ]] && wp_found=$(find "$wp_tmp" -type f -perm -u+x 2>/dev/null | head -1)
+  if [[ -z "$wp_found" ]]; then rm -rf "$wp_tmp" "$wp_tgz"; warn "wireproxy бинарь не найден в архиве"; return 1; fi
+  install -m 0755 "$wp_found" "$WIREPROXY_BIN"
+  rm -rf "$wp_tmp" "$wp_tgz"
+
+  # 3) регистрация WARP-аккаунта (wgcf) + WireGuard-профиль
+  info "Регистрирую WARP-аккаунт (wgcf)…"
+  if [[ ! -f "$WGCF_DIR/wgcf-account.toml" ]]; then
+    ( cd "$WGCF_DIR" && "$WGCF_BIN" register --accept-tos ) >>"$LOG" 2>&1 \
+      || { sleep 2; ( cd "$WGCF_DIR" && "$WGCF_BIN" register --accept-tos ) >>"$LOG" 2>&1 || { warn "wgcf register не удался (сеть?) — см. $LOG"; return 1; }; }
+  fi
+  ( cd "$WGCF_DIR" && "$WGCF_BIN" generate ) >>"$LOG" 2>&1 || { warn "wgcf generate не удался"; return 1; }
+  [[ -f "$WGCF_DIR/wgcf-profile.conf" ]] || { warn "Нет wgcf-profile.conf"; return 1; }
+
+  # 4) конфиг wireproxy (WG-профиль + SOCKS5)
+  cat > "$WGCF_DIR/proxy.conf" <<EOF
+WGConfig = ${WGCF_DIR}/wgcf-profile.conf
+
+[Socks5]
+BindAddress = 127.0.0.1:${WARP_PORT}
+EOF
+  chmod 600 "$WGCF_DIR/proxy.conf"
+
+  # 5) systemd-сервис
+  cat > "/etc/systemd/system/${WIREPROXY_SVC}.service" <<EOF
+[Unit]
+Description=WARP via wgcf + wireproxy (SOCKS5 ${WARP_PORT})
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=${WIREPROXY_BIN} -c ${WGCF_DIR}/proxy.conf
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "${WIREPROXY_SVC}" >/dev/null 2>&1 || true
+  systemctl restart "${WIREPROXY_SVC}" >/dev/null 2>&1 || true
+
+  # 6) проверка
+  local warp_ip="" ok_flag=0 i
+  for i in 1 2 3 4 5; do sleep 2; warp_port_listening && { ok_flag=1; break; }; done
+  warp_ip=$(curl -s --max-time 10 --socks5 "127.0.0.1:${WARP_PORT}" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+  echo
+  if [[ "$ok_flag" -eq 1 && -n "$warp_ip" ]]; then
+    echo -e "${GREEN}${BOLD}"
+    echo "  ╔════════════════════════════════════════════════════╗"
+    echo "  ║     ✅  WARP (wgcf+wireproxy) РАБОТАЕТ            ║"
+    echo "  ╚════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+  else
+    echo -e "${YELLOW}${BOLD}  ⚠️  wireproxy поднят, SOCKS ещё не готов${NC}"
+    warn "Проверьте: systemctl status ${WIREPROXY_SVC}; ss -tlnp | grep ${WARP_PORT}"
+  fi
+  echo -e "  SOCKS5:  ${CYAN}127.0.0.1:${WARP_PORT}${NC}  ${GRAY}(метод: wgcf+wireproxy)${NC}"
+  [[ -n "$warp_ip" ]] && echo -e "  CF IP:   ${CYAN}${warp_ip}${NC}"
+  echo -e "  Сервис:  ${CYAN}systemctl status ${WIREPROXY_SVC}${NC}"
+  echo -e "  ${GRAY}Outbound в панели/Xray менять не нужно — SOCKS5 тот же (127.0.0.1:${WARP_PORT}).${NC}"
+  echo
   return 0
 }
 
@@ -4361,6 +4487,15 @@ install_warp() {
   echo
   info "Исходящий IP Cloudflare — outbound в XRay для ChatGPT / Spotify и т.п."
   echo
+
+  # Уже стоит альтернативный метод (wgcf+wireproxy)?
+  if ! command -v warp-cli >/dev/null 2>&1 && _warp_is_wireproxy; then
+    warn "WARP уже установлен (метод wgcf+wireproxy)."
+    ask_yes_no "🔄 Переустановить (wgcf+wireproxy)?" ans N
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    install_warp_wgcf
+    return $?
+  fi
 
   if command -v warp-cli >/dev/null 2>&1; then
     warn "WARP уже установлен: $(warp-cli --version 2>/dev/null | head -1)"
@@ -4409,7 +4544,26 @@ systemctl daemon-reload"
   ok "Репозиторий Cloudflare"
 
   apt_wait_locks 120 || true
-  run_step "Установка cloudflare-warp" "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp"
+  # Официальный пакет. На части систем падает «held broken packages» → чиним
+  # зависимости и, если не помогло, переходим на wgcf+wireproxy (тот же SOCKS5).
+  info "Установка cloudflare-warp…"
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp >>"$LOG" 2>&1; then
+    ok "cloudflare-warp установлен"
+  else
+    warn "apt не смог поставить cloudflare-warp — пробую починить зависимости…"
+    apt_wait_locks 120 || true
+    apt-get -y -qq --fix-broken install >>"$LOG" 2>&1 || true
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp >>"$LOG" 2>&1; then
+      ok "cloudflare-warp установлен (после --fix-broken)"
+    else
+      warn "Официальный пакет не ставится на этой системе (битые зависимости)."
+      # чистим недоустановленное репо официального клиента, чтобы не мешало
+      apt-get remove -y --purge cloudflare-warp >/dev/null 2>&1 || true
+      rm -f /etc/apt/sources.list.d/cloudflare-client.list 2>/dev/null || true
+      install_warp_wgcf
+      return $?
+    fi
+  fi
 
   # /32 VPS fix
   local iface prefix
@@ -5507,7 +5661,7 @@ run_tspu_check() {
       if [[ -n "$rid" ]]; then
         local tries=0 pending=1 v
         sleep 1
-        while (( tries < 8 )); do
+        while (( tries < 18 )); do
           _CH_RESULT_JSON=$(_ch_get "/check-result/${rid}")
           if [[ -n "$_CH_RESULT_JSON" ]]; then
             pending=0
@@ -5555,7 +5709,7 @@ run_tspu_check() {
         if [[ -n "$hrid" ]]; then
           local htries=0 hpending=1
           sleep 1
-          while (( htries < 8 )); do
+          while (( htries < 18 )); do
             _CH_RESULT_JSON=$(_ch_get "/check-result/${hrid}")
             if [[ -n "$_CH_RESULT_JSON" ]]; then
               hpending=0
@@ -6145,7 +6299,8 @@ case "${1:-}" in
   hysteria2-legacy|h2-legacy)  install_hysteria2_legacy ;;
   fix-hysteria|fix-online)    fix_hysteria2_online ;;
   install-warp)                install_warp ;;
-  warp-check|warp-up|warp-fix) _menu_soft_mode; _WARP_CHECKED=0; warp_ensure_running; warp_is_connected && ok "WARP подключён (127.0.0.1:${WARP_PORT})" || warn "WARP не поднят — warp-cli status" ;;
+  install-warp-wgcf|warp-wgcf) _menu_soft_mode; install_warp_wgcf ;;
+  warp-check|warp-up|warp-fix) _menu_soft_mode; _WARP_CHECKED=0; warp_ensure_running; warp_port_listening && ok "WARP работает (SOCKS5 127.0.0.1:${WARP_PORT})" || warn "WARP не поднят — проверьте статус" ;;
   install-mtproto|mtproto)     install_mtproto ;;
   swap)                        _menu_soft_mode; setup_swap ;;
   ufw|firewall)                _menu_soft_mode; setup_ufw ;;

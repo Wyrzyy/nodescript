@@ -61,10 +61,14 @@ Reality `serverNames`/`dest`/`xver`, `SECRET_KEY`, outbound, образ) — О�
   WARP (install или `warp_ensure_running`). В конце — блок «⚠ ТРЕБУЕТСЯ ДЕЙСТВИЕ В ПАНЕЛИ».
 - Hysteria2: `install_hysteria2` (свой certbot/certs/renew), `install_hysteria2_legacy`,
   `fix_hysteria2_online`, `apply_custom_xray_patch`/`rollback_custom_xray_patch`.
-- WARP: `install_warp` (репо Cloudflare, /32-fix, mode proxy + порт `WARP_PORT`, `warp-auto.service`).
-  `warp_is_connected` (парсит `warp-cli status`; «Disconnected» содержит «connected» → проверяем оба),
+- WARP: `install_warp` (офиц. пакет cloudflare-warp: репо Cloudflare, /32-fix, mode proxy + порт `WARP_PORT`,
+  `warp-auto.service`). **Фолбэк**: если apt даёт «held broken packages» → `--fix-broken` → `install_warp_wgcf`
+  (wgcf + wireproxy, userspace WireGuard → тот же SOCKS5 `127.0.0.1:$WARP_PORT`, БЕЗ пакета и kernel-модулей,
+  systemd `warp-wireproxy.service`, конфиг `/etc/wireproxy/`). Outbound в панели менять НЕ нужно (порт тот же).
+  Хелперы метод-агностичны: `_warp_installed`/`_warp_is_wireproxy`, `warp_is_connected` (cli: парсит
+  `warp-cli status`, «Disconnected» содержит «connected» → проверяем оба; wireproxy: `systemctl is-active`),
   `warp_port_listening`, `warp_ensure_running` (автохил при запуске, 1 раз/процесс, guard `_WARP_CHECKED`,
-  молча если ок — статус виден в шапке). MTProto: `install_mtproto`.
+  оба метода). CLI: `remnanode warp-wgcf` — форсить альтернативный метод. MTProto: `install_mtproto`.
 - Система: `setup_swap`, `setup_ufw`, `setup_ports`/`ports_open`/`ports_open_panel` (firewall через nft,
   это НЕ UFW), `apply_performance_tuning`, анти-DDoS `setup_antiddos`/`apply_antiddos`.
 - Тесты/РКН: `run_speedtest_menu` и др.; **`run_tspu_check`** (~5222) — проверка блокировки из РФ через
@@ -131,6 +135,9 @@ Reality `serverNames`/`dest`/`xver`, `SECRET_KEY`, outbound, образ) — О�
 - **Вердикт** раздельный: блок-по-IP / блок-по-SNI / чисто / частично / глобально-недоступно, с тегами
   действий `[VPS]`/`[панель]`/`[клиент]` и оговоркой: active-probing / uTLS-fingerprint снаружи НЕ видны.
 - **auto-режим** (после install, 3302/3832) — лёгкий: только check-host TCP (без globalping/SNI), чтобы не тормозить установку и не жечь лимит.
+- **Опрос check-host = 18 итераций** (было 8): при НЕдоступном сервере узлы отдают таймаут-FAIL ~10с,
+  8с не хватало → показывало «не успел» вместо ⛔. Ранний выход при готовности сохранён (доступный сервер — быстро).
+  Если ВСЕ (РФ + контроль) по 443 = ⛔ → на 443 никто не слушает глобально = Reality-inbound не настроен в панели (частый кейс после установки).
 - ⚠️ Парсеры провалидированы на мок-JSON по докам, но ЖИВЬЁМ из sandbox не протестированы (egress 403 на оба API).
   Нужен один прогон `remnanode rkn` на VPS для сверки форматов /check-http и globalping; парсеры защитные (деградируют, не падают).
 - ASN операторов (на 2026): МТС AS8359/25513, Билайн AS3216/16345, Мегафон AS31133/31205/25159,
