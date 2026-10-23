@@ -59,8 +59,16 @@ Reality `serverNames`/`dest`/`xver`, `SECRET_KEY`, outbound, образ) — О�
   ЗАРАНЕЕ (collect ноды + домен/ws/порт selfsteal + да/нет WARP), один финальный confirm, затем без
   участия: `_rn_do_install` → `run_selfsteal @ --caddy --force --domain … --port … install` →
   WARP (install или `warp_ensure_running`). В конце — блок «⚠ ТРЕБУЕТСЯ ДЕЙСТВИЕ В ПАНЕЛИ».
-- Hysteria2: `install_hysteria2` (свой certbot/certs/renew), `install_hysteria2_legacy`,
-  `fix_hysteria2_online`, `apply_custom_xray_patch`/`rollback_custom_xray_patch`.
+- Hysteria2 (переработано 2026-10-23, по рабочей ноде DE): меню `hysteria2_menu` (пункт 3) → `install_hysteria2`
+  (0 версия Xray в ноде ≥ `H2_XRAY_MIN` 26.6.1 · 1 DNS · 2 UDP 443 + порт-хоппинг 20000–29999→443 (`_h2_setup_hop`, nft
+  `remna_hy2` + unit `remna-hy2-hop`) · 3 certbot standalone, 80/tcp ТОЛЬКО на время выпуска/продления через хуки
+  `renewal-hooks/pre|post/remna-acme-*.sh` (временная таблица `remna_acme`, стоп/старт держателя :80 = Caddy selfsteal,
+  своё правило UFW пользователя не трогают) · 4 certs → /opt/hysteria/certs (ключ 600, или 644 если не читается в контейнере,
+  `.keymode`), deploy-hook · 5 volume в compose · 6 `inbound.json` (hysteria v2, TLS alpn h3, finalmask salamander
+  packetSize 900-1300 + quicParams bbr; пароль salamander один раз в `.obfs`) · 7 `ИНСТРУКЦИЯ.txt` — пошагово для панели:
+  inbound в УЖЕ привязанный профиль (новый профиль вытеснит Reality!), включить на ноде, сквад, хост (Address=домен, SNI, ALPN h3)).
+  `check_hysteria2` (CLI `h2-check`): Xray жив, UDP 443 слушает, сертификат/SAN, монтирование, читаемость ключа, логи.
+  Inbound провалидирован `xray run -test`. Старое: `install_hysteria2_legacy`, `fix_hysteria2_online` (кастомное ядро).
 - WARP: `install_warp` (офиц. пакет cloudflare-warp: репо Cloudflare, /32-fix, mode proxy + порт `WARP_PORT`,
   `warp-auto.service`). **Фолбэк**: если apt даёт «held broken packages» → `--fix-broken` → `install_warp_wgcf`
   (wgcf + wireproxy, userspace WireGuard → тот же SOCKS5 `127.0.0.1:$WARP_PORT`, БЕЗ пакета и kernel-модулей,

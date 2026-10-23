@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.8.28
+# Версия: 2026.10.23
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.8.28"
+_REMNANODE_VER_PIN="2026.10.23"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -3844,16 +3844,37 @@ install_essentials() {
 }
 
 ###############################################################################
-# HYSTERIA2 — через h2-script (без установки ноды из того скрипта)
-###############################################################################
-###############################################################################
-# Hysteria2 — своя автоустановка «от и до» (нужен только домен)
-# Делает: certbot standalone, сертификаты в /opt/hysteria/certs, deploy-hook
-# авто-продления, volume в compose ноды, порты 80/tcp + 443/udp, рестарт ноды.
+# HYSTERIA2 — установка «от и до» на ноду Remnawave (ядро Xray, inbound hysteria v2)
+#
+# Что делает на сервере (панель НЕ трогает):
+#   0) проверяет, что Xray в контейнере ноды умеет Hysteria2 (26.6+)
+#   1) домен → DNS этого сервера
+#   2) UDP 443 + порт-хоппинг 20000–29999/udp → 443 (nftables, переживает ребут)
+#   3) сертификат Let's Encrypt (certbot standalone); 80/tcp открывается ТОЛЬКО
+#      на время выпуска/продления, занявший его сервис (Caddy selfsteal) — на эти
+#      секунды останавливается и сразу поднимается (те же хуки при авто-продлении)
+#   4) сертификаты → /opt/hysteria/certs, монтирование в контейнер ноды (ro)
+#   5) пароль маскировки salamander (генерируется 1 раз, хранится в /opt/hysteria)
+#   6) готовый inbound для панели: /opt/hysteria/inbound.json
+#   7) пошаговая инструкция для панели: /opt/hysteria/ИНСТРУКЦИЯ.txt
+# Повторный запуск безопасен: ничего не дублирует, Reality и прочие inbound'ы
+# не трогает, compose бэкапится перед правкой.
 ###############################################################################
 H2_DIR="/opt/hysteria"
 H2_CERTS="$H2_DIR/certs"
 H2_DOMAIN_FILE="$H2_DIR/.domain"
+H2_OBFS_FILE="$H2_DIR/.obfs"
+H2_INBOUND_FILE="$H2_DIR/inbound.json"
+H2_GUIDE_FILE="$H2_DIR/ИНСТРУКЦИЯ.txt"
+H2_TAG="HYSTERIA_GAME"
+H2_PORT=443
+H2_HOP_FROM=20000
+H2_HOP_TO=29999
+H2_HOP_TABLE="remna_hy2"
+H2_HOP_RULES="/etc/remnanode/hy2-hop.nft"
+H2_HOP_UNIT="/etc/systemd/system/remna-hy2-hop.service"
+H2_ACME_TABLE="remna_acme"
+H2_XRAY_MIN="26.6.1"
 
 _h2_ensure_certbot() {
   command -v certbot >/dev/null 2>&1 && return 0
@@ -3866,61 +3887,6 @@ _h2_ensure_certbot() {
   spin_fn "apt update (для certbot)" apt_update_safe || true
   apt_wait_locks 60 || true
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends certbot >>"$LOG" 2>&1
-}
-
-# Кто держит :80 — печатает "docker <id>" | "unit <name>" | ""
-_h2_port80_holder() {
-  local pid cid unit
-  pid=$(ss -tlnp 'sport = :80' 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
-  [[ -z "$pid" ]] && return 0
-  cid=$(grep -oE '[0-9a-f]{64}' "/proc/${pid}/cgroup" 2>/dev/null | head -1)
-  if [[ -n "$cid" ]] && command -v docker >/dev/null 2>&1 && docker inspect "$cid" >/dev/null 2>&1; then
-    printf 'docker %s' "$cid"
-    return 0
-  fi
-  unit=$(cat "/proc/${pid}/cgroup" 2>/dev/null | grep -oE '[a-zA-Z0-9_.@-]+\.service' | head -1)
-  [[ -n "$unit" ]] && printf 'unit %s' "$unit"
-  return 0
-}
-
-_H2_STOPPED_KIND=""
-_H2_STOPPED_ID=""
-
-_h2_free_port80() {
-  _H2_STOPPED_KIND=""
-  _H2_STOPPED_ID=""
-  local holder kind id
-  holder=$(_h2_port80_holder)
-  [[ -z "$holder" ]] && return 0
-  kind="${holder%% *}"
-  id="${holder#* }"
-  case "$kind" in
-    docker)
-      local name
-      name=$(docker inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##')
-      warn "Порт 80 занят контейнером ${name:-$id} — остановлю на время выпуска сертификата"
-      docker stop "$id" >/dev/null 2>&1 || return 0
-      _H2_STOPPED_KIND="docker"
-      _H2_STOPPED_ID="$id"
-      ;;
-    unit)
-      warn "Порт 80 занят сервисом ${id} — остановлю на время выпуска сертификата"
-      systemctl stop "$id" >/dev/null 2>&1 || return 0
-      _H2_STOPPED_KIND="unit"
-      _H2_STOPPED_ID="$id"
-      ;;
-  esac
-  return 0
-}
-
-_h2_restore_port80() {
-  case "$_H2_STOPPED_KIND" in
-    docker) docker start "$_H2_STOPPED_ID" >/dev/null 2>&1 && info "Контейнер возвращён в работу" ;;
-    unit)   systemctl start "$_H2_STOPPED_ID" >/dev/null 2>&1 && info "Сервис ${_H2_STOPPED_ID} запущен обратно" ;;
-  esac
-  _H2_STOPPED_KIND=""
-  _H2_STOPPED_ID=""
-  return 0
 }
 
 # Добавить volume-монтирование в compose ноды (идемпотентно, без python)
@@ -3949,14 +3915,77 @@ _compose_add_mount() {
   grep -qF "$mount" "$COMPOSE" 2>/dev/null
 }
 
-# Выпуск сертификата: вывод certbot — в лог (fd 3), чтобы не рвать спиннер
-_h2_certbot_issue() {
-  local domain="$1" email="$2"
-  certbot certonly --standalone -d "$domain" \
-    --agree-tos -m "$email" --non-interactive --no-eff-email \
-    --keep-until-expiring >&3 2>&3
+# Версия Xray внутри контейнера ноды: "26.7.28" | ""
+_h2_xray_version() {
+  docker exec remnanode xray version 2>/dev/null | awk 'NR==1 && $1=="Xray" {print $2}' | tr -d 'v'
 }
 
+# a >= b (версии вида 26.7.28)
+_h2_ver_ge() {
+  [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]
+}
+
+# Хуки certbot: открыть 80/tcp и освободить его на время выпуска/продления, потом
+# всё вернуть. Пишутся в renewal-hooks — автопродление делает ровно то же самое.
+_h2_write_acme_hooks() {
+  local pre="/etc/letsencrypt/renewal-hooks/pre/remna-acme-open.sh"
+  local post="/etc/letsencrypt/renewal-hooks/post/remna-acme-close.sh"
+  mkdir -p /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post
+  cat > "$pre" <<'EOF'
+#!/bin/bash
+# Hysteria2 / remnanode: 80/tcp на время выпуска сертификата
+nft -f - <<NFT 2>/dev/null || true
+table inet remna_acme
+delete table inet remna_acme
+table inet remna_acme {
+  chain input {
+    type filter hook input priority -20; policy accept;
+    tcp dport 80 accept comment "remna-acme-80"
+  }
+}
+NFT
+# UFW: временное правило — только если 80/tcp ещё не разрешён (своё правило пользователя не трогаем)
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active' \
+   && ! ufw status 2>/dev/null | grep -qE '^80(/tcp)?[[:space:]]+ALLOW'; then
+  ufw allow 80/tcp comment 'acme-temp' >/dev/null 2>&1 && touch /run/remna-acme.ufw
+fi
+# кто держит :80 (обычно Caddy selfsteal) — остановить на эти секунды
+[[ -s /run/remna-acme.holder ]] && exit 0
+pid=$(ss -tlnp 'sport = :80' 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+if [[ -n "$pid" ]]; then
+  cid=$(grep -oE '[0-9a-f]{64}' "/proc/${pid}/cgroup" 2>/dev/null | head -1)
+  if [[ -n "$cid" ]] && docker inspect "$cid" >/dev/null 2>&1; then
+    docker stop "$cid" >/dev/null 2>&1 && echo "docker $cid" > /run/remna-acme.holder
+  else
+    unit=$(grep -oE '[a-zA-Z0-9_.@-]+\.service' "/proc/${pid}/cgroup" 2>/dev/null | head -1)
+    [[ -n "$unit" ]] && systemctl stop "$unit" >/dev/null 2>&1 && echo "unit $unit" > /run/remna-acme.holder
+  fi
+fi
+exit 0
+EOF
+  cat > "$post" <<'EOF'
+#!/bin/bash
+# Hysteria2 / remnanode: вернуть всё как было после выпуска/продления
+nft delete table inet remna_acme 2>/dev/null || true
+# UFW: убрать только своё временное правило
+if [[ -f /run/remna-acme.ufw ]]; then
+  ufw delete allow 80/tcp >/dev/null 2>&1 || true
+  rm -f /run/remna-acme.ufw
+fi
+if [[ -s /run/remna-acme.holder ]]; then
+  read -r kind id < /run/remna-acme.holder
+  case "$kind" in
+    docker) docker start "$id" >/dev/null 2>&1 ;;
+    unit)   systemctl start "$id" >/dev/null 2>&1 ;;
+  esac
+fi
+rm -f /run/remna-acme.holder
+exit 0
+EOF
+  chmod 755 "$pre" "$post"
+}
+
+# Deploy-hook: свежий сертификат → /opt/hysteria/certs → перезапуск ноды
 _h2_write_renew_hook() {
   local domain="$1"
   mkdir -p /etc/letsencrypt/renewal-hooks/deploy
@@ -3964,25 +3993,329 @@ _h2_write_renew_hook() {
   cat > "$hook" <<EOF
 #!/bin/bash
 # автопродление: копируем свежие сертификаты для Hysteria2 и перезапускаем ноду
-cp -f /etc/letsencrypt/live/${domain}/fullchain.pem ${H2_CERTS}/fullchain.pem
-cp -f /etc/letsencrypt/live/${domain}/privkey.pem  ${H2_CERTS}/privkey.pem
-chmod 644 ${H2_CERTS}/fullchain.pem
-chmod 640 ${H2_CERTS}/privkey.pem
+[[ "\${RENEWED_LINEAGE:-}" == "/etc/letsencrypt/live/${domain}" ]] || [[ -z "\${RENEWED_LINEAGE:-}" ]] || exit 0
+install -m 644 /etc/letsencrypt/live/${domain}/fullchain.pem ${H2_CERTS}/fullchain.pem
+install -m "\$(cat ${H2_DIR}/.keymode 2>/dev/null || echo 600)" /etc/letsencrypt/live/${domain}/privkey.pem ${H2_CERTS}/privkey.pem
 docker compose -f ${COMPOSE} restart remnanode >/dev/null 2>&1 || true
 EOF
   chmod +x "$hook"
   printf '%s' "$hook"
 }
 
+# Выпуск сертификата: вывод — в лог (fd 3). Хуки 80/tcp вызывает install_hysteria2 вокруг него;
+# при авто-продлении certbot сам берёт их из renewal-hooks/pre|post.
+_h2_certbot_issue() {
+  local domain="$1" email="$2"
+  certbot certonly --standalone -d "$domain" \
+    --agree-tos -m "$email" --non-interactive --no-eff-email \
+    --keep-until-expiring >&3 2>&3
+}
+
+# Порт-хоппинг: UDP 20000–29999 → 443 (nat prerouting), своя таблица, свой unit
+_h2_setup_hop() {
+  mkdir -p "$(dirname "$H2_HOP_RULES")"
+  cat > "$H2_HOP_RULES" <<NFT
+#!/usr/sbin/nft -f
+# Hysteria2 port hopping: UDP ${H2_HOP_FROM}-${H2_HOP_TO} → ${H2_PORT} (remnanode)
+table inet ${H2_HOP_TABLE}
+delete table inet ${H2_HOP_TABLE}
+table inet ${H2_HOP_TABLE} {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        udp dport ${H2_HOP_FROM}-${H2_HOP_TO} redirect to :${H2_PORT} comment "remna-hy2-hop"
+    }
+}
+NFT
+  chmod 0644 "$H2_HOP_RULES"
+  nft -f "$H2_HOP_RULES" >&3 2>&3 || return 1
+  cat > "$H2_HOP_UNIT" <<UNIT
+[Unit]
+Description=Hysteria2 port hopping (UDP ${H2_HOP_FROM}-${H2_HOP_TO} -> ${H2_PORT}, remnanode)
+After=network-online.target nftables.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f ${H2_HOP_RULES}
+ExecStop=/usr/sbin/nft delete table inet ${H2_HOP_TABLE}
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable remna-hy2-hop.service >/dev/null 2>&1 || true
+  systemctl start remna-hy2-hop.service >/dev/null 2>&1 || true
+  return 0
+}
+
+# Пароль salamander: один на ноду, не меняется при повторном запуске (клиенты не сломаются)
+_h2_obfs_password() {
+  if [[ -s "$H2_OBFS_FILE" ]]; then
+    tr -d '[:space:]' <"$H2_OBFS_FILE"
+    return 0
+  fi
+  local p
+  p=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  ( umask 077; printf '%s\n' "$p" > "$H2_OBFS_FILE" )
+  printf '%s' "$p"
+}
+
+# Готовый inbound для конфиг-профиля в панели (пути — как внутри контейнера ноды)
+_h2_inbound_json() {
+  local domain="$1" obfs="$2"
+  cat <<JSON
+{
+  "tag": "${H2_TAG}",
+  "listen": "0.0.0.0",
+  "port": ${H2_PORT},
+  "protocol": "hysteria",
+  "settings": {
+    "version": 2,
+    "clients": []
+  },
+  "streamSettings": {
+    "network": "hysteria",
+    "security": "tls",
+    "tlsSettings": {
+      "serverName": "${domain}",
+      "alpn": ["h3"],
+      "certificates": [
+        {
+          "certificateFile": "${H2_CERTS}/fullchain.pem",
+          "keyFile": "${H2_CERTS}/privkey.pem"
+        }
+      ]
+    },
+    "hysteriaSettings": {
+      "version": 2
+    },
+    "finalmask": {
+      "udp": [
+        {
+          "type": "salamander",
+          "settings": {
+            "password": "${obfs}",
+            "packetSize": "900-1300"
+          }
+        }
+      ],
+      "quicParams": {
+        "congestion": "bbr"
+      }
+    }
+  },
+  "sniffing": {
+    "enabled": true,
+    "destOverride": ["http", "tls", "quic"],
+    "routeOnly": true
+  }
+}
+JSON
+}
+
+# Пошаговая инструкция для панели Remnawave (печатается и сохраняется в файл)
+_h2_guide() {
+  local domain="$1" ip="${PUBLIC_IP:-IP этого сервера}"
+  cat <<GUIDE
+================================================================================
+ HYSTERIA2 НА НОДЕ ${ip} — ЧТО СДЕЛАТЬ В ПАНЕЛИ REMNAWAVE (по шагам)
+================================================================================
+Сервер уже готов: сертификат на ${domain}, UDP ${H2_PORT} открыт,
+порт-хоппинг ${H2_HOP_FROM}–${H2_HOP_TO}/udp → ${H2_PORT}, сертификаты смонтированы в ноду.
+Inbound лежит в файле:  ${H2_INBOUND_FILE}
+Показать его ещё раз:   cat ${H2_INBOUND_FILE}
+
+ШАГ 1. Config Profiles (Конфиг-профили)
+  1.1  Откройте профиль, который УЖЕ привязан к этой ноде — тот, где ваш Reality.
+       ⛔ НЕ создавайте отдельный профиль под Hysteria2: у ноды только один профиль,
+          новый заменит старый — Reality пропадёт и перестанет работать ВСЁ.
+  1.2  В JSON профиля найдите массив  "inbounds": [ ... ]
+  1.3  После последнего inbound'а поставьте запятую и вставьте ЦЕЛИКОМ объект
+       из ${H2_INBOUND_FILE} (от { до }). Внутри ничего не меняйте:
+       — tag "${H2_TAG}" (если такой tag уже есть в профиле — переименуйте новый);
+       — port ${H2_PORT} — это UDP, с Reality на ${H2_PORT}/TCP он не конфликтует;
+       — пути к сертификатам — как внутри контейнера ноды, они уже смонтированы;
+       — "clients": [] оставьте пустым — пользователей панель добавит сама.
+  1.4  Нажмите Save. Если панель ругается на JSON — почти всегда это запятая
+       между inbound'ами или лишняя } в конце.
+
+ШАГ 2. Nodes (Ноды) → нода ${ip}
+  2.1  Config Profile — тот же профиль из шага 1.
+  2.2  В списке inbound'ов этого профиля включите ${H2_TAG}.
+       Reality и остальные — оставьте включёнными как были.
+  2.3  Save. Нода перезапустит Xray (5–15 секунд).
+  2.4  Вернитесь в этот скрипт → Hysteria2 → «Проверить».
+       Должно быть: ✅ Xray запущен, ✅ UDP ${H2_PORT} слушает.
+       ⛔ Если после 2.3 ВСЁ перестало работать — Xray не принял конфиг.
+          Сразу снимите галочку ${H2_TAG} (2.2) → Save: Reality вернётся.
+          Затем «Проверить» в скрипте — он покажет причину из логов ноды.
+
+ШАГ 3. Internal Squads (Внутренние сквады)
+  3.1  Откройте сквад, в котором ваши пользователи.
+       Совет: сначала создайте тестовый сквад с одним своим пользователем,
+       проверьте, и только потом включайте всем.
+  3.2  Включите в нём inbound ${H2_TAG} → Save.
+
+ШАГ 4. Hosts (Хосты) → Create host (новый хост)
+  Inbound ............ профиль из шага 1 → ${H2_TAG}
+  Remark (имя) ....... например: 🎮 Game | Город · UDP
+  Address ............ ${domain}        ← именно ДОМЕН, не IP: сертификат на домен
+  Port ............... ${H2_PORT}
+  SNI ................ ${domain}
+  ALPN ............... h3
+  Fingerprint ........ chrome (можно оставить пустым)
+  Allow insecure ..... ВЫКЛЮЧЕНО (сертификат настоящий)
+  Пароль salamander отдельно указывать не нужно: панель берёт его из inbound'а
+  и сама кладёт клиентам в подписку.
+  Save. Если хост нужен не всем — повесьте на него свой tag (например GAME).
+
+ШАГ 5. Клиент (проверка)
+  5.1  Happ: обновите подписку (⟳ или потяните список вниз) —
+       появится новый сервер с именем из шага 4.
+  5.2  Подключитесь к нему и откройте любой сайт.
+       Нет соединения:
+       — у клиента должна быть свежая версия (ядро Xray 26.x с Hysteria2);
+       — скрипт → «Проверить»: UDP ${H2_PORT} должен слушать;
+       — у части провайдеров UDP режут — тогда на этом сервере используйте Reality.
+  5.3  Порт-хоппинг: сервер принимает и ${H2_HOP_FROM}–${H2_HOP_TO}/udp. Панель диапазон
+       в ссылку не кладёт — по умолчанию клиенты ходят на ${H2_PORT}, это нормально.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+  — Логи ноды:           docker logs --tail 100 remnanode
+  — Кто слушает UDP:     ss -ulnp 'sport = :${H2_PORT}'
+  — Сертификат:          openssl x509 -noout -subject -enddate -in ${H2_CERTS}/fullchain.pem
+  — Откат в панели:      снять ${H2_TAG} с ноды (шаг 2.2) — всё остальное вернётся как было.
+================================================================================
+GUIDE
+}
+
+# Проверка Hysteria2 на сервере (после настройки в панели)
+check_hysteria2() {
+  show_header
+  echo -e "${WHITE}${BOLD}  🔍 Hysteria2 — проверка${NC}"
+  hline 56
+  echo
+  local domain="" bad=0
+  [[ -f "$H2_DOMAIN_FILE" ]] && domain=$(tr -d '[:space:]' <"$H2_DOMAIN_FILE" 2>/dev/null || true)
+
+  # 1) контейнер и Xray
+  if ! is_remnanode_up; then
+    echo -e "    ${RED}⛔ контейнер remnanode не запущен${NC}  ${GRAY}(docker compose -f ${COMPOSE} up -d)${NC}"
+    bad=1
+  elif docker exec remnanode pgrep -f xray >/dev/null 2>&1; then
+    echo -e "    ${GREEN}✅ Xray в ноде запущен${NC}  ${GRAY}($( _h2_xray_version || true ))${NC}"
+  else
+    echo -e "    ${RED}⛔ Xray в ноде НЕ запущен${NC} — панель прислала конфиг, который он не принял"
+    bad=1
+  fi
+
+  # 2) UDP 443 слушает
+  if ss -ulnp "sport = :${H2_PORT}" 2>/dev/null | grep -q xray; then
+    echo -e "    ${GREEN}✅ UDP ${H2_PORT} слушает Xray${NC} — inbound ${H2_TAG} работает"
+  else
+    echo -e "    ${YELLOW}⚠️  UDP ${H2_PORT} не слушается${NC} — inbound ещё не включён на ноде (инструкция, шаг 2.2)"
+    bad=1
+  fi
+
+  # 3) сертификат
+  if [[ -s "$H2_CERTS/fullchain.pem" && -s "$H2_CERTS/privkey.pem" ]]; then
+    local exp subj
+    exp=$(openssl x509 -enddate -noout -in "$H2_CERTS/fullchain.pem" 2>/dev/null | cut -d= -f2 || true)
+    if openssl x509 -checkend 0 -noout -in "$H2_CERTS/fullchain.pem" >/dev/null 2>&1; then
+      echo -e "    ${GREEN}✅ сертификат действителен${NC}  ${GRAY}до ${exp}${NC}"
+    else
+      echo -e "    ${RED}⛔ сертификат просрочен${NC}  ${GRAY}(${exp}) — certbot renew --force-renewal${NC}"
+      bad=1
+    fi
+    if [[ -n "$domain" ]] && ! openssl x509 -noout -ext subjectAltName -in "$H2_CERTS/fullchain.pem" 2>/dev/null | grep -q "DNS:${domain}"; then
+      echo -e "    ${RED}⛔ сертификат не на ${domain}${NC}"
+      bad=1
+    fi
+  else
+    echo -e "    ${RED}⛔ нет сертификатов в ${H2_CERTS}${NC} — запустите установку Hysteria2"
+    bad=1
+  fi
+  if docker inspect remnanode --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' 2>/dev/null | grep -q "$H2_CERTS"; then
+    echo -e "    ${GREEN}✅ сертификаты смонтированы в ноду${NC}"
+  else
+    echo -e "    ${RED}⛔ сертификаты не смонтированы в ноду${NC} — запустите установку Hysteria2"
+    bad=1
+  fi
+
+  if is_remnanode_up && [[ -s "$H2_CERTS/privkey.pem" ]] && ! docker exec remnanode sh -c "cat ${H2_CERTS}/privkey.pem >/dev/null" 2>/dev/null; then
+    echo -e "    ${RED}⛔ ключ не читается внутри контейнера${NC} — Xray упадёт: chmod 644 ${H2_CERTS}/privkey.pem"
+    bad=1
+  fi
+
+  # 4) порты
+  if nft list table inet "$H2_HOP_TABLE" >/dev/null 2>&1; then
+    echo -e "    ${GREEN}✅ порт-хоппинг ${H2_HOP_FROM}–${H2_HOP_TO}/udp → ${H2_PORT}${NC}"
+  else
+    echo -e "    ${GRAY}○ порт-хоппинг не включён (не обязателен)${NC}"
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active' \
+     && ! ufw status 2>/dev/null | grep -qE "^${H2_PORT}/udp"; then
+    echo -e "    ${RED}⛔ UFW активен и не пускает ${H2_PORT}/udp${NC} — ufw allow ${H2_PORT}/udp"
+    bad=1
+  fi
+
+  # 5) ошибки в логах ноды за 30 минут
+  local errs
+  errs=$(docker logs --since 30m remnanode 2>&1 | grep -iE 'hysteria|certificate|failed to (start|load|build)|tls:' | tail -6 || true)
+  if [[ -n "$errs" ]]; then
+    echo
+    echo -e "  ${YELLOW}Из логов ноды (30 мин):${NC}"
+    printf '%s\n' "$errs" | cut -c1-220 | sed 's/^/    /' >"$_TTY" 2>/dev/null || printf '%s\n' "$errs" | cut -c1-220 | sed 's/^/    /'
+  fi
+  echo
+  if (( bad == 0 )); then
+    ok "Hysteria2 на сервере в порядке. Если клиент не подключается — шаги 4–5 инструкции."
+  else
+    warn "Есть проблемы — см. выше. Инструкция: cat ${H2_GUIDE_FILE}"
+  fi
+  return 0
+}
+
+# Меню пункта «Hysteria2»
+hysteria2_menu() {
+  while true; do
+    show_header
+    echo -e "${WHITE}${BOLD}  ⚡ Hysteria2${NC}"
+    hline 56
+    echo
+    echo -e "  ${WHITE}1)${NC} 🚀 Установить / обновить на этом сервере"
+    echo -e "  ${WHITE}2)${NC} 📋 Инструкция для панели + inbound (показать ещё раз)"
+    echo -e "  ${WHITE}3)${NC} 🔍 Проверить"
+    echo -e "  ${GRAY}0)${NC} 🔙 Назад"
+    echo
+    ask_choice ch
+    case "$ch" in
+      1) install_hysteria2; pause ;;
+      2)
+        if [[ -s "$H2_GUIDE_FILE" && -s "$H2_INBOUND_FILE" ]]; then
+          cat "$H2_GUIDE_FILE" >"$_TTY" 2>/dev/null || cat "$H2_GUIDE_FILE"
+          echo -e "\n  ${WHITE}Inbound (${H2_INBOUND_FILE}):${NC}\n"
+          cat "$H2_INBOUND_FILE" >"$_TTY" 2>/dev/null || cat "$H2_INBOUND_FILE"
+        else
+          warn "Сначала установите Hysteria2 (пункт 1)."
+        fi
+        pause
+        ;;
+      3) check_hysteria2; pause ;;
+      0) return 0 ;;
+      *) continue ;;
+    esac
+  done
+}
+
 # usage: install_hysteria2 [домен]
 install_hysteria2() {
   show_header
-  echo -e "${WHITE}${BOLD}  ⚡ Hysteria2 — автоматическая настройка${NC}"
+  echo -e "${WHITE}${BOLD}  ⚡ Hysteria2 — установка на ноду${NC}"
   hline 56
   echo
-  info "Всё делается само: сертификат Let's Encrypt, авто-продление,"
-  info "монтирование сертификатов в ноду, порты 80/tcp и 443/udp."
-  echo -e "  ${GRAY}От вас нужен только домен, который указывает на этот сервер.${NC}"
+  info "Сервер настроится сам: сертификат, порты, порт-хоппинг, монтирование в ноду."
+  info "Панель скрипт не трогает — в конце будет пошаговая инструкция и готовый inbound."
+  echo -e "  ${GRAY}От вас нужен только домен (A-запись на этот сервер, без прокси Cloudflare).${NC}"
   echo
 
   if ! is_remnanode_installed; then
@@ -3994,12 +4327,29 @@ install_hysteria2() {
     return 1
   fi
 
-  # Домен: аргумент → сохранённый ранее → спросить
+  # 0) ядро Xray в ноде должно уметь Hysteria2
+  local xv=""
+  xv=$(_h2_xray_version || true)
+  if [[ -n "$xv" ]]; then
+    if _h2_ver_ge "$xv" "$H2_XRAY_MIN"; then
+      ok "Xray в ноде: ${xv} — Hysteria2 поддерживается"
+    else
+      warn "Xray в ноде: ${xv}. Для Hysteria2 нужен ${H2_XRAY_MIN}+ (на старом ядре нода не стартует с этим inbound)."
+      echo -e "    ${GRAY}Обновите ноду: меню «Нода» → обновить образ, или «Фикс H2» (своё ядро Xray).${NC}"
+      local go=""
+      ask_yes_no "Продолжить подготовку сервера всё равно?" go N
+      [[ "$go" =~ ^[Yy]$ ]] || return 0
+    fi
+  else
+    warn "Не удалось узнать версию Xray (контейнер не запущен?) — проверьте после установки: «Проверить»."
+  fi
+
+  # 1) домен: аргумент → сохранённый → спросить
   local domain="${1:-}" saved=""
   [[ -f "$H2_DOMAIN_FILE" ]] && saved=$(tr -d '[:space:]' <"$H2_DOMAIN_FILE" 2>/dev/null || true)
   if [[ -z "$domain" ]]; then
     echo -e "  ${GRAY}q — назад без установки${NC}"
-    ask "🌐 Домен для этой ноды" domain "$saved"
+    ask "🌐 Домен для Hysteria2 на этой ноде" domain "$saved"
     if _is_back "$domain" || [[ "$domain" == "0" ]]; then
       warn "Установка Hysteria2 отменена."
       return 0
@@ -4017,23 +4367,22 @@ install_hysteria2() {
     warn "Домен некорректный: «${domain}»"
     return 1
   fi
-
-  # Email для Let's Encrypt: не спрашиваем, если не задан через окружение
   local email="${H2_EMAIL:-admin@${domain}}"
 
   mkdir -p "$H2_CERTS"
+  chmod 755 "$H2_DIR" 2>/dev/null || true
   printf '%s\n' "$domain" > "$H2_DOMAIN_FILE" 2>/dev/null || true
 
   echo
   echo -e "  ${WHITE}Параметры:${NC}"
   echo -e "    Домен:         ${CYAN}${domain}${NC}"
-  echo -e "    Email (ACME):  ${GRAY}${email}${NC}"
+  echo -e "    Порт:          ${GRAY}${H2_PORT}/udp + хоппинг ${H2_HOP_FROM}–${H2_HOP_TO}/udp${NC}"
   echo -e "    Сертификаты:   ${GRAY}${H2_CERTS}${NC}"
-  echo -e "    Compose ноды:  ${GRAY}${COMPOSE}${NC}"
+  echo -e "    Inbound:       ${GRAY}${H2_INBOUND_FILE}${NC}"
   echo
 
-  # 1/6 DNS
-  info "1️⃣/6  Проверка DNS"
+  # 1/7 DNS
+  info "1️⃣/7  Проверка DNS"
   local resolved
   resolved=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -1)
   if [[ -z "$resolved" ]]; then
@@ -4045,7 +4394,7 @@ install_hysteria2() {
   fi
   if [[ -n "$PUBLIC_IP" && "$resolved" != "$PUBLIC_IP" ]]; then
     warn "Домен ведёт на ${resolved}, а IP сервера — ${PUBLIC_IP}"
-    echo -e "    ${GRAY}Для Let's Encrypt (standalone) нужен именно этот сервер.${NC}"
+    echo -e "    ${GRAY}Нужна A-запись именно на этот сервер (в Cloudflare — «DNS only», серое облако).${NC}"
     local go=""
     ask_yes_no "Всё равно продолжить?" go N
     [[ "$go" =~ ^[Yy]$ ]] || { warn "Отменено — поправьте A-запись"; return 1; }
@@ -4053,103 +4402,119 @@ install_hysteria2() {
     ok "DNS: ${domain} → ${resolved}"
   fi
 
-  # 2/6 порты
-  info "2️⃣/6  Открываю порты 80/tcp (ACME) и 443/udp (Hysteria2)"
-  ports_open 80 tcp >/dev/null 2>&1 || warn "Не удалось открыть 80/tcp в nftables"
-  ports_open 443 udp >/dev/null 2>&1 || warn "Не удалось открыть 443/udp в nftables"
+  # 2/7 UDP 443 + хоппинг
+  info "2️⃣/7  UDP ${H2_PORT} и порт-хоппинг ${H2_HOP_FROM}–${H2_HOP_TO}/udp"
+  ports_open "$H2_PORT" udp >/dev/null 2>&1 || warn "Не удалось открыть ${H2_PORT}/udp в nftables"
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-    ufw allow 80/tcp  >/dev/null 2>&1 || true
-    ufw allow 443/udp >/dev/null 2>&1 || true
-    info "UFW активен — правила 80/tcp и 443/udp добавлены"
+    ufw allow "${H2_PORT}/udp" comment 'Hysteria2' >/dev/null 2>&1 || true
+    ufw allow "${H2_HOP_FROM}:${H2_HOP_TO}/udp" comment 'Hysteria2 hop' >/dev/null 2>&1 || true
+    info "UFW активен — правила ${H2_PORT}/udp и ${H2_HOP_FROM}:${H2_HOP_TO}/udp добавлены"
   fi
-  ok "Порты готовы"
+  if _h2_setup_hop; then
+    ok "Порт-хоппинг включён (переживает перезагрузку)"
+  else
+    warn "Порт-хоппинг не включился (не страшно — клиенты ходят на ${H2_PORT}). Лог: ${LOG}"
+  fi
+  # буферы UDP для QUIC
+  local rmem
+  rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+  if (( rmem < 16777216 )); then
+    info "Буферы UDP малы (${rmem}) — применяю тюнинг сети"
+    apply_performance_tuning || true
+  fi
 
-  # 3/6 certbot
-  info "3️⃣/6  Сертификат Let's Encrypt"
+  # 3/7 сертификат
+  info "3️⃣/7  Сертификат Let's Encrypt"
   if ! _h2_ensure_certbot; then
     warn "certbot не установился — см. ${LOG}"
     return 1
   fi
+  _h2_write_acme_hooks
   if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
     ok "Сертификат для ${domain} уже есть — использую его"
   else
-    _h2_free_port80
+    info "80/tcp откроется только на время выпуска; Caddy/selfsteal на нём — остановится на эти секунды"
     local rc=0
+    /etc/letsencrypt/renewal-hooks/pre/remna-acme-open.sh >&3 2>&3 || true
     spin_fn "выпуск сертификата (certbot standalone)" \
       _h2_certbot_issue "$domain" "$email" || rc=$?
-    _h2_restore_port80
+    # в любом случае: закрыть 80/tcp и вернуть Caddy/selfsteal
+    /etc/letsencrypt/renewal-hooks/post/remna-acme-close.sh >&3 2>&3 || true
     if (( rc != 0 )) || [[ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
       warn "Не удалось выпустить сертификат (код ${rc})."
-      echo -e "    ${GRAY}Частые причины: 80/tcp закрыт в firewall провайдера, домен не на этот сервер,${NC}"
-      echo -e "    ${GRAY}или лимит Let's Encrypt. Подробности: ${LOG}${NC}"
+      echo -e "    ${GRAY}Частые причины: 80/tcp закрыт у провайдера/хостера, домен не на этот сервер,${NC}"
+      echo -e "    ${GRAY}оранжевое облако Cloudflare (нужно «DNS only»), лимит Let's Encrypt. Лог: ${LOG}${NC}"
       return 1
     fi
     ok "Сертификат выпущен"
   fi
 
-  # 4/6 сертификаты + hook
-  info "4️⃣/6  Сертификаты в ${H2_CERTS} и авто-продление"
-  cp -f "/etc/letsencrypt/live/${domain}/fullchain.pem" "$H2_CERTS/fullchain.pem"
-  cp -f "/etc/letsencrypt/live/${domain}/privkey.pem"  "$H2_CERTS/privkey.pem"
-  chmod 644 "$H2_CERTS/fullchain.pem" 2>/dev/null || true
-  chmod 640 "$H2_CERTS/privkey.pem" 2>/dev/null || true
+  # 4/7 сертификаты для ноды + авто-продление
+  info "4️⃣/7  Сертификаты в ${H2_CERTS} и авто-продление"
+  install -m 644 "/etc/letsencrypt/live/${domain}/fullchain.pem" "$H2_CERTS/fullchain.pem"
+  install -m "$(cat "$H2_DIR/.keymode" 2>/dev/null || echo 600)" "/etc/letsencrypt/live/${domain}/privkey.pem" "$H2_CERTS/privkey.pem"
   local hook
   hook=$(_h2_write_renew_hook "$domain")
-  ok "Deploy-hook: ${hook}"
+  ok "Продление: certbot.timer + хуки (80/tcp — только на время продления), ${hook}"
 
-  # 5/6 volume в compose
-  info "5️⃣/6  Монтирую сертификаты в контейнер ноды"
+  # 5/7 монтирование в контейнер
+  info "5️⃣/7  Монтирую сертификаты в контейнер ноды"
   if _compose_add_mount "${H2_CERTS}:${H2_CERTS}:ro"; then
-    ok "Volume ${H2_CERTS} прописан в compose"
+    ok "Volume ${H2_CERTS} прописан в compose (бэкап рядом)"
   else
     warn "Не удалось прописать volume — добавьте вручную в ${COMPOSE}:"
     echo -e "    ${GRAY}- '${H2_CERTS}:${H2_CERTS}:ro'${NC}"
   fi
-
-  # 6/6 перезапуск ноды
-  info "6️⃣/6  Пересоздаю контейнер ноды (подхватить сертификаты)"
-  fix_remnanode_s6_init || true
-  if (cd "$DIR" && docker compose up -d >>"$LOG" 2>&1); then
-    ok "Нода перезапущена"
-  else
-    warn "Не удалось перезапустить ноду — docker compose logs remnanode"
-  fi
-  sleep 3
-
-  # Проверка результата
-  echo
-  echo -e "  ${WHITE}Проверка:${NC}"
-  if [[ -s "$H2_CERTS/fullchain.pem" && -s "$H2_CERTS/privkey.pem" ]]; then
-    echo -e "    ${GREEN}✅ сертификаты на месте${NC} ${GRAY}(${H2_CERTS})${NC}"
-  else
-    echo -e "    ${RED}⛔ сертификаты не найдены${NC}"
-  fi
   if docker inspect remnanode --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' 2>/dev/null | grep -q "$H2_CERTS"; then
-    echo -e "    ${GREEN}✅ сертификаты видны внутри контейнера${NC}"
+    ok "Контейнер уже видит сертификаты — перезапуск не нужен"
   else
-    echo -e "    ${YELLOW}⚠️  контейнер пока без монтирования — перезапустите ноду${NC}"
-  fi
-  local exp=""
-  exp=$(openssl x509 -enddate -noout -in "$H2_CERTS/fullchain.pem" 2>/dev/null | cut -d= -f2 || true)
-  [[ -n "$exp" ]] && echo -e "    ${GRAY}Сертификат действителен до: ${exp}${NC}"
-  if systemctl list-timers 2>/dev/null | grep -q certbot; then
-    echo -e "    ${GREEN}✅ авто-продление certbot активно${NC}"
-  else
-    echo -e "    ${GRAY}Продление: systemctl list-timers | grep certbot${NC}"
+    info "Пересоздаю контейнер ноды (5–15 с), чтобы он увидел сертификаты"
+    fix_remnanode_s6_init || true
+    if (cd "$DIR" && docker compose up -d >>"$LOG" 2>&1); then
+      ok "Нода перезапущена"
+    else
+      warn "Не удалось перезапустить ноду — docker compose -f ${COMPOSE} logs remnanode"
+    fi
+    sleep 3
   fi
 
+  # ключ должен читаться тем пользователем, от которого в контейнере работает Xray —
+  # иначе Xray не стартует и падают ВСЕ inbound'ы ноды (частая причина «ничего не работает»)
+  if is_remnanode_up && ! docker exec remnanode sh -c "cat ${H2_CERTS}/privkey.pem >/dev/null" 2>/dev/null; then
+    chmod 644 "$H2_CERTS/privkey.pem" 2>/dev/null || true
+    echo 644 > "$H2_DIR/.keymode"
+    warn "Ключ не читался внутри контейнера — права 644 (продление сохранит их)"
+  elif is_remnanode_up; then
+    ok "Ключ читается внутри контейнера"
+  fi
+
+  # 6/7 inbound
+  info "6️⃣/7  Готовлю inbound для панели"
+  local obfs
+  obfs=$(_h2_obfs_password)
+  ( umask 077; _h2_inbound_json "$domain" "$obfs" > "$H2_INBOUND_FILE" )
+  if command -v jq >/dev/null 2>&1 && ! jq empty "$H2_INBOUND_FILE" >/dev/null 2>&1; then
+    warn "inbound.json получился некорректным — сообщите автору скрипта"
+  fi
+  ok "Inbound: ${H2_INBOUND_FILE}"
+
+  # 7/7 инструкция
+  info "7️⃣/7  Инструкция для панели"
+  ( umask 077; _h2_guide "$domain" > "$H2_GUIDE_FILE" )
+  ok "Инструкция: ${H2_GUIDE_FILE}"
+
   echo
-  ok "Hysteria2 готов на сервере"
+  ok "Сервер готов к Hysteria2"
   echo
-  echo -e "  ${WHITE}Остался один шаг в панели Remnawave:${NC}"
-  echo -e "    1) Config profile с Hysteria2 → привязать к этой ноде"
-  echo -e "    2) В конфиге указать сертификаты:"
-  echo -e "       ${GRAY}cert: ${H2_CERTS}/fullchain.pem${NC}"
-  echo -e "       ${GRAY}key:  ${H2_CERTS}/privkey.pem${NC}"
-  echo -e "       ${GRAY}домен (SNI): ${domain}, порт 443/udp${NC}"
+  echo -e "  ${YELLOW}${BOLD}⚠ ТРЕБУЕТСЯ ДЕЙСТВИЕ В ПАНЕЛИ — по шагам ниже, ничего не пропускайте${NC}"
   echo
-  echo -e "  ${GRAY}Если онлайн в ноде не отображается (ядро 26.3.x) —${NC}"
-  echo -e "  ${GRAY}пункт «Фикс онлайна Hysteria2».${NC}"
+  _h2_guide "$domain" >"$_TTY" 2>/dev/null || _h2_guide "$domain"
+  echo
+  echo -e "  ${WHITE}Inbound для шага 1.3 (скопируйте целиком):${NC}"
+  echo
+  cat "$H2_INBOUND_FILE" >"$_TTY" 2>/dev/null || cat "$H2_INBOUND_FILE"
+  echo
+  echo -e "  ${GRAY}Показать ещё раз: меню Hysteria2 → 2   ·   Проверить: меню Hysteria2 → 3${NC}"
   echo
 }
 
@@ -6212,7 +6577,7 @@ main_menu() {
     section "📦  Установка"
     menu_item "🚀" "1"  "Remnanode"  "VPN-нода Remnawave" remnanode
     menu_item "🎭" "2"  "Selfsteal"  "маскировка Reality" selfsteal
-    menu_item "⚡" "3"  "Hysteria2"  "авто: нужен домен"  hysteria
+    menu_item "⚡" "3"  "Hysteria2"  "установка + инструкция" hysteria
     menu_item "🔧" "4"  "Фикс H2"    "custom Xray"        xrayfix
     menu_item "☁️" "5"  "WARP"       "Cloudflare SOCKS5"  warp
     menu_item "✈️" "6"  "MTProto"    "прокси Telegram"    mtproto
@@ -6237,7 +6602,7 @@ main_menu() {
       a|A|а|А|all|все) install_essentials; pause ;;
       1)  install_remnanode; pause ;;
       2)  install_selfsteal; pause ;;
-      3)  install_hysteria2; pause ;;
+      3)  hysteria2_menu ;;
       4)  fix_hysteria2_online ;;
       5)  install_warp; pause ;;
       6)  install_mtproto ;;
@@ -6296,6 +6661,8 @@ case "${1:-}" in
     shift 2>/dev/null || true
     install_hysteria2 "${1:-}"
     ;;
+  check-hysteria2|h2-check|hysteria-check) _menu_soft_mode; check_hysteria2 ;;
+  h2-guide|hysteria-guide)     _menu_soft_mode; if [[ -s "$H2_GUIDE_FILE" ]]; then cat "$H2_GUIDE_FILE"; cat "$H2_INBOUND_FILE" 2>/dev/null; else warn "Сначала: remnanode install-hysteria2"; fi ;;
   hysteria2-legacy|h2-legacy)  install_hysteria2_legacy ;;
   fix-hysteria|fix-online)    fix_hysteria2_online ;;
   install-warp)                install_warp ;;
