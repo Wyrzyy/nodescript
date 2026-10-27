@@ -1,0 +1,9 @@
+#!/bin/bash
+echo "nft $*" >> "$T/calls.log"
+case "$*" in
+  "-c -f "*) exec /usr/sbin/nft "$@" ;;
+  "-f "*) touch "$T/hop_loaded"; exit 0 ;;
+  "list table"*) [[ -f "$T/hop_loaded" ]]; exit $? ;;
+  "delete table"*) rm -f "$T/hop_loaded"; exit 0 ;;
+esac
+exit 0

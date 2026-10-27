@@ -1,0 +1,2 @@
+#!/bin/bash
+case "$1" in ahostsv4) [[ -f "$T/dns_ip" ]] && { ip=$(cat "$T/dns_ip"); echo "$ip STREAM $2"; echo "$ip DGRAM"; }; exit 0 ;; ahostsv6) exit 0 ;; esac; exit 0

@@ -1,0 +1,15 @@
+#!/bin/bash
+echo "docker $*" >> "$T/calls.log"
+case "$1" in
+  ps) [[ -f "$T/node_up" ]] && echo remnanode; exit 0 ;;
+  inspect) if [[ "$*" == *Mounts* ]]; then cat "$T/mounts" 2>/dev/null; exit 0; fi; exit 1 ;;
+  compose) if [[ "$*" == *"up -d"* ]]; then touch "$T/node_up"; grep -oE "'?[^ ']+:[^ ']+:ro'?" "$T/opt/remnanode/docker-compose.yml" | tr -d "'" | cut -d: -f1 > "$T/mounts"; fi; exit 0 ;;
+  cp) [[ -f "$2" ]] && cp "$2" "$T/selftest.json"; exit 0 ;;
+  exec) shift
+        if [[ "$*" == *"xray version"* ]]; then echo "Xray ${XRAY_VER:-26.7.28} (Xray, Penetrates Everything.)"; exit 0; fi
+        if [[ "$*" == *"xray run -test"* ]]; then [[ -n "${XRAY_TEST_FAIL:-}" ]] && { echo "Failed to load config: cert not found" >&2; exit 1; }; exit 0; fi
+        if [[ "$*" == *"test -r"* ]]; then p="${@: -1}"; if [[ -n "${KEY_UNREADABLE:-}" ]] && [[ "$(stat -L -c %a "$p" 2>/dev/null)" == "600" ]]; then exit 1; fi; exit 0; fi
+        exit 0 ;;
+  stop|start|restart) exit 0 ;;
+esac
+exit 0

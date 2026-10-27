@@ -1,0 +1,8 @@
+#!/bin/bash
+echo "systemctl $*" >> "$T/calls.log"
+case "$1" in
+  list-timers) echo "certbot.timer"; exit 0 ;;
+  enable) [[ "$*" == *hysteria-hop* ]] && { touch "$T/hop_enabled"; [[ "$*" == *--now* && -f "$T/etc/hysteria-hop.nft" ]] && touch "$T/hop_loaded"; }; exit 0 ;;
+  is-enabled) [[ -f "$T/hop_enabled" ]]; exit $? ;;
+esac
+exit 0

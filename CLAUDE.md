@@ -28,7 +28,10 @@ Reality `serverNames`/`dest`/`xver`, `SECRET_KEY`, outbound, образ) — О�
 - `selfsteal.sh` (~5570 строк) — маскировочный веб-сервер Reality (Caddy/Nginx). Русиф. копия DigneZzZ.
   Лаунчер вызывает его как внешний скрипт (`run_selfsteal`), копию кладёт в `/opt/remnanode/selfsteal.sh`.
 - `CLAUDE.md` — этот файл.
-- Нет тестов/CI. Проверка перед коммитом: `bash -n remnanode.sh && bash -n selfsteal.sh`.
+- Проверка перед коммитом: `bash -n remnanode.sh && bash -n selfsteal.sh`.
+- Тесты Hysteria2 (заглушки docker/certbot/ufw/nft + mock-панель Remnawave, систему не трогают): `[XRAY_BIN=/путь/xray]
+  tests/hysteria2/run_tests.sh remnanode.sh` — 78 проверок. Линт: `uvx --from shellcheck-py shellcheck -s bash -S warning
+  tests/hysteria2/h2_block.sh` (файл генерируется тестами).
 
 ## remnanode.sh — карта (ищи по именам функций)
 Точка входа — низ файла: self-reexec из tempfile (фикс `/dev/fd` в Termius) → конфиг-переменные (1-88)
@@ -59,16 +62,27 @@ Reality `serverNames`/`dest`/`xver`, `SECRET_KEY`, outbound, образ) — О�
   ЗАРАНЕЕ (collect ноды + домен/ws/порт selfsteal + да/нет WARP), один финальный confirm, затем без
   участия: `_rn_do_install` → `run_selfsteal @ --caddy --force --domain … --port … install` →
   WARP (install или `warp_ensure_running`). В конце — блок «⚠ ТРЕБУЕТСЯ ДЕЙСТВИЕ В ПАНЕЛИ».
-- Hysteria2 (переработано 2026-10-23, по рабочей ноде DE): меню `hysteria2_menu` (пункт 3) → `install_hysteria2`
-  (0 версия Xray в ноде ≥ `H2_XRAY_MIN` 26.6.1 · 1 DNS · 2 UDP 443 + порт-хоппинг 20000–29999→443 (`_h2_setup_hop`, nft
-  `remna_hy2` + unit `remna-hy2-hop`) · 3 certbot standalone, 80/tcp ТОЛЬКО на время выпуска/продления через хуки
-  `renewal-hooks/pre|post/remna-acme-*.sh` (временная таблица `remna_acme`, стоп/старт держателя :80 = Caddy selfsteal,
-  своё правило UFW пользователя не трогают) · 4 certs → /opt/hysteria/certs (ключ 600, или 644 если не читается в контейнере,
-  `.keymode`), deploy-hook · 5 volume в compose · 6 `inbound.json` (hysteria v2, TLS alpn h3, finalmask salamander
-  packetSize 900-1300 + quicParams bbr; пароль salamander один раз в `.obfs`) · 7 `ИНСТРУКЦИЯ.txt` — пошагово для панели:
-  inbound в УЖЕ привязанный профиль (новый профиль вытеснит Reality!), включить на ноде, сквад, хост (Address=домен, SNI, ALPN h3)).
-  `check_hysteria2` (CLI `h2-check`): Xray жив, UDP 443 слушает, сертификат/SAN, монтирование, читаемость ключа, логи.
-  Inbound провалидирован `xray run -test`. Старое: `install_hysteria2_legacy`, `fix_hysteria2_online` (кастомное ядро).
+- ⚡ **Hysteria2 (v2026.10.27 — объединено: рабочий рецепт DE-ноды + автонастройка панели по API)**. В Remnawave это ИНБАУНД Xray
+  (`protocol: hysteria`, `network: hysteria`, TLS alpn h3, `finalmask` salamander packetSize 900-1300 + `quicParams.congestion=bbr`)
+  в config profile ноды + хост в подписке; у ноды ОДИН профиль → hysteria добавляется В НЕГО (отдельный профиль вытеснит Reality).
+  Меню `hysteria2_menu` (пункт 3: установка / только панель / JSON+инструкция / проверка / self-test по ссылке `hysteria2://`).
+  `install_hysteria2` (9 шагов, у каждого пояснение): домен+DNS (детект Cloudflare-прокси, AAAA) → параметры (порт, hopping
+  20000-29999, obfs) → UDP-буферы 16 МБ + BBR → firewall (nft-менеджер лаунчера + UFW; напоминание про firewall хостера) →
+  certbot (80/tcp только на время выпуска; хуки `renewal-hooks/pre|post/hysteria2-*.sh` освобождают :80 у Caddy selfsteal и
+  возвращают; `deploy/hysteria2-restart-node.sh` перезапускает ноду) → **mount всей `/etc/letsencrypt:ro`** (live/ = симлинки на
+  archive/, копия устаревает; если ключ не читается в контейнере — `chmod 644` + `.keymode`, хук продления его повторяет) →
+  проверка версии Xray ≥ `H2_XRAY_MIN` 26.6.1 → port hopping (`nft` redirect, unit `hysteria-hop.service`, старый `remna_hy2`
+  удаляется) → панель → диагностика.
+  Панель: перед любыми изменениями inbound проверяется НАСТОЯЩИМ Xray из контейнера (`xray run -test` — ошибка пути/прав роняет
+  Xray на всей ноде); затем `_h2_panel_auto` (API-токен: inbound в профиль ноды с бэкапом, привязка к ноде, хост tag `HYSTERIA2`,
+  squad'ы с бэкапом; PATCH squad'а = ПОЛНЫЙ список inbounds) либо `_h2_panel_manual` (готовый JSON + пошаговая инструкция →
+  `/opt/hysteria/ИНСТРУКЦИЯ.txt`, `inbound.json`). Миграция: домен и пароль obfs прошлой версии (`.domain`/`.obfs`) подхватываются.
+  Состояние `/opt/hysteria/h2.env` (600, там пароль obfs). Идемпотентно: повтор не перезапускает ноду и не дублирует профиль/хост.
+  CLI: `h2 [домен]`, `h2-menu`, `h2-check`, `h2-guide`, `h2-panel`, `h2-test [ссылка]`. Без вопросов: `H2_YES=1 H2_DOMAIN_ENV=…
+  [H2_PORT_ENV H2_HOP_ENV H2_PANEL_URL_ENV H2_PANEL_TOKEN_ENV H2_EMAIL]`.
+  ⚠ Панель НЕ отдаёт `mport` в ссылке — клиент подставляет диапазон hopping сам. PATCH профиля/ноды проверены на mock-панели
+  (POST профиля/хоста, PATCH squad'а — на боевой); при отказе панели скрипт сам показывает ручную инструкцию.
+  Старое: `install_hysteria2_legacy`, `fix_hysteria2_online` (кастомное ядро; на Xray 26.7.x онлайн считается штатно).
 - WARP: `install_warp` (офиц. пакет cloudflare-warp: репо Cloudflare, /32-fix, mode proxy + порт `WARP_PORT`,
   `warp-auto.service`). **Фолбэк**: если apt даёт «held broken packages» → `--fix-broken` → `install_warp_wgcf`
   (wgcf + wireproxy, userspace WireGuard → тот же SOCKS5 `127.0.0.1:$WARP_PORT`, БЕЗ пакета и kernel-модулей,
@@ -129,7 +143,7 @@ Reality `serverNames`/`dest`/`xver`, `SECRET_KEY`, outbound, образ) — О�
 ## Команды (CLI `remnanode` / аргументы)
 - Меню: `bash <(curl -Ls "<RAW>/remnanode.sh?$(date +%s)") @ install`  или просто `remnanode`.
 - `essentials|all|setup|quick` → «Самое нужное» (нода+selfsteal+warp).
-- `install-remnanode`, `install-selfsteal`, `install-warp`, `install-hysteria2|h2`, `install-mtproto`.
+- `install-remnanode`, `install-selfsteal`, `install-warp`, `install-hysteria2|h2`, `h2-check`, `h2-guide`, `h2-panel`, `h2-test`, `install-mtproto`.
 - `warp-check|warp-up|warp-fix` → поднять/проверить WARP.
 - `secret|eproto|doctor` → диагностика EPROTO. `panel-update` → обновить панель. `restart|logs|status|up|down`.
 - `self-update` → обновить лаунчер. selfsteal: `selfsteal <template|logs|status|renew-ssl|edit|uninstall>`.

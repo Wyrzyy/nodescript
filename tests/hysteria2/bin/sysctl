@@ -1,0 +1,5 @@
+#!/bin/bash
+echo "sysctl $*" >> "$T/calls.log"
+if [[ "$1" == "-n" ]]; then f="$T/sysctl_$2"; [[ -f "$f" ]] && cat "$f" || { case "$2" in net.core.*) echo 212992 ;; *) echo cubic ;; esac; }; exit 0; fi
+if [[ "$1" == "-p" ]]; then while IFS='=' read -r k v; do k=$(echo "$k" | tr -d ' '); v=$(echo "$v" | tr -d ' '); [[ "$k" == \#* || -z "$k" ]] && continue; echo "$v" > "$T/sysctl_$k"; done < "$2"; fi
+exit 0

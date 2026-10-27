@@ -1,0 +1,8 @@
+#!/bin/bash
+echo "ufw $*" >> "$T/calls.log"
+case "$1" in
+  status) echo "Status: active"; echo "To Action From"; echo "22/tcp ALLOW Anywhere"; [[ -f "$T/ufw_rules" ]] && cat "$T/ufw_rules"; exit 0 ;;
+  allow) p="$2"; echo "${p} ALLOW Anywhere" >> "$T/ufw_rules"; exit 0 ;;
+  delete) p="${3:-}"; [[ -f "$T/ufw_rules" ]] && grep -v "^${p} " "$T/ufw_rules" > "$T/ufw_rules.n" ; mv "$T/ufw_rules.n" "$T/ufw_rules" 2>/dev/null; exit 0 ;;
+esac
+exit 0

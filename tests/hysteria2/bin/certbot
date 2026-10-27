@@ -1,0 +1,7 @@
+#!/bin/bash
+echo "certbot $*" >> "$T/calls.log"
+dom=""; while [[ $# -gt 0 ]]; do [[ "$1" == "-d" ]] && dom="$2"; shift; done
+[[ -n "$dom" ]] || exit 0
+[[ -n "${CERTBOT_FAIL:-}" ]] && { echo "challenge failed" >&2; exit 1; }
+d="$T/etc/letsencrypt/live/$dom"; mkdir -p "$d"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 90 -subj "/CN=$dom" -addext "subjectAltName=DNS:$dom" -keyout "$d/privkey.pem" -out "$d/fullchain.pem" 2>/dev/null
