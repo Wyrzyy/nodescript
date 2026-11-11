@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.11.11
+# Версия: 2026.11.11.1
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.11.11"
+_REMNANODE_VER_PIN="2026.11.11.1"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -2555,6 +2555,101 @@ _install_docker_via_get_docker() {
   command -v docker >/dev/null 2>&1
 }
 
+# Codename, который реально публикует Docker для $ID (наш — или новейший LTS,
+# если текущий слишком свежий: напр. Ubuntu 26 ещё не поддержан Docker).
+_docker_repo_codename() {
+  local want="$CODENAME" fallbacks cn
+  if curl -fsSL --max-time 8 -o /dev/null "https://download.docker.com/linux/${ID}/dists/${want}/Release" 2>/dev/null; then
+    printf '%s' "$want"; return 0
+  fi
+  case "$ID" in
+    ubuntu) fallbacks="noble jammy focal" ;;
+    debian) fallbacks="bookworm bullseye buster" ;;
+    *)      fallbacks="noble jammy bookworm" ;;
+  esac
+  for cn in $fallbacks; do
+    if curl -fsSL --max-time 8 -o /dev/null "https://download.docker.com/linux/${ID}/dists/${cn}/Release" 2>/dev/null; then
+      printf '%s' "$cn"; return 0
+    fi
+  done
+  printf '%s' "$want"
+}
+
+# Ультимативный фолбэк: статические бинарники Docker (без apt/репозиториев).
+# dockerd сам поднимает встроенный containerd. Работает на любой свежей/нестандартной ОС.
+_install_docker_static() {
+  info "Fallback: статические бинарники Docker (без apt)…"
+  command -v tar >/dev/null 2>&1 || { apt_wait_locks 30 || true; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tar >/dev/null 2>&1 || true; }
+  local arch_s
+  case "$ARCH" in
+    amd64) arch_s="x86_64" ;;
+    arm64) arch_s="aarch64" ;;
+    *) warn "Статический Docker: арх '$ARCH' не поддержан"; return 1 ;;
+  esac
+  local base="https://download.docker.com/linux/static/stable/${arch_s}"
+  local ver
+  ver=$(curl -fsSL --max-time 15 "${base}/" 2>/dev/null \
+        | grep -oE 'docker-[0-9]+\.[0-9]+\.[0-9]+\.tgz' \
+        | sed -E 's/^docker-([0-9.]+)\.tgz$/\1/' | sort -V | tail -1)
+  [[ -z "$ver" ]] && ver="27.3.1"
+  local tgz xdir
+  tgz=$(mktemp "${TMPDIR:-/tmp}/rn-docker-static.XXXXXX.tgz")
+  info "Скачиваю docker-${ver} (${arch_s})…"
+  if ! curl -fsSL --connect-timeout 10 --max-time 240 "${base}/docker-${ver}.tgz" -o "$tgz"; then
+    rm -f "$tgz"; warn "Не удалось скачать статический Docker"; return 1
+  fi
+  xdir=$(mktemp -d "${TMPDIR:-/tmp}/rn-dockerx.XXXXXX")
+  if ! tar -xzf "$tgz" -C "$xdir" 2>/dev/null; then
+    rm -rf "$xdir" "$tgz"; warn "Распаковка статического Docker не удалась"; return 1
+  fi
+  rm -f "$tgz"
+  install -m 0755 "$xdir"/docker/* /usr/bin/ 2>/dev/null \
+    || { rm -rf "$xdir"; warn "Не удалось установить бинарники Docker"; return 1; }
+  rm -rf "$xdir"
+  command -v dockerd >/dev/null 2>&1 || { warn "dockerd не найден после распаковки"; return 1; }
+
+  cat > /etc/systemd/system/docker.service <<'UNIT'
+[Unit]
+Description=Docker Application Container Engine (static)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=notify
+ExecStart=/usr/bin/dockerd
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable docker >/dev/null 2>&1 || true
+  systemctl restart docker >/dev/null 2>&1 || true
+
+  mkdir -p /usr/lib/docker/cli-plugins
+  local cver
+  cver=$(curl -fsSL --max-time 12 "https://api.github.com/repos/docker/compose/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)
+  [[ -z "$cver" ]] && cver="v2.30.3"
+  if gh_download "https://github.com/docker/compose/releases/download/${cver}/docker-compose-linux-${arch_s}" /usr/lib/docker/cli-plugins/docker-compose; then
+    chmod +x /usr/lib/docker/cli-plugins/docker-compose
+  else
+    warn "compose-плагин не скачался — docker compose может не работать"
+  fi
+
+  local i
+  for i in 1 2 3 4 5; do sleep 2; docker info >/dev/null 2>&1 && break; done
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    ok "Docker (статические бинарники ${ver}) установлен и запущен"
+    return 0
+  fi
+  warn "Статический Docker установлен, но демон не поднялся — journalctl -u docker -n 50"
+  command -v docker >/dev/null 2>&1
+}
+
 _install_docker_via_apt() {
   info "🐳 Добавляю репозиторий Docker…"
   install -m 0755 -d /etc/apt/keyrings
@@ -2569,7 +2664,9 @@ _install_docker_via_apt() {
   install -m 0644 "$_dk_tmp" /etc/apt/keyrings/docker.gpg
   rm -f "$_dk_tmp"
   chmod a+r /etc/apt/keyrings/docker.gpg
-  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
+  local repo_cn; repo_cn=$(_docker_repo_codename)
+  [[ "$repo_cn" != "$CODENAME" ]] && info "Docker не публикует для '${CODENAME}' — использую репозиторий '${repo_cn}'"
+  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${repo_cn} stable" \
     > /etc/apt/sources.list.d/docker.list
 
   apt_takeover
@@ -2641,12 +2738,12 @@ install_docker() {
 
   if _install_docker_via_apt; then
     :
-  else
-    warn "Установка Docker через apt не вышла — пробую get.docker.com"
-    if ! _install_docker_via_get_docker; then
-      err "Не удалось установить Docker. Освободите apt: systemctl stop unattended-upgrades; затем повторите."
-    fi
+  elif _install_docker_via_get_docker; then
     ok "Docker установлен через get.docker.com"
+  elif _install_docker_static; then
+    :
+  else
+    err "Не удалось установить Docker. Освободите apt: systemctl stop unattended-upgrades; затем повторите."
   fi
 
   command -v docker >/dev/null 2>&1 || err "docker не найден после установки"

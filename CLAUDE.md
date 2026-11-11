@@ -49,7 +49,12 @@ Reality `serverNames`/`dest`/`xver`, `SECRET_KEY`, outbound, образ) — О�
   `gh_download`, `gh_run_bash`, `gh_pipe_bash`. `run_selfsteal` — мост к selfsteal.sh через `/dev/tty`.
 - apt: `apt_takeover`/`apt_wait_locks`/`sanitize_apt_repos`/`apt_update_safe`/`apt_update_one_repo`/
   `ensure_packages` (борьба с cloud-init/unattended-upgrades локами).
-- Docker: `install_docker` (get.docker.com → apt fallback), `ensure_docker_daemon_config`.
+- Docker: `install_docker` — цепочка: `_install_docker_via_apt` (офиц. репо; `_docker_repo_codename`
+  ремапит неизвестный Docker'у codename на новейший LTS — напр. Ubuntu 26→noble; pre-step сносит
+  конфликтующие docker.io/containerd/runc; при «Unmet deps»/«held broken» → `_apt_repair_broken`
+  dpkg --configure -a + apt -f install, до 4 попыток) → `_install_docker_via_get_docker` →
+  `_install_docker_static` (статич. бинарники с download.docker.com, dockerd сам поднимает containerd,
+  systemd `docker.service`, compose-плагин из github — работает на любой ОС без apt). `ensure_docker_daemon_config`.
 - Производительность: `apply_performance_tuning` (BBR/буферы/RPS и т.п.) — серверная, панели не касается.
 - Нода (РЕФАКТОРЕНО): `_rn_collect_params` (интерактивный сбор в globals `RN_PANEL_IP/RN_NODE_PORT/
   RN_XTLS/RN_SECRET`, 0=ок/1=отмена) → `install_remnanode` (шапка + предочистка + collect + do) →
