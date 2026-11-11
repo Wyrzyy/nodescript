@@ -2517,10 +2517,25 @@ setup_ports() {
 # Docker
 ###############################################################################
 # Установка Docker через официальный convenience-скрипт (обходит зависший apt lock)
+# apt сломан (битые/неудовлетворённые зависимости, прерванный dpkg)?
+_apt_err_is_broken() {
+  grep -qiE 'Unmet dependencies|held broken packages|fix-broken|broken packages|dpkg was interrupted|half-installed|half-configured|not fully installed or removed' "${1:-/dev/null}" 2>/dev/null
+}
+# Починить сломанный apt: доконфигурировать прерванный dpkg + дотянуть зависимости.
+_apt_repair_broken() {
+  apt_takeover
+  apt_wait_locks 120 || true
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+  apt_wait_locks 120 || true
+  DEBIAN_FRONTEND=noninteractive apt-get -y -q -f install >/dev/null 2>&1 || true
+}
+
 _install_docker_via_get_docker() {
   info "Fallback: установка Docker через get.docker.com…"
   apt_takeover
   apt_wait_locks 120 || true
+  # на серверах с битыми зависимостями скрипт get.docker.com тоже упадёт — чиним заранее
+  _apt_repair_broken
   local tmp
   tmp=$(mktemp /tmp/rn-get-docker.XXXXXX.sh)
   if ! curl -fsSL --connect-timeout 10 --max-time 60 https://get.docker.com -o "$tmp"; then
@@ -2567,6 +2582,12 @@ _install_docker_via_apt() {
     spin_fn "apt (docker-репо, полный)" apt_update_safe force || true
   fi
 
+  # Официальный pre-step Docker: снести конфликтующие старые пакеты — частая причина
+  # «Unmet dependencies» (distro-шный containerd/docker.io против containerd.io).
+  apt_wait_locks 60 || true
+  DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq \
+    docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc >/dev/null 2>&1 || true
+
   local attempt=1
   local errf="/tmp/rn-docker-apt.err"
   while (( attempt <= 4 )); do
@@ -2590,6 +2611,12 @@ _install_docker_via_apt() {
       warn "Docker: apt lock (попытка ${attempt}/4) — жду и повторяю…"
       apt_takeover
       sleep 5
+      attempt=$((attempt + 1))
+      continue
+    fi
+    if _apt_err_is_broken "$errf"; then
+      warn "Docker: битые зависимости apt — чиню (dpkg --configure -a + apt -f install) и повторяю…"
+      _apt_repair_broken
       attempt=$((attempt + 1))
       continue
     fi
