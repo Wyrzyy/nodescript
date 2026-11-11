@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ###############################################################################
 # REMNANODE LAUNCHER — Ubuntu 24.04 / Debian 12
 # Remnanode · Selfsteal · Hysteria2 · WARP · MTProto · SWAP · UFW · Тесты
-# Версия: 2026.11.11.1
+# Версия: 2026.11.11.2
 #
 # Запуск лаунчера (меню со всеми возможностями):
 #   bash <(curl -Ls "https://raw.githubusercontent.com/Wyrzyy/nodescript/refs/heads/main/remnanode.sh?$(date +%s)") @ install
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 # Версия лаунчера — литерал + pin (os-release/env не должны её затереть)
-_REMNANODE_VER_PIN="2026.11.11.1"
+_REMNANODE_VER_PIN="2026.11.11.2"
 _REMNANODE_VER="$_REMNANODE_VER_PIN"
 RN_VERSION="$_REMNANODE_VER_PIN"
 SCRIPT_VERSION="$_REMNANODE_VER_PIN"
@@ -2718,8 +2718,17 @@ _install_docker_via_apt() {
       continue
     fi
     warn "apt install docker не удался — см. лог"
-    return 1
+    break
   done
+  # Диагностика: реальные неудовлетворённые зависимости (apt-get -s — симуляция, без изменений)
+  {
+    echo "=== docker unmet deps diag (repo codename=${repo_cn:-$CODENAME}, OS CODENAME=${CODENAME}, VERSION_ID=${VERSION_ID:-?}) ==="
+    DEBIAN_FRONTEND=noninteractive apt-get install -s \
+      docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>&1 | head -60
+    echo "--- apt-cache policy containerd.io docker-ce ---"
+    apt-cache policy containerd.io docker-ce 2>&1 | head -40
+  } >&3 2>&3 || true
+  warn "Реальные unmet-зависимости записаны в лог: ${LOG}"
   return 1
 }
 
